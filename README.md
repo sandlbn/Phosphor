@@ -2,6 +2,8 @@
 
 A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hardware. Built with Rust and Iced.
 
+![Phosphor](assets/screenshot.png)
+
 > **⚠️ Work in progress.** PSID playback works well. RSID support is experimental and many tunes won't play correctly yet.
 
 ## Requirements
