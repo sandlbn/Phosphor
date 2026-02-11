@@ -1,0 +1,34 @@
+[package]
+name = "phosphor"
+version = "0.1.0"
+edition = "2021"
+description = "Phosphor — a SID player for USBSID-Pico"
+
+[dependencies]
+# GUI
+iced = { version = "0.14", features = ["canvas", "tokio", "image"] }
+rfd = "0.15"
+
+# 6502 emulation + USBSID hardware
+mos6502 = "0.8"
+usbsid-pico = { version = "0.1.3", features = ["usb"] }
+
+# Player ↔ GUI communication
+crossbeam-channel = "0.5"
+
+# Shuffle & randomisation
+rand = "0.8"
+
+# Songlength MD5 (HVSC)
+md5 = "0.7"
+
+# Directory scanning for adding folders
+walkdir = "2"
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Unix signal handling (macOS/Linux)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
