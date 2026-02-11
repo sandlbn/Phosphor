@@ -247,22 +247,30 @@ impl FavoritesDb {
 
 /// Get the application config directory.
 fn config_dir() -> Option<PathBuf> {
-    // macOS: ~/Library/Application Support/phosphor/
-    // Linux: ~/.config/phosphor/
-    let home = std::env::var("HOME").ok()?;
-    let home = PathBuf::from(home);
+    // macOS:   ~/Library/Application Support/phosphor/
+    // Linux:   ~/.config/phosphor/
+    // Windows: %APPDATA%/phosphor/
 
     #[cfg(target_os = "macos")]
     {
+        let home = std::env::var("HOME").ok()?;
         Some(
-            home.join("Library")
+            PathBuf::from(home)
+                .join("Library")
                 .join("Application Support")
                 .join("phosphor"),
         )
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Some(home.join(".config").join("phosphor"))
+        let appdata = std::env::var("APPDATA").ok()?;
+        Some(PathBuf::from(appdata).join("phosphor"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home).join(".config").join("phosphor"))
     }
 }

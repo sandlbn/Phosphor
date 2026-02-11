@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod player;
 mod playlist;
@@ -852,10 +854,23 @@ fn parse_hex_addr(s: &str) -> Option<u16> {
 fn main() -> iced::Result {
     env_logger::init();
 
+    let icon = {
+        let bytes = include_bytes!("../assets/phosphor.png");
+        let img = image::load_from_memory(bytes)
+            .expect("Failed to load icon")
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        iced::window::icon::from_rgba(img.into_raw(), w, h).expect("Failed to create icon")
+    };
+
     iced::application(App::boot, App::update, App::view)
         .title("Phosphor")
         .subscription(App::subscription)
         .theme(App::theme)
         .window_size((900.0, 600.0))
+        .window(iced::window::Settings {
+            icon: Some(icon),
+            ..Default::default()
+        })
         .run()
 }
