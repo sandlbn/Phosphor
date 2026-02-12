@@ -3,6 +3,7 @@
 // setuid usbsid-bridge helper (fixed-size protocol, async ring buffer).
 
 pub mod memory;
+pub mod rsid_bus;
 pub mod sid_file;
 
 use std::path::PathBuf;
@@ -12,10 +13,12 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, select, tick, Receiver, Sender};
 use mos6502::cpu::CPU;
 use mos6502::instruction::Nmos6502;
+use mos6502::memory::Bus;
 use mos6502::registers::{StackPointer, Status};
 
 use crate::sid_device::{create_device, SidDevice};
 use memory::*;
+use rsid_bus::RsidBus;
 use sid_file::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,241 +155,6 @@ fn run_until(cpu: &mut CPU<C64Memory, Nmos6502>, halt: u16, max_steps: u32) {
     }
 }
 
-/// Run RSID INIT with full hardware emulation (CIA/VIC ticking + interrupt delivery).
-///
-/// Like libsidplayfp, this is continuous CPU execution — no artificial phases.
-/// Budget is in cycles (not steps). If INIT returns (reaches idle_pc), stops early.
-/// Also exits early once the tune has installed interrupt handlers AND enabled
-/// the matching interrupt source — meaning playback is ready.
-/// If INIT doesn't return, the frame loop takes over seamlessly.
-/// Returns (init_returned, final_prev_nmi).
-fn run_rsid_init(
-    cpu: &mut CPU<C64Memory, Nmos6502>,
-    idle_pc: u16,
-    max_cycles: u32,
-) -> (bool, bool) {
-    let mut cycles_done: u32 = 0;
-    let mut prev_nmi = false;
-    let mut check_cycles: u32 = 0;
-
-    while cycles_done < max_cycles {
-        if cpu.registers.program_counter == idle_pc {
-            return (true, prev_nmi);
-        }
-
-        let inst_cycles = opcode_cycles_banked(&cpu.memory, cpu.registers.program_counter);
-        cpu.single_step();
-        cycles_done += inst_cycles;
-
-        // Tick all hardware
-        cpu.memory.cia1.tick(inst_cycles);
-        cpu.memory.cia2.tick(inst_cycles);
-        cpu.memory.vic.tick(inst_cycles);
-
-        // Account for VIC badline stolen cycles
-        let stolen = cpu.memory.vic.stolen_cycles;
-        if stolen > 0 {
-            cycles_done += stolen;
-            cpu.memory.cia1.tick(stolen);
-            cpu.memory.cia2.tick(stolen);
-        }
-
-        // Jiffy clock: increment $00A2 on VIC frame boundary.
-        // Many tunes poll this for timing during INIT (decompression etc.)
-        if cpu.memory.vic.new_frame {
-            cpu.memory.vic.new_frame = false;
-            cpu.memory.tick_jiffy_clock();
-        }
-
-        // Deliver IRQ (level-triggered)
-        if cpu.memory.cia1.int_pending() || cpu.memory.vic.irq_line {
-            let irq_cycles = deliver_irq(cpu);
-            if irq_cycles > 0 {
-                cycles_done += irq_cycles;
-                cpu.memory.cia1.tick(irq_cycles);
-                cpu.memory.cia2.tick(irq_cycles);
-                cpu.memory.vic.tick(irq_cycles);
-            }
-        }
-
-        // Deliver NMI (edge-triggered)
-        let cur_nmi = cpu.memory.cia2.int_pending();
-        if cur_nmi && !prev_nmi {
-            let nmi_cycles = deliver_nmi(cpu);
-            cycles_done += nmi_cycles;
-            cpu.memory.cia1.tick(nmi_cycles);
-            cpu.memory.cia2.tick(nmi_cycles);
-            cpu.memory.vic.tick(nmi_cycles);
-        }
-        prev_nmi = cur_nmi;
-
-        // Periodically check if interrupt-driven playback is ready.
-        check_cycles += inst_cycles;
-        if check_cycles >= 50_000 {
-            check_cycles = 0;
-
-            let irq_vec = cpu.memory.ram[0x0314] as u16 | ((cpu.memory.ram[0x0315] as u16) << 8);
-            let nmi_vec = cpu.memory.ram[0x0318] as u16 | ((cpu.memory.ram[0x0319] as u16) << 8);
-
-            // IRQ ready: custom handler installed + interrupt source enabled
-            let irq_ready = irq_vec != 0xEA31
-                && (cpu.memory.vic.raster_irq_enabled
-                    || (cpu.memory.cia1.int_mask & 0x01 != 0 && cpu.memory.cia1.timer_a.running));
-
-            // NMI ready: check if the SOFTWARE vector changed ($0318),
-            // OR if the HARDWARE vector ($FFFA) was changed by the tune's
-            // code. Read $FFFA through banking (kernal_rom) to avoid false
-            // positives from tune data loaded over the KERNAL area.
-            let nmi_hw_vec = cpu.memory.banked_read(0xFFFA) as u16
-                | ((cpu.memory.banked_read(0xFFFB) as u16) << 8);
-            let nmi_installed = nmi_vec != 0xFE72 || nmi_hw_vec != 0xFE43;
-
-            let nmi_ready =
-                nmi_installed && cpu.memory.cia2.int_mask != 0 && cpu.memory.cia2.timer_a.running;
-
-            if irq_ready || nmi_ready {
-                eprintln!(
-                    "[phosphor] RSID INIT: playback ready at cycle {} \
-                     (IRQ=${:04X} NMI=${:04X})",
-                    cycles_done, irq_vec, nmi_vec,
-                );
-                return (false, prev_nmi);
-            }
-        }
-    }
-
-    (false, prev_nmi)
-}
-
-/// Deliver an IRQ to the CPU (manual, since mos6502 crate has no IRQ support).
-///
-/// The real 6502 IRQ sequence:
-///   1. Push PC high byte
-///   2. Push PC low byte
-///   3. Push status register (with B flag clear)
-///   4. Set I flag (disable further IRQs)
-///   5. Load PC from $FFFE/$FFFF
-/// Deliver an IRQ to the CPU. Returns the number of cycles consumed (7)
-/// or 0 if interrupts are disabled and IRQ was not taken.
-fn deliver_irq(cpu: &mut CPU<C64Memory, Nmos6502>) -> u32 {
-    // Check if interrupts are disabled
-    if cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS) {
-        return 0;
-    }
-
-    let pc = cpu.registers.program_counter;
-    let mut sp = cpu.registers.stack_pointer.0;
-
-    // Push PC high byte
-    cpu.memory.ram[0x0100 | sp as usize] = (pc >> 8) as u8;
-    sp = sp.wrapping_sub(1);
-
-    // Push PC low byte
-    cpu.memory.ram[0x0100 | sp as usize] = (pc & 0xFF) as u8;
-    sp = sp.wrapping_sub(1);
-
-    // Push status (B flag clear, unused bit set)
-    let status_byte = (cpu.registers.status.bits() | 0x20) & !0x10;
-    cpu.memory.ram[0x0100 | sp as usize] = status_byte;
-    sp = sp.wrapping_sub(1);
-
-    cpu.registers.stack_pointer = StackPointer(sp);
-
-    // Set interrupt disable flag
-    cpu.registers.status.insert(Status::PS_DISABLE_INTERRUPTS);
-
-    // Jump to IRQ vector at $FFFE/$FFFF (reads through banking layer —
-    // on real C64, vector fetch always sees KERNAL ROM when HIRAM=1)
-    let lo = cpu.memory.banked_read(0xFFFE) as u16;
-    let hi = cpu.memory.banked_read(0xFFFF) as u16;
-    cpu.registers.program_counter = (hi << 8) | lo;
-
-    7 // 6502 IRQ sequence takes 7 cycles
-}
-
-/// Deliver an NMI (non-maskable interrupt).
-/// Same as IRQ but: cannot be masked, uses vector $FFFA/$FFFB.
-/// Deliver an NMI (non-maskable interrupt). Returns 7 (cycles consumed).
-fn deliver_nmi(cpu: &mut CPU<C64Memory, Nmos6502>) -> u32 {
-    let pc = cpu.registers.program_counter;
-    let mut sp = cpu.registers.stack_pointer.0;
-
-    cpu.memory.ram[0x0100 | sp as usize] = (pc >> 8) as u8;
-    sp = sp.wrapping_sub(1);
-    cpu.memory.ram[0x0100 | sp as usize] = (pc & 0xFF) as u8;
-    sp = sp.wrapping_sub(1);
-    let status_byte = (cpu.registers.status.bits() | 0x20) & !0x10;
-    cpu.memory.ram[0x0100 | sp as usize] = status_byte;
-    sp = sp.wrapping_sub(1);
-
-    cpu.registers.stack_pointer = StackPointer(sp);
-    cpu.registers.status.insert(Status::PS_DISABLE_INTERRUPTS);
-
-    let lo = cpu.memory.banked_read(0xFFFA) as u16;
-    let hi = cpu.memory.banked_read(0xFFFB) as u16;
-    cpu.registers.program_counter = (hi << 8) | lo;
-
-    7 // 6502 NMI sequence takes 7 cycles
-}
-
-/// Run RSID emulation for `cycles` cycles, ticking CIA/VIC and delivering interrupts.
-/// `prev_nmi` is passed by reference to maintain edge-detection state across sub-frames.
-fn run_rsid_sub(cpu: &mut CPU<C64Memory, Nmos6502>, cycles: u32, prev_nmi: &mut bool) {
-    let mut cycles_done: u32 = 0;
-
-    while cycles_done < cycles {
-        let inst_cycles = opcode_cycles_banked(&cpu.memory, cpu.registers.program_counter);
-        cpu.single_step();
-        cycles_done += inst_cycles;
-        cpu.memory.frame_cycle += inst_cycles;
-
-        // Tick all interrupt sources
-        cpu.memory.cia1.tick(inst_cycles);
-        cpu.memory.cia2.tick(inst_cycles);
-        cpu.memory.vic.tick(inst_cycles);
-
-        // Account for VIC badline stolen cycles (CPU stalled ~40 cycles)
-        let stolen = cpu.memory.vic.stolen_cycles;
-        if stolen > 0 {
-            cycles_done += stolen;
-            cpu.memory.frame_cycle += stolen;
-            cpu.memory.cia1.tick(stolen);
-            cpu.memory.cia2.tick(stolen);
-        }
-
-        // Jiffy clock: increment $00A2-$00A0 on each VIC frame boundary.
-        // Many tunes poll this counter for timing even without interrupts.
-        if cpu.memory.vic.new_frame {
-            cpu.memory.vic.new_frame = false;
-            cpu.memory.tick_jiffy_clock();
-        }
-
-        // IRQ (level-triggered)
-        if cpu.memory.cia1.int_pending() || cpu.memory.vic.irq_line {
-            let irq_cycles = deliver_irq(cpu);
-            if irq_cycles > 0 {
-                cycles_done += irq_cycles;
-                cpu.memory.frame_cycle += irq_cycles;
-                cpu.memory.cia1.tick(irq_cycles);
-                cpu.memory.cia2.tick(irq_cycles);
-                cpu.memory.vic.tick(irq_cycles);
-            }
-        }
-
-        // NMI (edge-triggered)
-        let cur_nmi = cpu.memory.cia2.int_pending();
-        if cur_nmi && !*prev_nmi {
-            let nmi_cycles = deliver_nmi(cpu);
-            cycles_done += nmi_cycles;
-            cpu.memory.frame_cycle += nmi_cycles;
-            cpu.memory.cia1.tick(nmi_cycles);
-            cpu.memory.cia2.tick(nmi_cycles);
-            cpu.memory.vic.tick(nmi_cycles);
-        }
-        *prev_nmi = cur_nmi;
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Player thread
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,31 +233,34 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>) {
                     }
 
                     if let Some(ref mut ctx) = play_ctx {
-                        if ctx.is_rsid {
-                            // ── RSID ─────────────────────────────────────────
-                            ctx.cpu.memory.clear_writes();
-                            run_rsid_sub(&mut ctx.cpu, ctx.cycles_per_frame, &mut ctx.prev_nmi);
+                        match &mut ctx.engine {
+                            PlayEngine::Rsid { cpu, prev_nmi } => {
+                                // ── RSID (c64_emu) ───────────────────────────
+                                cpu.memory.clear_writes();
+                                run_rsid_sub_emu(cpu, ctx.cycles_per_frame, prev_nmi);
 
-                            if let Some(ref mut br) = bridge {
-                                send_sid_writes(
-                                    br.as_mut(),
-                                    &ctx.cpu.memory.sid_writes,
-                                    ctx.mirror_mono,
-                                );
+                                if let Some(ref mut br) = bridge {
+                                    send_sid_writes(
+                                        br.as_mut(),
+                                        &cpu.memory.sid_writes,
+                                        ctx.mirror_mono,
+                                    );
+                                }
                             }
-                        } else {
-                            // ── PSID ─────────────────────────────────────────
-                            ctx.cpu.memory.clear_writes();
-                            ctx.cpu.registers.program_counter = ctx.trampoline;
-                            ctx.cpu.registers.stack_pointer = StackPointer(0xFD);
-                            run_until(&mut ctx.cpu, ctx.halt_pc, 200_000);
+                            PlayEngine::Psid(cpu) => {
+                                // ── PSID ─────────────────────────────────────
+                                cpu.memory.clear_writes();
+                                cpu.registers.program_counter = ctx.trampoline;
+                                cpu.registers.stack_pointer = StackPointer(0xFD);
+                                run_until(cpu, ctx.halt_pc, 200_000);
 
-                            if let Some(ref mut br) = bridge {
-                                send_sid_writes(
-                                    br.as_mut(),
-                                    &ctx.cpu.memory.sid_writes,
-                                    ctx.mirror_mono,
-                                );
+                                if let Some(ref mut br) = bridge {
+                                    send_sid_writes(
+                                        br.as_mut(),
+                                        &cpu.memory.sid_writes,
+                                        ctx.mirror_mono,
+                                    );
+                                }
                             }
                         }
 
@@ -555,8 +326,8 @@ fn send_status(
         Some(c) => (
             Some(c.track_info.clone()),
             c.elapsed,
-            c.cpu.memory.voice_levels(),
-            c.cpu.memory.sid_writes.len(),
+            c.voice_levels(),
+            c.sid_writes().len(),
         ),
         None => (None, Duration::ZERO, vec![], 0),
     };
@@ -663,7 +434,7 @@ fn handle_cmd(
             if let Some(ref ctx) = play_ctx {
                 let path = ctx.track_info.path.clone();
                 let stereo = ctx.mirror_mono;
-                let is_rsid = ctx.is_rsid;
+                let is_rsid = ctx.is_rsid();
                 let sid4 = 0;
                 stop_playback(play_ctx, bridge);
 
@@ -701,18 +472,51 @@ fn stop_playback(ctx: &mut Option<PlayContext>, bridge: &mut Option<Box<dyn SidD
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct PlayContext {
-    cpu: CPU<C64Memory, Nmos6502>,
+    engine: PlayEngine,
     trampoline: u16,
     halt_pc: u16,
     frame_us: u64,
     cycles_per_frame: u32,
     elapsed: Duration,
     mirror_mono: bool,
-    is_rsid: bool,
-    prev_nmi: bool, // NMI edge state (persists across sub-frames)
     track_info: TrackInfo,
     frame_count: u32,
     next_frame: Instant, // absolute deadline for next frame
+}
+
+enum PlayEngine {
+    Psid(CPU<C64Memory, Nmos6502>),
+    Rsid {
+        cpu: CPU<RsidBus, Nmos6502>,
+        prev_nmi: bool,
+    },
+}
+
+impl PlayContext {
+    fn is_rsid(&self) -> bool {
+        matches!(self.engine, PlayEngine::Rsid { .. })
+    }
+
+    fn sid_writes(&self) -> &[SidWrite] {
+        match &self.engine {
+            PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
+            PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
+        }
+    }
+
+    fn voice_levels(&self) -> Vec<f32> {
+        match &self.engine {
+            PlayEngine::Psid(cpu) => cpu.memory.voice_levels(),
+            PlayEngine::Rsid { cpu, .. } => cpu.memory.voice_levels(),
+        }
+    }
+
+    fn clear_writes(&mut self) {
+        match &mut self.engine {
+            PlayEngine::Psid(cpu) => cpu.memory.clear_writes(),
+            PlayEngine::Rsid { cpu, .. } => cpu.memory.clear_writes(),
+        }
+    }
 }
 
 fn setup_playback(
@@ -804,158 +608,394 @@ fn setup_playback(
         );
     }
 
-    // ── Build C64 memory + CPU ───────────────────────────────────────────
-    let mut mem = C64Memory::new(header.is_pal, mapper, mono_mode);
-    mem.load(sid_file.load_address, &sid_file.payload);
-
-    // Rebuild kernal_rom overlay: copies tune data at $E000+ into the
-    // ROM overlay so it's visible through banking, then re-installs our
-    // KERNAL stubs at the critical entry points ($FF48, $EA31, etc.)
-    mem.rebuild_kernal_rom();
-
-    let load_end = sid_file.load_address as u32 + sid_file.payload.len() as u32;
-    if load_end > 0xE000 {
-        eprintln!(
-            "[phosphor] Tune loads into KERNAL area: ${:04X}-${:04X} \
-             (kernal_rom rebuilt)",
-            sid_file.load_address,
-            load_end.min(0xFFFF),
-        );
-    }
+    // ── Build C64 + CPU — branch on RSID vs PSID ─────────────────────
 
     let trampoline: u16 = 0x0300;
     let halt_pc = trampoline + 3;
 
-    // NMI vector → KERNAL NMI entry ($FE43)
-    mem.set_hw_vector(0xFFFA, 0xFE43);
-
-    if is_rsid {
-        // For RSID: IRQ vector points to the KERNAL IRQ entry ($FF48)
-        // which saves A/X/Y, then jumps through the software vector
-        // at $0314/$0315. The tune's INIT routine typically changes
-        // $0314/$0315 to point to its own IRQ handler.
-        mem.set_hw_vector(0xFFFE, 0xFF48);
-
-        // Pre-initialize CIA1 to RSID defaults per SID spec:
-        // Timer A at 60Hz (PAL: 0x4025, NTSC: 0x4295), running, IRQ enabled.
-        mem.cia1.setup_rsid_defaults(header.is_pal);
+    let engine = if is_rsid {
+        setup_rsid_engine(&sid_file, song, &mapper, mono_mode, cycles_per_frame, trampoline, halt_pc)
     } else {
-        // For PSID: IRQ vector → halt (not used, but safe)
-        mem.set_hw_vector(0xFFFE, halt_pc);
-    }
-
-    // ── Run INIT routine ─────────────────────────────────────────────────
-    mem.install_trampoline(trampoline, header.init_address);
-
-    // For RSID, install a CLI idle loop after the JSR:
-    //   $0303: CLI          (58)
-    //   $0304: JMP $0304    (4C 04 03)
-    // This ensures interrupts are enabled after INIT returns.
-    let idle_pc: u16 = if is_rsid {
-        mem.ram[0x0303] = 0x58; // CLI
-        mem.ram[0x0304] = 0x4C; // JMP $0304
-        mem.ram[0x0305] = 0x04;
-        mem.ram[0x0306] = 0x03;
-        0x0304 // detect INIT return when CPU reaches this JMP
-    } else {
-        halt_pc // PSID: use the default JMP halt from install_trampoline
+        setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc)
     };
 
-    let mut cpu = CPU::new(mem, Nmos6502);
-    cpu.registers.program_counter = trampoline;
-    cpu.registers.stack_pointer = StackPointer(0xFD);
-    cpu.registers.accumulator = song.saturating_sub(1) as u8;
-
-    // Run INIT.
-    // RSID: full hardware emulation (CIA/VIC ticking + interrupts) because
-    // tunes may poll timers or need interrupts during initialization.
-    // Budget: 30M cycles (~30 seconds C64 time, <1s real time).
-    // Early exit once the tune installs interrupt handlers + enables sources.
-    // PSID: simple step execution, no interrupt delivery needed.
-    let (init_returned, init_prev_nmi) = if is_rsid {
-        run_rsid_init(&mut cpu, idle_pc, 30_000_000)
-    } else {
-        run_until(&mut cpu, halt_pc, 2_000_000);
-        (cpu.registers.program_counter == halt_pc, false)
+    // Send INIT writes to hardware
+    let init_writes = match &engine {
+        PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
+        PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
     };
 
-    // Send INIT's SID writes to hardware
-    let init_writes = cpu.memory.sid_writes.len();
     if let Some(ref mut br) = bridge {
-        for &(_cycle, reg, val) in &cpu.memory.sid_writes {
+        for &(_cycle, reg, val) in init_writes {
             br.write(reg, val);
         }
-        eprintln!("[phosphor] INIT done, {init_writes} SID writes sent");
+        eprintln!("[phosphor] INIT done, {} SID writes sent", init_writes.len());
     }
-    cpu.memory.clear_writes();
 
-    if is_rsid {
-        // Clean up stale CIA interrupt flags. During INIT, our RSID defaults
-        // had CIA1 timer running. If the tune stopped the timer but didn't
-        // read $DC0D, a pending underflow flag would cause an IRQ flood
-        // (e.g., Chimera by Rob Hubbard: stops CIA1, uses VIC raster only,
-        // but stale CIA1 int_data causes deliver_irq on every instruction).
-        cpu.memory.cia1.clear_stale_ints();
-        cpu.memory.cia2.clear_stale_ints();
-
-        eprintln!(
-            "[phosphor] RSID: load=${:04X} init=${:04X} play=${:04X}",
-            sid_file.load_address, header.init_address, header.play_address,
-        );
-        if init_returned {
-            // INIT returned normally — CPU is in CLI; JMP $0304 idle loop.
-            eprintln!("[phosphor] RSID: INIT returned, idle loop active");
-        } else {
-            // INIT didn't return — non-returning INIT (e.g. MOD player with
-            // decompression). The frame loop will continue execution naturally.
-            // Decompression takes several real-time seconds at 50 frames/sec,
-            // then the tune sets up interrupts and playback begins.
-            cpu.registers.status.remove(Status::PS_DISABLE_INTERRUPTS);
-            eprintln!(
-                "[phosphor] RSID: INIT did not return (non-returning), PC=${:04X}",
-                cpu.registers.program_counter,
-            );
+    // Clear writes and install play trampoline for PSID
+    let engine = match engine {
+        PlayEngine::Psid(mut cpu) => {
+            cpu.memory.clear_writes();
+            if header.play_address != 0 {
+                cpu.memory.install_trampoline(trampoline, header.play_address);
+            }
+            PlayEngine::Psid(cpu)
         }
-
-        eprintln!(
-            "[phosphor] RSID: CIA1 timer_a={}, mask={:#04x}, running={}",
-            cpu.memory.cia1.timer_a.latch,
-            cpu.memory.cia1.int_mask,
-            cpu.memory.cia1.timer_a.running,
-        );
-        eprintln!(
-            "[phosphor] RSID: VIC raster_compare={}, raster_irq={}",
-            cpu.memory.vic.raster_compare, cpu.memory.vic.raster_irq_enabled,
-        );
-        eprintln!(
-            "[phosphor] RSID: CIA2 timer_a={}, mask={:#04x}, running={}",
-            cpu.memory.cia2.timer_a.latch,
-            cpu.memory.cia2.int_mask,
-            cpu.memory.cia2.timer_a.running,
-        );
-        eprintln!(
-            "[phosphor] RSID: IRQ vector $0314=${:04X}, NMI vector $0318=${:04X}",
-            cpu.memory.ram[0x0314] as u16 | ((cpu.memory.ram[0x0315] as u16) << 8),
-            cpu.memory.ram[0x0318] as u16 | ((cpu.memory.ram[0x0319] as u16) << 8),
-        );
-    } else if header.play_address != 0 {
-        // PSID: install play trampoline
-        cpu.memory
-            .install_trampoline(trampoline, header.play_address);
-    }
+        PlayEngine::Rsid { mut cpu, prev_nmi } => {
+            cpu.memory.clear_writes();
+            PlayEngine::Rsid { cpu, prev_nmi }
+        }
+    };
 
     PlayContext {
-        cpu,
+        engine,
         trampoline,
         halt_pc,
         frame_us,
         cycles_per_frame,
         elapsed: Duration::ZERO,
         mirror_mono,
-        is_rsid,
-        prev_nmi: init_prev_nmi,
         track_info,
         frame_count: 0,
         next_frame: Instant::now(),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PSID engine setup (unchanged logic, uses C64Memory)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn setup_psid_engine(
+    sid_file: &SidFile,
+    song: u16,
+    mapper: &SidMapper,
+    mono_mode: bool,
+    trampoline: u16,
+    halt_pc: u16,
+) -> PlayEngine {
+    let header = &sid_file.header;
+
+    let mut mem = C64Memory::new(header.is_pal, mapper.clone(), mono_mode);
+    mem.load(sid_file.load_address, &sid_file.payload);
+    mem.rebuild_kernal_rom();
+
+    mem.set_hw_vector(0xFFFA, 0xFE43); // NMI
+    mem.set_hw_vector(0xFFFE, halt_pc); // IRQ → halt
+
+    mem.install_trampoline(trampoline, header.init_address);
+
+    let mut cpu = CPU::new(mem, Nmos6502);
+    cpu.registers.program_counter = trampoline;
+    cpu.registers.stack_pointer = StackPointer(0xFD);
+    cpu.registers.accumulator = song.saturating_sub(1) as u8;
+
+    run_until(&mut cpu, halt_pc, 2_000_000);
+    let init_returned = cpu.registers.program_counter == halt_pc;
+
+    if !init_returned {
+        eprintln!("[phosphor] PSID INIT did not return (PC=${:04X})", cpu.registers.program_counter);
+    }
+
+    PlayEngine::Psid(cpu)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  RSID engine setup (uses c64_emu for accurate emulation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn setup_rsid_engine(
+    sid_file: &SidFile,
+    song: u16,
+    mapper: &SidMapper,
+    mono_mode: bool,
+    cycles_per_frame: u32,
+    trampoline: u16,
+    halt_pc: u16,
+) -> PlayEngine {
+    let header = &sid_file.header;
+
+    let mut bus = RsidBus::new(header.is_pal, mapper.clone(), mono_mode);
+
+    // Load tune data into RAM
+    bus.load(sid_file.load_address, &sid_file.payload);
+
+    // Set up C64 machine state (CPU port, zero-page, DDRs, VIC)
+    bus.setup_machine_state(header.is_pal);
+
+    // Build KERNAL stubs (overlays tune data at $E000+ then patches stubs)
+    bus.install_kernal_stubs();
+
+    // Install software vectors
+    bus.install_software_vectors();
+
+    // Hardware vectors
+    bus.set_hw_vector(0xFFFA, 0xFE43); // NMI → KERNAL NMI entry
+    bus.set_hw_vector(0xFFFE, 0xFF48); // IRQ → KERNAL IRQ entry
+
+    // Pre-initialize CIA1 for RSID
+    bus.setup_rsid_cia_defaults(header.is_pal);
+
+    let load_end = sid_file.load_address as u32 + sid_file.payload.len() as u32;
+    if load_end > 0xE000 {
+        eprintln!(
+            "[phosphor] RSID: tune loads into KERNAL area: ${:04X}-${:04X}",
+            sid_file.load_address,
+            load_end.min(0xFFFF),
+        );
+    }
+
+    // Install INIT trampoline + CLI idle loop
+    bus.install_trampoline(trampoline, header.init_address);
+    bus.c64.ram.ram[0x0303] = 0x58; // CLI
+    bus.c64.ram.ram[0x0304] = 0x4C; // JMP $0304
+    bus.c64.ram.ram[0x0305] = 0x04;
+    bus.c64.ram.ram[0x0306] = 0x03;
+    let idle_pc: u16 = 0x0304;
+
+    let mut cpu = CPU::new(bus, Nmos6502);
+    cpu.registers.program_counter = trampoline;
+    cpu.registers.stack_pointer = StackPointer(0xFD);
+    cpu.registers.accumulator = song.saturating_sub(1) as u8;
+
+    // Run INIT with full cycle-accurate hardware emulation.
+    // Budget: 30M cycles (~30s C64 time).
+    let (init_returned, init_prev_nmi) = run_rsid_init_emu(&mut cpu, idle_pc, 30_000_000);
+
+    // Clear stale CIA interrupt flags
+    cpu.memory.clear_stale_ints();
+
+    eprintln!(
+        "[phosphor] RSID (c64_emu): load=${:04X} init=${:04X} play=${:04X}",
+        sid_file.load_address, header.init_address, header.play_address,
+    );
+    if init_returned {
+        eprintln!("[phosphor] RSID: INIT returned, idle loop active");
+    } else {
+        cpu.registers.status.remove(Status::PS_DISABLE_INTERRUPTS);
+        eprintln!(
+            "[phosphor] RSID: INIT did not return (non-returning), PC=${:04X}",
+            cpu.registers.program_counter,
+        );
+    }
+
+    eprintln!(
+        "[phosphor] RSID: CIA1 TA latch={}, mask={:#04x}, started={}",
+        cpu.memory.c64.cia1.timer_a.latch,
+        cpu.memory.c64.cia1.interrupt.icr_mask(),
+        cpu.memory.c64.cia1.timer_a.started(),
+    );
+    eprintln!(
+        "[phosphor] RSID: VIC raster_irq={}, irq_state={}",
+        cpu.memory.c64.vic.irq_mask_has_raster(),
+        cpu.memory.c64.vic.irq_state,
+    );
+    eprintln!(
+        "[phosphor] RSID: CIA2 TA latch={}, mask={:#04x}, started={}",
+        cpu.memory.c64.cia2.timer_a.latch,
+        cpu.memory.c64.cia2.interrupt.icr_mask(),
+        cpu.memory.c64.cia2.timer_a.started(),
+    );
+    eprintln!(
+        "[phosphor] RSID: IRQ vector $0314=${:04X}, NMI vector $0318=${:04X}",
+        cpu.memory.c64.ram.ram[0x0314] as u16 | ((cpu.memory.c64.ram.ram[0x0315] as u16) << 8),
+        cpu.memory.c64.ram.ram[0x0318] as u16 | ((cpu.memory.c64.ram.ram[0x0319] as u16) << 8),
+    );
+
+    PlayEngine::Rsid {
+        cpu,
+        prev_nmi: init_prev_nmi,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  RSID emulation loops (cycle-accurate, using c64_emu)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run RSID INIT with full per-cycle hardware emulation.
+fn run_rsid_init_emu(
+    cpu: &mut CPU<RsidBus, Nmos6502>,
+    idle_pc: u16,
+    max_cycles: u32,
+) -> (bool, bool) {
+    let mut cycles_done: u32 = 0;
+    let mut prev_nmi = false;
+    let mut check_cycles: u32 = 0;
+
+    while cycles_done < max_cycles {
+        if cpu.registers.program_counter == idle_pc {
+            return (true, prev_nmi);
+        }
+
+        let inst_cycles = cpu.memory.opcode_cycles(cpu.registers.program_counter);
+        cpu.single_step();
+        cycles_done += inst_cycles;
+
+        // Tick all peripherals for each cycle of the instruction
+        for _ in 0..inst_cycles {
+            cpu.memory.c64.tick_peripherals();
+        }
+
+        // Jiffy clock on VIC frame boundary
+        if cpu.memory.c64.vic.new_frame {
+            cpu.memory.c64.vic.new_frame = false;
+            cpu.memory.tick_jiffy_clock();
+        }
+
+        // Deliver IRQ (level-triggered)
+        if cpu.memory.irq_pending() {
+            let irq_cycles = deliver_irq_emu(cpu);
+            if irq_cycles > 0 {
+                cycles_done += irq_cycles;
+                for _ in 0..irq_cycles {
+                    cpu.memory.c64.tick_peripherals();
+                }
+            }
+        }
+
+        // Deliver NMI (edge-triggered)
+        let cur_nmi = cpu.memory.nmi_pending();
+        if cur_nmi && !prev_nmi {
+            let nmi_cycles = deliver_nmi_emu(cpu);
+            cycles_done += nmi_cycles;
+            for _ in 0..nmi_cycles {
+                cpu.memory.c64.tick_peripherals();
+            }
+        }
+        prev_nmi = cur_nmi;
+
+        // Periodically check if interrupt-driven playback is ready
+        check_cycles += inst_cycles;
+        if check_cycles >= 50_000 {
+            check_cycles = 0;
+
+            let ram = &cpu.memory.c64.ram.ram;
+            let irq_vec = ram[0x0314] as u16 | ((ram[0x0315] as u16) << 8);
+            let nmi_vec = ram[0x0318] as u16 | ((ram[0x0319] as u16) << 8);
+
+            let vic_raster_irq = cpu.memory.c64.vic.irq_mask_has_raster();
+            let cia1_ta_started = cpu.memory.c64.cia1.timer_a.started();
+            let cia1_ta_mask = cpu.memory.c64.cia1.interrupt.icr_mask() & 0x01 != 0;
+
+            let irq_ready = irq_vec != 0xEA31
+                && (vic_raster_irq || (cia1_ta_mask && cia1_ta_started));
+
+            // Check NMI vector
+            let kernal_rom = cpu.memory.c64.kernal_rom.rom_ref();
+            let nmi_hw_vec = kernal_rom[0xFFFA - 0xE000] as u16
+                | ((kernal_rom[0xFFFB - 0xE000] as u16) << 8);
+            let nmi_installed = nmi_vec != 0xFE72 || nmi_hw_vec != 0xFE43;
+            let cia2_mask = cpu.memory.c64.cia2.interrupt.icr_mask();
+            let cia2_ta_started = cpu.memory.c64.cia2.timer_a.started();
+            let nmi_ready = nmi_installed && cia2_mask != 0 && cia2_ta_started;
+
+            if irq_ready || nmi_ready {
+                eprintln!(
+                    "[phosphor] RSID INIT: playback ready at cycle {} \
+                     (IRQ=${:04X} NMI=${:04X})",
+                    cycles_done, irq_vec, nmi_vec,
+                );
+                return (false, prev_nmi);
+            }
+        }
+    }
+
+    (false, prev_nmi)
+}
+
+/// Run RSID emulation for `cycles` cycles with per-cycle peripheral ticking.
+fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mut bool) {
+    let mut cycles_done: u32 = 0;
+
+    while cycles_done < cycles {
+        let inst_cycles = cpu.memory.opcode_cycles(cpu.registers.program_counter);
+        cpu.single_step();
+        cycles_done += inst_cycles;
+        cpu.memory.frame_cycle += inst_cycles;
+
+        // Tick all peripherals for each cycle
+        for _ in 0..inst_cycles {
+            cpu.memory.c64.tick_peripherals();
+        }
+
+        // Jiffy clock on VIC frame boundary
+        if cpu.memory.c64.vic.new_frame {
+            cpu.memory.c64.vic.new_frame = false;
+            cpu.memory.tick_jiffy_clock();
+        }
+
+        // IRQ (level-triggered)
+        if cpu.memory.irq_pending() {
+            let irq_cycles = deliver_irq_emu(cpu);
+            if irq_cycles > 0 {
+                cycles_done += irq_cycles;
+                cpu.memory.frame_cycle += irq_cycles;
+                for _ in 0..irq_cycles {
+                    cpu.memory.c64.tick_peripherals();
+                }
+            }
+        }
+
+        // NMI (edge-triggered)
+        let cur_nmi = cpu.memory.nmi_pending();
+        if cur_nmi && !*prev_nmi {
+            let nmi_cycles = deliver_nmi_emu(cpu);
+            cycles_done += nmi_cycles;
+            cpu.memory.frame_cycle += nmi_cycles;
+            for _ in 0..nmi_cycles {
+                cpu.memory.c64.tick_peripherals();
+            }
+        }
+        *prev_nmi = cur_nmi;
+    }
+}
+
+/// Deliver an IRQ to the CPU (emu variant).
+fn deliver_irq_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
+    if cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS) {
+        return 0;
+    }
+
+    let pc = cpu.registers.program_counter;
+    let mut sp = cpu.registers.stack_pointer.0;
+
+    cpu.memory.c64.ram.ram[0x0100 | sp as usize] = (pc >> 8) as u8;
+    sp = sp.wrapping_sub(1);
+    cpu.memory.c64.ram.ram[0x0100 | sp as usize] = (pc & 0xFF) as u8;
+    sp = sp.wrapping_sub(1);
+    let status_byte = (cpu.registers.status.bits() | 0x20) & !0x10;
+    cpu.memory.c64.ram.ram[0x0100 | sp as usize] = status_byte;
+    sp = sp.wrapping_sub(1);
+
+    cpu.registers.stack_pointer = StackPointer(sp);
+    cpu.registers.status.insert(Status::PS_DISABLE_INTERRUPTS);
+
+    // Read IRQ vector through banking (KERNAL ROM when HIRAM=1)
+    let lo = cpu.memory.get_byte(0xFFFE) as u16;
+    let hi = cpu.memory.get_byte(0xFFFF) as u16;
+    cpu.registers.program_counter = (hi << 8) | lo;
+
+    7
+}
+
+/// Deliver an NMI to the CPU (emu variant).
+fn deliver_nmi_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
+    let pc = cpu.registers.program_counter;
+    let mut sp = cpu.registers.stack_pointer.0;
+
+    cpu.memory.c64.ram.ram[0x0100 | sp as usize] = (pc >> 8) as u8;
+    sp = sp.wrapping_sub(1);
+    cpu.memory.c64.ram.ram[0x0100 | sp as usize] = (pc & 0xFF) as u8;
+    sp = sp.wrapping_sub(1);
+    let status_byte = (cpu.registers.status.bits() | 0x20) & !0x10;
+    cpu.memory.c64.ram.ram[0x0100 | sp as usize] = status_byte;
+    sp = sp.wrapping_sub(1);
+
+    cpu.registers.stack_pointer = StackPointer(sp);
+    cpu.registers.status.insert(Status::PS_DISABLE_INTERRUPTS);
+
+    let lo = cpu.memory.get_byte(0xFFFA) as u16;
+    let hi = cpu.memory.get_byte(0xFFFB) as u16;
+    cpu.registers.program_counter = (hi << 8) | lo;
+
+    7
 }

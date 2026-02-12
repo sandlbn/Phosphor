@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod c64_emu;
 mod config;
 mod player;
 mod playlist;
