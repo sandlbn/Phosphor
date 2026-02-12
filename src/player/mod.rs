@@ -264,6 +264,13 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>) {
                             }
                         }
 
+                        // Signal the device to flush any remaining buffered
+                        // writes for this frame (matches SidBerry's
+                        // USBSID_SetFlush() at end of each frame).
+                        if let Some(ref mut br) = bridge {
+                            br.flush();
+                        }
+
                         // ── Absolute-timeline frame pacing ───────────────────
                         // Advance deadline by exactly one frame period.
                         // This prevents inter-frame overhead from accumulating

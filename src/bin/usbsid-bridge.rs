@@ -3,9 +3,9 @@
 // Communicates with Phosphor over a Unix domain socket.
 // Fixed-size protocol — every command has a known byte count.
 //
-// CMD_RING writes are buffered. CMD_FLUSH packs them into 64-byte
-// USB bulk packets via single_write using OP_CYCLED_WRITE — one
-// transfer per 15 reg/val/cycles tuples (4 bytes each).
+// CMD_RING writes are forwarded to the driver's threaded ring buffer
+// via write_ring_cycled(). CMD_FLUSH signals end-of-frame via
+// set_flush(), matching SidBerry's approach.
 //
 // Not needed on Windows — USB access works directly from userspace.
 
@@ -45,12 +45,6 @@ mod unix_main {
     const RESP_OK: u8 = 0x00;
     const RESP_ERR: u8 = 0x01;
 
-    /// OP_CYCLED_WRITE opcode (top 2 bits = 0b10).
-    const OP_CYCLED_WRITE: u8 = 2;
-
-    /// Max cycled-write tuples per 64-byte USB packet: (64 - 1 header) / 4 = 15
-    const MAX_PAIRS_PER_PACKET: usize = 15;
-
     fn send_ok(stream: &mut impl Write) {
         let _ = stream.write_all(&[RESP_OK]);
         let _ = stream.flush();
@@ -64,35 +58,9 @@ mod unix_main {
         let _ = stream.flush();
     }
 
-    /// Flush buffered writes as bulk USB packets using OP_CYCLED_WRITE.
-    /// Each packet: [header, reg1, val1, cyc1_hi, cyc1_lo, reg2, val2, ...]
-    /// header = (OP_CYCLED_WRITE << 6) | byte_count
-    fn flush_ring_buf(dev: &mut UsbSid, ring_buf: &[(u8, u8, u16)]) {
-        if ring_buf.is_empty() {
-            return;
-        }
-
-        let mut pkt = [0u8; 64];
-
-        for chunk in ring_buf.chunks(MAX_PAIRS_PER_PACKET) {
-            let data_len = (chunk.len() * 4) as u8; // 4 bytes per write
-            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
-            for (i, &(reg, val, cycles)) in chunk.iter().enumerate() {
-                pkt[1 + i * 4] = reg;
-                pkt[2 + i * 4] = val;
-                pkt[3 + i * 4] = (cycles >> 8) as u8;
-                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
-            }
-            let total = 1 + chunk.len() * 4;
-            let _ = dev.single_write(&pkt[..total]);
-        }
-    }
-
     fn handle_client(mut stream: std::os::unix::net::UnixStream) {
         let mut dev: Option<UsbSid> = None;
         let mut cmd = [0u8; 1];
-        // Buffer for CMD_RING writes — flushed on CMD_FLUSH
-        let mut ring_buf: Vec<(u8, u8, u16)> = Vec::with_capacity(128);
 
         eprintln!("[usbsid-bridge] client connected");
 
@@ -108,9 +76,10 @@ mod unix_main {
                         continue;
                     }
                     let mut d = UsbSid::new();
-                    match d.init(false, false) {
+                    // Init with threaded + cycled mode, matching SidBerry
+                    match d.init(true, true) {
                         Ok(_) => {
-                            eprintln!("[usbsid-bridge] USBSID-Pico opened");
+                            eprintln!("[usbsid-bridge] USBSID-Pico opened (threaded, cycled)");
                             dev = Some(d);
                             send_ok(&mut stream);
                         }
@@ -169,21 +138,22 @@ mod unix_main {
 
                 CMD_RING => {
                     // Fixed 4 bytes: reg, val, cycles_hi, cycles_lo
-                    // Buffer the write with cycles — flushed as OP_CYCLED_WRITE on CMD_FLUSH
+                    // Forward directly to driver's ring buffer
                     let mut b = [0u8; 4];
                     if stream.read_exact(&mut b).is_err() {
                         break;
                     }
-                    let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
-                    ring_buf.push((b[0], b[1], cycles));
+                    if let Some(ref d) = dev {
+                        let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
+                        let _ = d.write_ring_cycled(b[0], b[1], cycles);
+                    }
                 }
 
                 CMD_FLUSH => {
-                    // Pack buffered writes into bulk USB packets and send
+                    // Signal end-of-frame flush to the driver's background thread
                     if let Some(ref mut d) = dev {
-                        flush_ring_buf(d, &ring_buf);
+                        d.set_flush();
                     }
-                    ring_buf.clear();
                 }
 
                 CMD_MUTE => {
@@ -195,10 +165,7 @@ mod unix_main {
 
                 CMD_CLOSE => {
                     if let Some(ref mut d) = dev {
-                        if !ring_buf.is_empty() {
-                            flush_ring_buf(d, &ring_buf);
-                            ring_buf.clear();
-                        }
+                        d.set_flush();
                         d.mute();
                         d.reset();
                         d.close();
@@ -209,10 +176,7 @@ mod unix_main {
 
                 CMD_QUIT => {
                     if let Some(ref mut d) = dev {
-                        if !ring_buf.is_empty() {
-                            flush_ring_buf(d, &ring_buf);
-                            ring_buf.clear();
-                        }
+                        d.set_flush();
                         d.mute();
                         d.reset();
                         d.close();

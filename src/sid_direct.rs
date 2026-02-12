@@ -4,59 +4,26 @@
 // Windows: user must install WinUSB driver via Zadig for VID=0xCAFE.
 // Linux:   user must add a udev rule (or run as root once).
 //
-// Batches SID writes into 64-byte USB bulk packets, same format
-// as the macOS bridge daemon uses internally.
+// Uses the driver's built-in threaded ring buffer with cycle-accurate
+// writes, matching SidBerry's approach:
+//   init(true, true)          → start background writer thread
+//   write_ring_cycled(r,v,c)  → push to ring buffer per write
+//   set_flush()               → signal end-of-frame flush
 
 use crate::sid_device::SidDevice;
 use usbsid_pico::{ClockSpeed, UsbSid};
 
-/// OP_CYCLED_WRITE opcode (top 2 bits = 0b10).
-const OP_CYCLED_WRITE: u8 = 2;
-
-/// Max cycled-write tuples per 64-byte USB packet: (64 - 1 header) / 4 = 15
-const MAX_PAIRS_PER_PACKET: usize = 15;
-
 pub struct DirectDevice {
     dev: UsbSid,
-    ring_buf: Vec<(u8, u8, u16)>, // (reg, val, delta_cycles)
 }
 
 impl DirectDevice {
     pub fn open() -> Result<Self, String> {
         let mut dev = UsbSid::new();
-        dev.init(false, false)
+        dev.init(true, true)
             .map_err(|e| format!("USB init failed: {e}"))?;
-        eprintln!("[sid-direct] USBSID-Pico opened");
-        Ok(Self {
-            dev,
-            ring_buf: Vec::with_capacity(128),
-        })
-    }
-
-    /// Pack buffered writes into 64-byte bulk USB packets using OP_CYCLED_WRITE.
-    /// Each packet: [header, reg1, val1, cyc1_hi, cyc1_lo, reg2, val2, ...]
-    /// header = (OP_CYCLED_WRITE << 6) | byte_count
-    fn flush_ring_buf(&mut self) {
-        if self.ring_buf.is_empty() {
-            return;
-        }
-
-        let mut pkt = [0u8; 64];
-
-        for chunk in self.ring_buf.chunks(MAX_PAIRS_PER_PACKET) {
-            let data_len = (chunk.len() * 4) as u8; // 4 bytes per write
-            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
-            for (i, &(reg, val, cycles)) in chunk.iter().enumerate() {
-                pkt[1 + i * 4] = reg;
-                pkt[2 + i * 4] = val;
-                pkt[3 + i * 4] = (cycles >> 8) as u8;
-                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
-            }
-            let total = 1 + chunk.len() * 4;
-            let _ = self.dev.single_write(&pkt[..total]);
-        }
-
-        self.ring_buf.clear();
+        eprintln!("[sid-direct] USBSID-Pico opened (threaded, cycled)");
+        Ok(Self { dev })
     }
 }
 
@@ -88,21 +55,19 @@ impl SidDevice for DirectDevice {
     }
 
     fn ring_cycled(&mut self, writes: &[(u16, u8, u8)]) {
-        if writes.is_empty() {
-            return;
-        }
-
-        // Buffer all writes WITH cycle deltas for OP_CYCLED_WRITE
+        // Push each write into the driver's ring buffer.
+        // The background thread drains it and packs OP_CYCLED_WRITE
+        // packets to USB asynchronously.
         for &(cycles, reg, val) in writes {
-            self.ring_buf.push((reg, val, cycles));
+            let _ = self.dev.write_ring_cycled(reg, val, cycles);
         }
-
-        // Immediately flush as bulk USB packets
-        self.flush_ring_buf();
     }
 
     fn flush(&mut self) {
-        self.flush_ring_buf();
+        // Signal the background thread to flush any remaining buffered
+        // writes — called at end of each frame, same as SidBerry's
+        // USBSID_SetFlush().
+        self.dev.set_flush();
     }
 
     fn mute(&mut self) {
@@ -110,7 +75,7 @@ impl SidDevice for DirectDevice {
     }
 
     fn close(&mut self) {
-        self.flush_ring_buf();
+        self.dev.set_flush();
         self.dev.mute();
         self.dev.reset();
         self.dev.close();
