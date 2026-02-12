@@ -4,8 +4,8 @@
 //! banking lines LORAM / HIRAM / CHAREN.  Bits 6 & 7 of the data port
 //! are unused on the 6510 and exhibit a capacitor-like fall-off from 1→0.
 
-use super::bank::Bank;
 use super::super::event::EventClock;
+use super::bank::Bank;
 
 // ── Data-bit fall-off emulation ───────────────────────────────
 
@@ -138,7 +138,9 @@ impl ZeroRamBank {
 }
 
 impl Default for ZeroRamBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for ZeroRamBank {

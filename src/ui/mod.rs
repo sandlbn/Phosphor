@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, row, rule, scrollable, text, text_input,
-    Column, Space,
+    button, column, container, row, rule, scrollable, text, text_input, Column, Space,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Theme};
 
@@ -132,7 +131,9 @@ pub fn track_info_bar<'a>(
 
     let content = row![
         info_col,
-        container(vis).width(Length::Fixed(300.0)).height(Length::Fixed(60.0)),
+        container(vis)
+            .width(Length::Fixed(300.0))
+            .height(Length::Fixed(60.0)),
     ]
     .spacing(16)
     .align_y(Alignment::Center);
@@ -187,7 +188,9 @@ pub fn progress_bar<'a>(
         });
 
     let remaining = container(Space::new().height(Length::Fixed(4.0)))
-        .width(Length::FillPortion(100u16.saturating_sub(bar_width_pct).max(1)))
+        .width(Length::FillPortion(
+            100u16.saturating_sub(bar_width_pct).max(1),
+        ))
         .style(|_theme: &Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.19, 0.22))),
             border: iced::Border {
@@ -199,12 +202,9 @@ pub fn progress_bar<'a>(
 
     let bar_row = row![filled, remaining].spacing(0).width(Length::Fill);
 
-    let content = row![
-        bar_row,
-        time_label,
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    let content = row![bar_row, time_label,]
+        .spacing(8)
+        .align_y(Alignment::Center);
 
     container(content)
         .padding(Padding::from([4, 16]))
@@ -217,10 +217,7 @@ pub fn progress_bar<'a>(
 }
 
 /// Build the transport controls bar.
-pub fn controls_bar<'a>(
-    status: &PlayerStatus,
-    playlist: &Playlist,
-) -> Element<'a, Message> {
+pub fn controls_bar<'a>(status: &PlayerStatus, playlist: &Playlist) -> Element<'a, Message> {
     let play_label = match status.state {
         PlayState::Playing => "❚❚",
         _ => "▶",
@@ -242,13 +239,14 @@ pub fn controls_bar<'a>(
 
     let mode_controls = row![
         tool_button(
-            if playlist.shuffle { "🔀 On" } else { "🔀 Off" },
+            if playlist.shuffle {
+                "🔀 On"
+            } else {
+                "🔀 Off"
+            },
             Message::ToggleShuffle,
         ),
-        tool_button(
-            playlist.repeat.label(),
-            Message::CycleRepeat,
-        ),
+        tool_button(playlist.repeat.label(), Message::CycleRepeat,),
     ]
     .spacing(4);
 
@@ -374,9 +372,7 @@ pub fn search_bar<'a>(
     .align_y(Alignment::Center);
 
     if !search_text.is_empty() {
-        search_row = search_row.push(
-            tool_button("✕", Message::ClearSearch),
-        );
+        search_row = search_row.push(tool_button("✕", Message::ClearSearch));
     }
 
     let bar = row![
@@ -423,7 +419,10 @@ pub fn playlist_view<'a>(
         false,
     );
 
-    let mut rows = Column::new().spacing(0).push(header).push(rule::horizontal(1));
+    let mut rows = Column::new()
+        .spacing(0)
+        .push(header)
+        .push(rule::horizontal(1));
 
     if filtered_indices.is_empty() {
         let msg = if playlist.is_empty() {
@@ -432,20 +431,18 @@ pub fn playlist_view<'a>(
             "No matching tracks"
         };
         rows = rows.push(
-            container(
-                text(msg)
-                    .size(14)
-                    .color(Color::from_rgb(0.4, 0.4, 0.5)),
-            )
-            .padding(40)
-            .center_x(Length::Fill),
+            container(text(msg).size(14).color(Color::from_rgb(0.4, 0.4, 0.5)))
+                .padding(40)
+                .center_x(Length::Fill),
         );
     } else {
         for &actual_idx in filtered_indices {
             if let Some(entry) = playlist.entries.get(actual_idx) {
                 let is_current = playlist.current == Some(actual_idx);
                 let is_selected = selected == Some(actual_idx);
-                let is_fav = entry.md5.as_ref()
+                let is_fav = entry
+                    .md5
+                    .as_ref()
                     .map(|m| favorites.is_favorite(m))
                     .unwrap_or(false);
                 let row_el = playlist_entry_row(actual_idx, entry, is_current, is_selected, is_fav);
@@ -482,9 +479,13 @@ fn playlist_entry_row<'a>(
     };
 
     let bg = if is_selected {
-        Some(iced::Background::Color(Color::from_rgba(0.3, 0.5, 0.8, 0.2)))
+        Some(iced::Background::Color(Color::from_rgba(
+            0.3, 0.5, 0.8, 0.2,
+        )))
     } else if is_current {
-        Some(iced::Background::Color(Color::from_rgba(0.2, 0.6, 0.4, 0.1)))
+        Some(iced::Background::Color(Color::from_rgba(
+            0.2, 0.6, 0.4, 0.1,
+        )))
     } else {
         None
     };
@@ -502,9 +503,9 @@ fn playlist_entry_row<'a>(
         .padding(Padding::from([4, 4]))
         .style(|_theme: &Theme, status| {
             let bg = match status {
-                button::Status::Hovered => Some(iced::Background::Color(
-                    Color::from_rgba(1.0, 0.3, 0.4, 0.15),
-                )),
+                button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
+                    1.0, 0.3, 0.4, 0.15,
+                ))),
                 _ => None,
             };
             button::Style {
@@ -581,13 +582,34 @@ fn playlist_row_content<'a>(
     let indicator = if is_current { "▶ " } else { "  " };
 
     row![
-        text(format!("{indicator}{num:>3}")).size(size).color(color).width(Length::Fixed(50.0)),
-        text(title).size(size).color(color).width(Length::FillPortion(4)),
-        text(author).size(size).color(color).width(Length::FillPortion(3)),
-        text(released).size(size).color(color).width(Length::FillPortion(2)),
-        text(time).size(size).color(color).width(Length::Fixed(55.0)),
-        text(sid_type).size(size).color(type_color).width(Length::Fixed(42.0)),
-        text(sids).size(size).color(color).width(Length::Fixed(45.0)),
+        text(format!("{indicator}{num:>3}"))
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(50.0)),
+        text(title)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(4)),
+        text(author)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(3)),
+        text(released)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(2)),
+        text(time)
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(55.0)),
+        text(sid_type)
+            .size(size)
+            .color(type_color)
+            .width(Length::Fixed(42.0)),
+        text(sids)
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(45.0)),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
@@ -627,24 +649,56 @@ fn playlist_row_view<'a>(
     };
 
     let bg = if is_selected {
-        Some(iced::Background::Color(Color::from_rgba(0.3, 0.5, 0.8, 0.2)))
+        Some(iced::Background::Color(Color::from_rgba(
+            0.3, 0.5, 0.8, 0.2,
+        )))
     } else if is_current {
-        Some(iced::Background::Color(Color::from_rgba(0.2, 0.6, 0.4, 0.1)))
+        Some(iced::Background::Color(Color::from_rgba(
+            0.2, 0.6, 0.4, 0.1,
+        )))
     } else {
         None
     };
 
-    let indicator = if is_current && !is_header { "▶ " } else { "  " };
+    let indicator = if is_current && !is_header {
+        "▶ "
+    } else {
+        "  "
+    };
 
     let r = row![
-        text(heart).size(size).color(color).width(Length::Fixed(22.0)),
-        text(format!("{indicator}{num:>3}")).size(size).color(color).width(Length::Fixed(50.0)),
-        text(title).size(size).color(color).width(Length::FillPortion(4)),
-        text(author).size(size).color(color).width(Length::FillPortion(3)),
-        text(released).size(size).color(color).width(Length::FillPortion(2)),
-        text(time).size(size).color(color).width(Length::Fixed(55.0)),
-        text(sid_type).size(size).color(type_color).width(Length::Fixed(42.0)),
-        text(sids).size(size).color(color).width(Length::Fixed(45.0)),
+        text(heart)
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(22.0)),
+        text(format!("{indicator}{num:>3}"))
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(50.0)),
+        text(title)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(4)),
+        text(author)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(3)),
+        text(released)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(2)),
+        text(time)
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(55.0)),
+        text(sid_type)
+            .size(size)
+            .color(type_color)
+            .width(Length::Fixed(42.0)),
+        text(sids)
+            .size(size)
+            .color(color)
+            .width(Length::Fixed(45.0)),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
@@ -675,12 +729,8 @@ pub fn settings_panel<'a>(
 
     let close_btn = tool_button("✕ Close", Message::ToggleSettings);
 
-    let header = row![
-        title,
-        Space::new().width(Length::Fill),
-        close_btn,
-    ]
-    .align_y(Alignment::Center);
+    let header =
+        row![title, Space::new().width(Length::Fill), close_btn,].align_y(Alignment::Center);
 
     // ── Skip RSID ────────────────────────────────────────────────
     let rsid_label = text("Skip RSID tunes:")
@@ -688,7 +738,11 @@ pub fn settings_panel<'a>(
         .color(Color::from_rgb(0.75, 0.77, 0.82));
 
     let rsid_toggle = tool_button(
-        if config.skip_rsid { "✓ Yes — skip RSID" } else { "✗ No — play all tunes" },
+        if config.skip_rsid {
+            "✓ Yes — skip RSID"
+        } else {
+            "✗ No — play all tunes"
+        },
         Message::ToggleSkipRsid,
     );
 
@@ -724,7 +778,10 @@ pub fn settings_panel<'a>(
     let current_val = if config.default_song_length_secs > 0 {
         let m = config.default_song_length_secs / 60;
         let s = config.default_song_length_secs % 60;
-        format!("Current: {}:{:02} ({}s)", m, s, config.default_song_length_secs)
+        format!(
+            "Current: {}:{:02} ({}s)",
+            m, s, config.default_song_length_secs
+        )
     } else {
         "Disabled (0) — unknown songs won't auto-advance".to_string()
     };
@@ -733,9 +790,10 @@ pub fn settings_panel<'a>(
         .size(11)
         .color(Color::from_rgb(0.45, 0.47, 0.52));
 
-    let length_help = text("Fallback duration for songs not found in Songlength DB. Set to 0 to disable.")
-        .size(11)
-        .color(Color::from_rgb(0.45, 0.47, 0.52));
+    let length_help =
+        text("Fallback duration for songs not found in Songlength DB. Set to 0 to disable.")
+            .size(11)
+            .color(Color::from_rgb(0.45, 0.47, 0.52));
 
     let length_section = column![length_label, length_input, length_info, length_help].spacing(6);
 
@@ -762,7 +820,10 @@ pub fn settings_panel<'a>(
             selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
         });
 
-    let dl_btn = tool_button("⬇ Download / Refresh Songlength.md5", Message::DownloadSonglength);
+    let dl_btn = tool_button(
+        "⬇ Download / Refresh Songlength.md5",
+        Message::DownloadSonglength,
+    );
     let load_btn = tool_button("📂 Load Songlength.md5 from file…", Message::LoadSonglength);
 
     let dl_status_color = if download_status.contains("Error") || download_status.contains("fail") {
@@ -773,9 +834,7 @@ pub fn settings_panel<'a>(
         Color::from_rgb(0.5, 0.5, 0.6)
     };
 
-    let dl_status = text(download_status)
-        .size(12)
-        .color(dl_status_color);
+    let dl_status = text(download_status).size(12).color(dl_status_color);
 
     let dl_section = column![dl_label, dl_url_input, dl_btn, load_btn, dl_status].spacing(6);
 
@@ -847,11 +906,16 @@ pub fn filter_playlist(
 ) -> Vec<usize> {
     let q = query.to_lowercase();
 
-    playlist.entries.iter().enumerate()
+    playlist
+        .entries
+        .iter()
+        .enumerate()
         .filter(|(_, entry)| {
             // Favorites filter
             if favorites_only {
-                let is_fav = entry.md5.as_ref()
+                let is_fav = entry
+                    .md5
+                    .as_ref()
                     .map(|m| favorites.is_favorite(m))
                     .unwrap_or(false);
                 if !is_fav {

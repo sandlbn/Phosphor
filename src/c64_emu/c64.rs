@@ -5,10 +5,10 @@
 
 use mos6502::memory::Bus;
 
-use super::banks::*;
 use super::banks::io_bank::IoChip;
-use super::cia::Mos652x;
+use super::banks::*;
 use super::cia::interrupt::CiaModel;
+use super::cia::Mos652x;
 use super::mmu::{Mmu, PageMapping};
 use super::vic_ii::{Mos656x, VicModel};
 
@@ -38,11 +38,36 @@ struct ModelParams {
 }
 
 const MODELS: [ModelParams; 5] = [
-    ModelParams { color_burst: 4_433_618.75,  divider: 18.0, power_freq: 50.0, vic_model: VicModel::Mos6569 },
-    ModelParams { color_burst: 3_579_545.455, divider: 14.0, power_freq: 60.0, vic_model: VicModel::Mos6567R8 },
-    ModelParams { color_burst: 3_579_545.455, divider: 14.0, power_freq: 60.0, vic_model: VicModel::Mos6567R56A },
-    ModelParams { color_burst: 3_582_056.25,  divider: 14.0, power_freq: 50.0, vic_model: VicModel::Mos6572 },
-    ModelParams { color_burst: 3_575_611.49,  divider: 14.0, power_freq: 50.0, vic_model: VicModel::Mos6573 },
+    ModelParams {
+        color_burst: 4_433_618.75,
+        divider: 18.0,
+        power_freq: 50.0,
+        vic_model: VicModel::Mos6569,
+    },
+    ModelParams {
+        color_burst: 3_579_545.455,
+        divider: 14.0,
+        power_freq: 60.0,
+        vic_model: VicModel::Mos6567R8,
+    },
+    ModelParams {
+        color_burst: 3_579_545.455,
+        divider: 14.0,
+        power_freq: 60.0,
+        vic_model: VicModel::Mos6567R56A,
+    },
+    ModelParams {
+        color_burst: 3_582_056.25,
+        divider: 14.0,
+        power_freq: 50.0,
+        vic_model: VicModel::Mos6572,
+    },
+    ModelParams {
+        color_burst: 3_575_611.49,
+        divider: 14.0,
+        power_freq: 50.0,
+        vic_model: VicModel::Mos6573,
+    },
 ];
 
 fn cpu_freq(model: C64Model) -> f64 {
@@ -52,8 +77,8 @@ fn cpu_freq(model: C64Model) -> f64 {
 
 fn to_cia_model(m: C64CiaModel) -> CiaModel {
     match m {
-        C64CiaModel::Old     => CiaModel::Mos6526,
-        C64CiaModel::New     => CiaModel::Mos8521,
+        C64CiaModel::Old => CiaModel::Mos6526,
+        C64CiaModel::New => CiaModel::Mos8521,
         C64CiaModel::Old4485 => CiaModel::Mos6526W4485,
     }
 }
@@ -141,9 +166,15 @@ impl C64 {
 
     // ── ROM loading ───────────────────────────────────────────
 
-    pub fn set_kernal(&mut self, rom: Option<&[u8]>) { self.kernal_rom.set(rom); }
-    pub fn set_basic(&mut self, rom: Option<&[u8]>)  { self.basic_rom.set(rom); }
-    pub fn set_chargen(&mut self, rom: Option<&[u8]>) { self.char_rom.set(rom); }
+    pub fn set_kernal(&mut self, rom: Option<&[u8]>) {
+        self.kernal_rom.set(rom);
+    }
+    pub fn set_basic(&mut self, rom: Option<&[u8]>) {
+        self.basic_rom.set(rom);
+    }
+    pub fn set_chargen(&mut self, rom: Option<&[u8]>) {
+        self.char_rom.set(rom);
+    }
 
     // ── SID ───────────────────────────────────────────────────
 
@@ -242,7 +273,9 @@ impl C64 {
 }
 
 impl Default for C64 {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── mos6502 Bus implementation ────────────────────────────────
@@ -264,23 +297,21 @@ impl Bus for C64 {
             PageMapping::BasicRom => self.basic_rom.peek(addr),
             PageMapping::KernalRom => self.kernal_rom.peek(addr),
             PageMapping::CharacterRom => self.char_rom.peek(addr),
-            PageMapping::Io => {
-                match self.io_bank.dispatch(addr) {
-                    IoChip::Vic => self.vic.read((addr & 0x3F) as u8),
-                    IoChip::Sid => self.sid_bank.peek(addr),
-                    IoChip::ColorRam => self.color_ram.peek(addr),
-                    IoChip::Cia1 => {
-                        let (val, _irq_delta) = self.cia1.read((addr & 0x0F) as u8);
-                        val
-                    }
-                    IoChip::Cia2 => {
-                        let (val, _irq_delta) = self.cia2.read((addr & 0x0F) as u8);
-                        val
-                    }
-                    IoChip::DisconnectedBus => self.mmu.last_read_byte(),
-                    IoChip::ExtraSid(_) => 0xFF,
+            PageMapping::Io => match self.io_bank.dispatch(addr) {
+                IoChip::Vic => self.vic.read((addr & 0x3F) as u8),
+                IoChip::Sid => self.sid_bank.peek(addr),
+                IoChip::ColorRam => self.color_ram.peek(addr),
+                IoChip::Cia1 => {
+                    let (val, _irq_delta) = self.cia1.read((addr & 0x0F) as u8);
+                    val
                 }
-            }
+                IoChip::Cia2 => {
+                    let (val, _irq_delta) = self.cia2.read((addr & 0x0F) as u8);
+                    val
+                }
+                IoChip::DisconnectedBus => self.mmu.last_read_byte(),
+                IoChip::ExtraSid(_) => 0xFF,
+            },
         }
     }
 

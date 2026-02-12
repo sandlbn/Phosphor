@@ -35,7 +35,9 @@ impl SystemRamBank {
 }
 
 impl Default for SystemRamBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for SystemRamBank {

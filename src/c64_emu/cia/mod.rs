@@ -7,41 +7,41 @@
 //! - Interrupt control logic (old 6526: 1-cycle delayed; new 8521: immediate)
 //! - Two 8-bit I/O ports (directly memory-mapped at the 16 registers)
 
+pub mod interrupt;
 pub mod timer;
 pub mod tod;
-pub mod interrupt;
 
+use interrupt::{CiaModel, InterruptSource};
 use timer::Timer;
 use tod::Tod;
-use interrupt::{InterruptSource, CiaModel};
 
 // ── Register offsets (low 4 bits of address) ──────────────────
 
-pub const PRA: u8     = 0;
-pub const PRB: u8     = 1;
-pub const DDRA: u8    = 2;
-pub const DDRB: u8    = 3;
-pub const TAL: u8     = 4;
-pub const TAH: u8     = 5;
-pub const TBL: u8     = 6;
-pub const TBH: u8     = 7;
+pub const PRA: u8 = 0;
+pub const PRB: u8 = 1;
+pub const DDRA: u8 = 2;
+pub const DDRB: u8 = 3;
+pub const TAL: u8 = 4;
+pub const TAH: u8 = 5;
+pub const TBL: u8 = 6;
+pub const TBH: u8 = 7;
 pub const TOD_TEN: u8 = 8;
 pub const TOD_SEC: u8 = 9;
 pub const TOD_MIN: u8 = 10;
-pub const TOD_HR: u8  = 11;
-pub const SDR: u8     = 12;
-pub const ICR: u8     = 13;
-pub const CRA: u8     = 14;
-pub const CRB: u8     = 15;
+pub const TOD_HR: u8 = 11;
+pub const SDR: u8 = 12;
+pub const ICR: u8 = 13;
+pub const CRA: u8 = 14;
+pub const CRB: u8 = 15;
 
 // ── Interrupt flag bits ───────────────────────────────────────
 
 pub const INT_UNDERFLOW_A: u8 = 1 << 0;
 pub const INT_UNDERFLOW_B: u8 = 1 << 1;
-pub const INT_ALARM: u8       = 1 << 2;
-pub const INT_SP: u8          = 1 << 3;
-pub const INT_FLAG: u8        = 1 << 4;
-pub const INT_REQUEST: u8     = 1 << 7;
+pub const INT_ALARM: u8 = 1 << 2;
+pub const INT_SP: u8 = 1 << 3;
+pub const INT_FLAG: u8 = 1 << 4;
+pub const INT_REQUEST: u8 = 1 << 7;
 
 // ── MOS652X ───────────────────────────────────────────────────
 
@@ -129,8 +129,12 @@ impl Mos652x {
             TBL => self.timer_b.latch_lo(data),
             TBH => self.timer_b.latch_hi(data),
             TOD_TEN..=TOD_HR => {
-                self.tod.write(addr - TOD_TEN, data,
-                    self.regs[CRA as usize], self.regs[CRB as usize]);
+                self.tod.write(
+                    addr - TOD_TEN,
+                    data,
+                    self.regs[CRA as usize],
+                    self.regs[CRB as usize],
+                );
             }
             SDR => { /* serial port start — simplified */ }
             ICR => {
@@ -176,21 +180,27 @@ impl Mos652x {
                 // output mode — count underflows for shift register
             }
 
-            if irq { return Some(true); }
+            if irq {
+                return Some(true);
+            }
         }
 
         // --- Timer B ---
         let ub = self.timer_b.tick_phi2();
         if ub {
             let irq = self.interrupt.trigger(INT_UNDERFLOW_B);
-            if irq { return Some(true); }
+            if irq {
+                return Some(true);
+            }
         }
 
         // --- TOD ---
         let alarm = self.tod.tick(self.regs[CRA as usize]);
         if alarm {
             let irq = self.interrupt.trigger(INT_ALARM);
-            if irq { return Some(true); }
+            if irq {
+                return Some(true);
+            }
         }
 
         None

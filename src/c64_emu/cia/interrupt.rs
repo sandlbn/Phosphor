@@ -3,7 +3,7 @@
 //! Old CIA (MOS 6526): interrupts are delayed by 1 cycle.
 //! New CIA (MOS 8521): interrupts fire immediately.
 
-use super::{INT_REQUEST};
+use super::INT_REQUEST;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiaModel {

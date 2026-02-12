@@ -52,8 +52,8 @@ impl Mmu {
 
     /// Called by the zero-page bank when $01 changes.
     pub fn set_cpu_port(&mut self, state: u8) {
-        self.loram  = (state & 1) != 0;
-        self.hiram  = (state & 2) != 0;
+        self.loram = (state & 1) != 0;
+        self.hiram = (state & 2) != 0;
         self.charen = (state & 4) != 0;
         self.update_mapping();
     }
@@ -88,11 +88,16 @@ impl Mmu {
 
     /// Pseudo-random "last byte on VIC bus" (same LCG as libsidplayfp).
     pub fn last_read_byte(&mut self) -> u8 {
-        self.seed = self.seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
         (self.seed >> 16) as u8
     }
 }
 
 impl Default for Mmu {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

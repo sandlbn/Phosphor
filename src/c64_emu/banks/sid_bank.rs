@@ -14,7 +14,9 @@ pub struct NullSid;
 
 impl SidChip for NullSid {
     fn reset(&mut self, _volume: u8) {}
-    fn read(&self, _reg: u8) -> u8 { 0xFF }
+    fn read(&self, _reg: u8) -> u8 {
+        0xFF
+    }
     fn write(&mut self, _reg: u8, _data: u8) {}
 }
 
@@ -46,7 +48,9 @@ impl SidBank {
 }
 
 impl Default for SidBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for SidBank {

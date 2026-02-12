@@ -59,5 +59,7 @@ impl ExtraSidBank {
 }
 
 impl Default for ExtraSidBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

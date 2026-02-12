@@ -59,11 +59,17 @@ impl IoBank {
     /// Standard C64 I/O mapping.
     pub fn reset_default(&mut self) {
         // $D000-$D3FF  VIC-II
-        for i in 0x0..=0x3 { self.map[i] = IoChip::Vic; }
+        for i in 0x0..=0x3 {
+            self.map[i] = IoChip::Vic;
+        }
         // $D400-$D7FF  SID
-        for i in 0x4..=0x7 { self.map[i] = IoChip::Sid; }
+        for i in 0x4..=0x7 {
+            self.map[i] = IoChip::Sid;
+        }
         // $D800-$DBFF  Color RAM
-        for i in 0x8..=0xB { self.map[i] = IoChip::ColorRam; }
+        for i in 0x8..=0xB {
+            self.map[i] = IoChip::ColorRam;
+        }
         // $DC00-$DCFF  CIA1
         self.map[0xC] = IoChip::Cia1;
         // $DD00-$DDFF  CIA2

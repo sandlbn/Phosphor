@@ -4,7 +4,8 @@
 // Fixed-size protocol — every command has a known byte count.
 //
 // CMD_RING writes are buffered. CMD_FLUSH packs them into 64-byte
-// USB bulk packets via single_write — one transfer per 31 reg/val pairs.
+// USB bulk packets via single_write using OP_CYCLED_WRITE — one
+// transfer per 15 reg/val/cycles tuples (4 bytes each).
 //
 // Not needed on Windows — USB access works directly from userspace.
 
@@ -44,8 +45,11 @@ mod unix_main {
     const RESP_OK: u8 = 0x00;
     const RESP_ERR: u8 = 0x01;
 
-    /// Max reg/val pairs per 64-byte USB packet: (64 - 1 header) / 2 = 31
-    const MAX_PAIRS_PER_PACKET: usize = 31;
+    /// OP_CYCLED_WRITE opcode (top 2 bits = 0b10).
+    const OP_CYCLED_WRITE: u8 = 2;
+
+    /// Max cycled-write tuples per 64-byte USB packet: (64 - 1 header) / 4 = 15
+    const MAX_PAIRS_PER_PACKET: usize = 15;
 
     fn send_ok(stream: &mut impl Write) {
         let _ = stream.write_all(&[RESP_OK]);
@@ -60,10 +64,10 @@ mod unix_main {
         let _ = stream.flush();
     }
 
-    /// Flush buffered writes as bulk USB packets.
-    /// Each packet: [write_header, reg1, val1, reg2, val2, ...]
-    /// write_header = data_len (since OP_WRITE = 0, top 2 bits are 0).
-    fn flush_ring_buf(dev: &mut UsbSid, ring_buf: &[(u8, u8)]) {
+    /// Flush buffered writes as bulk USB packets using OP_CYCLED_WRITE.
+    /// Each packet: [header, reg1, val1, cyc1_hi, cyc1_lo, reg2, val2, ...]
+    /// header = (OP_CYCLED_WRITE << 6) | byte_count
+    fn flush_ring_buf(dev: &mut UsbSid, ring_buf: &[(u8, u8, u16)]) {
         if ring_buf.is_empty() {
             return;
         }
@@ -71,13 +75,15 @@ mod unix_main {
         let mut pkt = [0u8; 64];
 
         for chunk in ring_buf.chunks(MAX_PAIRS_PER_PACKET) {
-            let data_len = (chunk.len() * 2) as u8;
-            pkt[0] = data_len; // USB protocol header (OP_WRITE=0 | byte_count)
-            for (i, &(reg, val)) in chunk.iter().enumerate() {
-                pkt[1 + i * 2] = reg;
-                pkt[2 + i * 2] = val;
+            let data_len = (chunk.len() * 4) as u8; // 4 bytes per write
+            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
+            for (i, &(reg, val, cycles)) in chunk.iter().enumerate() {
+                pkt[1 + i * 4] = reg;
+                pkt[2 + i * 4] = val;
+                pkt[3 + i * 4] = (cycles >> 8) as u8;
+                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
             }
-            let total = 1 + chunk.len() * 2;
+            let total = 1 + chunk.len() * 4;
             let _ = dev.single_write(&pkt[..total]);
         }
     }
@@ -86,7 +92,7 @@ mod unix_main {
         let mut dev: Option<UsbSid> = None;
         let mut cmd = [0u8; 1];
         // Buffer for CMD_RING writes — flushed on CMD_FLUSH
-        let mut ring_buf: Vec<(u8, u8)> = Vec::with_capacity(128);
+        let mut ring_buf: Vec<(u8, u8, u16)> = Vec::with_capacity(128);
 
         eprintln!("[usbsid-bridge] client connected");
 
@@ -163,12 +169,13 @@ mod unix_main {
 
                 CMD_RING => {
                     // Fixed 4 bytes: reg, val, cycles_hi, cycles_lo
-                    // Buffer the write — flushed as bulk USB packet on CMD_FLUSH
+                    // Buffer the write with cycles — flushed as OP_CYCLED_WRITE on CMD_FLUSH
                     let mut b = [0u8; 4];
                     if stream.read_exact(&mut b).is_err() {
                         break;
                     }
-                    ring_buf.push((b[0], b[1]));
+                    let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
+                    ring_buf.push((b[0], b[1], cycles));
                 }
 
                 CMD_FLUSH => {

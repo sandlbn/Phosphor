@@ -10,12 +10,15 @@
 use crate::sid_device::SidDevice;
 use usbsid_pico::{ClockSpeed, UsbSid};
 
-/// Max reg/val pairs per 64-byte USB packet: (64 - 1 header) / 2 = 31
-const MAX_PAIRS_PER_PACKET: usize = 31;
+/// OP_CYCLED_WRITE opcode (top 2 bits = 0b10).
+const OP_CYCLED_WRITE: u8 = 2;
+
+/// Max cycled-write tuples per 64-byte USB packet: (64 - 1 header) / 4 = 15
+const MAX_PAIRS_PER_PACKET: usize = 15;
 
 pub struct DirectDevice {
     dev: UsbSid,
-    ring_buf: Vec<(u8, u8)>,
+    ring_buf: Vec<(u8, u8, u16)>, // (reg, val, delta_cycles)
 }
 
 impl DirectDevice {
@@ -30,9 +33,9 @@ impl DirectDevice {
         })
     }
 
-    /// Pack buffered writes into 64-byte bulk USB packets.
-    /// Each packet: [data_len, reg1, val1, reg2, val2, ...]
-    /// where data_len = num_pairs * 2 (OP_WRITE = 0, so top bits are 0).
+    /// Pack buffered writes into 64-byte bulk USB packets using OP_CYCLED_WRITE.
+    /// Each packet: [header, reg1, val1, cyc1_hi, cyc1_lo, reg2, val2, ...]
+    /// header = (OP_CYCLED_WRITE << 6) | byte_count
     fn flush_ring_buf(&mut self) {
         if self.ring_buf.is_empty() {
             return;
@@ -41,13 +44,15 @@ impl DirectDevice {
         let mut pkt = [0u8; 64];
 
         for chunk in self.ring_buf.chunks(MAX_PAIRS_PER_PACKET) {
-            let data_len = (chunk.len() * 2) as u8;
-            pkt[0] = data_len;
-            for (i, &(reg, val)) in chunk.iter().enumerate() {
-                pkt[1 + i * 2] = reg;
-                pkt[2 + i * 2] = val;
+            let data_len = (chunk.len() * 4) as u8; // 4 bytes per write
+            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
+            for (i, &(reg, val, cycles)) in chunk.iter().enumerate() {
+                pkt[1 + i * 4] = reg;
+                pkt[2 + i * 4] = val;
+                pkt[3 + i * 4] = (cycles >> 8) as u8;
+                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
             }
-            let total = 1 + chunk.len() * 2;
+            let total = 1 + chunk.len() * 4;
             let _ = self.dev.single_write(&pkt[..total]);
         }
 
@@ -87,9 +92,9 @@ impl SidDevice for DirectDevice {
             return;
         }
 
-        // Buffer all writes, ignoring cycle values (frame pacing by player)
-        for &(_cycles, reg, val) in writes {
-            self.ring_buf.push((reg, val));
+        // Buffer all writes WITH cycle deltas for OP_CYCLED_WRITE
+        for &(cycles, reg, val) in writes {
+            self.ring_buf.push((reg, val, cycles));
         }
 
         // Immediately flush as bulk USB packets

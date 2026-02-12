@@ -614,7 +614,15 @@ fn setup_playback(
     let halt_pc = trampoline + 3;
 
     let engine = if is_rsid {
-        setup_rsid_engine(&sid_file, song, &mapper, mono_mode, cycles_per_frame, trampoline, halt_pc)
+        setup_rsid_engine(
+            &sid_file,
+            song,
+            &mapper,
+            mono_mode,
+            cycles_per_frame,
+            trampoline,
+            halt_pc,
+        )
     } else {
         setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc)
     };
@@ -629,7 +637,10 @@ fn setup_playback(
         for &(_cycle, reg, val) in init_writes {
             br.write(reg, val);
         }
-        eprintln!("[phosphor] INIT done, {} SID writes sent", init_writes.len());
+        eprintln!(
+            "[phosphor] INIT done, {} SID writes sent",
+            init_writes.len()
+        );
     }
 
     // Clear writes and install play trampoline for PSID
@@ -637,7 +648,8 @@ fn setup_playback(
         PlayEngine::Psid(mut cpu) => {
             cpu.memory.clear_writes();
             if header.play_address != 0 {
-                cpu.memory.install_trampoline(trampoline, header.play_address);
+                cpu.memory
+                    .install_trampoline(trampoline, header.play_address);
             }
             PlayEngine::Psid(cpu)
         }
@@ -693,7 +705,10 @@ fn setup_psid_engine(
     let init_returned = cpu.registers.program_counter == halt_pc;
 
     if !init_returned {
-        eprintln!("[phosphor] PSID INIT did not return (PC=${:04X})", cpu.registers.program_counter);
+        eprintln!(
+            "[phosphor] PSID INIT did not return (PC=${:04X})",
+            cpu.registers.program_counter
+        );
     }
 
     PlayEngine::Psid(cpu)
@@ -876,13 +891,13 @@ fn run_rsid_init_emu(
             let cia1_ta_started = cpu.memory.c64.cia1.timer_a.started();
             let cia1_ta_mask = cpu.memory.c64.cia1.interrupt.icr_mask() & 0x01 != 0;
 
-            let irq_ready = irq_vec != 0xEA31
-                && (vic_raster_irq || (cia1_ta_mask && cia1_ta_started));
+            let irq_ready =
+                irq_vec != 0xEA31 && (vic_raster_irq || (cia1_ta_mask && cia1_ta_started));
 
             // Check NMI vector
             let kernal_rom = cpu.memory.c64.kernal_rom.rom_ref();
-            let nmi_hw_vec = kernal_rom[0xFFFA - 0xE000] as u16
-                | ((kernal_rom[0xFFFB - 0xE000] as u16) << 8);
+            let nmi_hw_vec =
+                kernal_rom[0xFFFA - 0xE000] as u16 | ((kernal_rom[0xFFFB - 0xE000] as u16) << 8);
             let nmi_installed = nmi_vec != 0xFE72 || nmi_hw_vec != 0xFE43;
             let cia2_mask = cpu.memory.c64.cia2.interrupt.icr_mask();
             let cia2_ta_started = cpu.memory.c64.cia2.timer_a.started();

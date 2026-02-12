@@ -52,7 +52,9 @@ impl PartialOrd for ScheduledEvent {
 impl Ord for ScheduledEvent {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap; we want earliest first → reverse.
-        other.fire_at.cmp(&self.fire_at)
+        other
+            .fire_at
+            .cmp(&self.fire_at)
             .then_with(|| other.id.cmp(&self.id))
     }
 }
@@ -101,7 +103,11 @@ impl EventContext {
         let id = self.next_id;
         self.next_id += 1;
         let fire_at = self.clock + delay + (phase as EventClock) - (self.phase as EventClock);
-        self.queue.push(ScheduledEvent { fire_at, id, action: Some(action) });
+        self.queue.push(ScheduledEvent {
+            fire_at,
+            id,
+            action: Some(action),
+        });
         id
     }
 
@@ -121,7 +127,9 @@ impl EventContext {
 
     /// Is the event still pending?
     pub fn is_pending(&self, target_id: EventId) -> bool {
-        self.queue.iter().any(|e| e.id == target_id && e.action.is_some())
+        self.queue
+            .iter()
+            .any(|e| e.id == target_id && e.action.is_some())
     }
 
     // ── Advance ────────────────────────────────────────────────
@@ -138,11 +146,15 @@ impl EventContext {
 
         let mut fired = false;
         loop {
-            let should_fire = self.queue.peek()
+            let should_fire = self
+                .queue
+                .peek()
                 .map_or(false, |e| e.fire_at <= self.clock && e.action.is_some());
             if !should_fire {
                 // Also drain dead (cancelled) entries at the top.
-                let is_dead = self.queue.peek()
+                let is_dead = self
+                    .queue
+                    .peek()
                     .map_or(false, |e| e.fire_at <= self.clock && e.action.is_none());
                 if is_dead {
                     self.queue.pop();

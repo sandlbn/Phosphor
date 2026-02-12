@@ -71,10 +71,7 @@ impl Sprites {
         let y = (raster_y & 0xFF) as u8;
         let mut mask: u8 = 1;
         for i in 0..NUM_SPRITES {
-            if (enable & mask != 0)
-                && (y == regs[(i << 1) + 1])
-                && (self.dma & mask == 0)
-            {
+            if (enable & mask != 0) && (y == regs[(i << 1) + 1]) && (self.dma & mask == 0) {
                 self.dma |= mask;
                 self.mc_base[i] = 0;
                 self.exp_flop |= mask;
@@ -104,5 +101,7 @@ impl Sprites {
 }
 
 impl Default for Sprites {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

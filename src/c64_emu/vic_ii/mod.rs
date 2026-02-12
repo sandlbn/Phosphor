@@ -3,11 +3,11 @@
 //! Not cycle-exact pixel rendering but accurate enough for SID playback:
 //! raster IRQs, bad-line detection, sprite DMA, lightpen.
 
-pub mod sprites;
 pub mod lightpen;
+pub mod sprites;
 
-use sprites::Sprites;
 use lightpen::Lightpen;
+use sprites::Sprites;
 
 // ── Model data ────────────────────────────────────────────────
 
@@ -26,21 +26,36 @@ struct ModelData {
 }
 
 const MODEL_DATA: [ModelData; 5] = [
-    ModelData { raster_lines: 262, cycles_per_line: 64 }, // Old NTSC
-    ModelData { raster_lines: 263, cycles_per_line: 65 }, // NTSC-M
-    ModelData { raster_lines: 312, cycles_per_line: 63 }, // PAL-B
-    ModelData { raster_lines: 312, cycles_per_line: 65 }, // PAL-N
-    ModelData { raster_lines: 263, cycles_per_line: 65 }, // PAL-M
+    ModelData {
+        raster_lines: 262,
+        cycles_per_line: 64,
+    }, // Old NTSC
+    ModelData {
+        raster_lines: 263,
+        cycles_per_line: 65,
+    }, // NTSC-M
+    ModelData {
+        raster_lines: 312,
+        cycles_per_line: 63,
+    }, // PAL-B
+    ModelData {
+        raster_lines: 312,
+        cycles_per_line: 65,
+    }, // PAL-N
+    ModelData {
+        raster_lines: 263,
+        cycles_per_line: 65,
+    }, // PAL-M
 ];
 
 // ── IRQ flags ─────────────────────────────────────────────────
 
-const IRQ_RASTER: u8   = 1 << 0;
+const IRQ_RASTER: u8 = 1 << 0;
 const IRQ_LIGHTPEN: u8 = 1 << 3;
 
 const FIRST_DMA_LINE: u32 = 0x30;
-const LAST_DMA_LINE: u32  = 0xF7;
-const FETCH_CYCLE: u32    = 11;
+const LAST_DMA_LINE: u32 = 0xF7;
+const FETCH_CYCLE: u32 = 11;
 const SCREEN_TEXTCOLS: u32 = 40;
 
 // ── MOS656X ───────────────────────────────────────────────────
@@ -166,7 +181,10 @@ impl Mos656x {
     pub fn write(&mut self, addr: u8, data: u8) -> VicOutput {
         let a = (addr & 0x3F) as usize;
         self.regs[a] = data;
-        let mut out = VicOutput { irq: None, ba: None };
+        let mut out = VicOutput {
+            irq: None,
+            ba: None,
+        };
 
         match a {
             0x11 => {
@@ -185,10 +203,8 @@ impl Mos656x {
                     && self.raster_y >= FIRST_DMA_LINE
                     && self.raster_y <= LAST_DMA_LINE
                 {
-                    let was_bad = self.are_bad_lines_enabled
-                        && old_yscroll == (self.raster_y & 7);
-                    let now_bad = self.are_bad_lines_enabled
-                        && self.yscroll == (self.raster_y & 7);
+                    let was_bad = self.are_bad_lines_enabled && old_yscroll == (self.raster_y & 7);
+                    let now_bad = self.are_bad_lines_enabled && self.yscroll == (self.raster_y & 7);
                     if now_bad != was_bad {
                         if now_bad && self.line_cycle <= FETCH_CYCLE + SCREEN_TEXTCOLS + 6 {
                             self.is_bad_line = true;
@@ -233,7 +249,10 @@ impl Mos656x {
             self.line_cycle = 0;
         }
 
-        let mut out = VicOutput { irq: None, ba: None };
+        let mut out = VicOutput {
+            irq: None,
+            ba: None,
+        };
 
         // Beginning of line
         if self.line_cycle == 0 {
@@ -314,7 +333,11 @@ impl Mos656x {
     }
 
     fn old_raster_y(&self) -> u32 {
-        if self.raster_y > 0 { self.raster_y - 1 } else { self.max_rasters - 1 }
+        if self.raster_y > 0 {
+            self.raster_y - 1
+        } else {
+            self.max_rasters - 1
+        }
     }
 
     fn raster_y_irq_edge_detect(&mut self) {
@@ -344,10 +367,7 @@ impl Mos656x {
         if self.raster_y == self.max_rasters - 1 {
             self.vblanking = true;
         }
-        if self.raster_y == FIRST_DMA_LINE
-            && !self.are_bad_lines_enabled
-            && self.read_den()
-        {
+        if self.raster_y == FIRST_DMA_LINE && !self.are_bad_lines_enabled && self.read_den() {
             self.are_bad_lines_enabled = true;
         }
         if self.raster_y == LAST_DMA_LINE {
@@ -384,5 +404,7 @@ impl Mos656x {
 }
 
 impl Default for Mos656x {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

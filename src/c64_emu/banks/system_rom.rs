@@ -137,11 +137,14 @@ impl KernalRomBank {
 }
 
 impl Default for KernalRomBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for KernalRomBank {
-    fn poke(&mut self, _address: u16, _value: u8) { /* ROM: no-op */ }
+    fn poke(&mut self, _address: u16, _value: u8) { /* ROM: no-op */
+    }
     fn peek(&self, address: u16) -> u8 {
         self.rom[mask(0x2000, address)]
     }
@@ -173,7 +176,8 @@ impl BasicRomBank {
         let off = mask(0x2000, 0xA7AE);
         self.trap_backup.copy_from_slice(&self.rom[off..off + 3]);
         let off2 = mask(0x2000, 0xBF53);
-        self.subtune_backup.copy_from_slice(&self.rom[off2..off2 + 11]);
+        self.subtune_backup
+            .copy_from_slice(&self.rom[off2..off2 + 11]);
     }
 
     pub fn reset(&mut self) {
@@ -192,7 +196,7 @@ impl BasicRomBank {
 
     pub fn set_subtune(&mut self, tune: u8) {
         let o = mask(0x2000, 0xBF53);
-        self.rom[o]     = opc::LDA_IMM;
+        self.rom[o] = opc::LDA_IMM;
         self.rom[o + 1] = tune;
         self.rom[o + 2] = opc::STA_ABS;
         self.rom[o + 3] = 0x0C;
@@ -207,11 +211,14 @@ impl BasicRomBank {
 }
 
 impl Default for BasicRomBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for BasicRomBank {
-    fn poke(&mut self, _address: u16, _value: u8) { /* ROM: no-op */ }
+    fn poke(&mut self, _address: u16, _value: u8) { /* ROM: no-op */
+    }
     fn peek(&self, address: u16) -> u8 {
         self.rom[mask(0x2000, address)]
     }
@@ -237,7 +244,9 @@ impl CharacterRomBank {
 }
 
 impl Default for CharacterRomBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for CharacterRomBank {

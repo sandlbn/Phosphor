@@ -4,10 +4,10 @@
 //! Driven by the 50 Hz or 60 Hz power-line signal (divided from the
 //! system clock).
 
-const TENTHS: usize  = 0;
+const TENTHS: usize = 0;
 const SECONDS: usize = 1;
 const MINUTES: usize = 2;
-const HOURS: usize   = 3;
+const HOURS: usize = 3;
 
 pub struct Tod {
     clock: [u8; 4],
@@ -73,7 +73,7 @@ impl Tod {
     pub fn write(&mut self, reg: u8, mut data: u8, _cra: u8, crb: u8) {
         let r = reg as usize;
         match r {
-            TENTHS  => data &= 0x0F,
+            TENTHS => data &= 0x0F,
             SECONDS | MINUTES => data &= 0x7F,
             HOURS => {
                 data &= 0x9F;
@@ -125,8 +125,8 @@ impl Tod {
                         alarm = true;
                     }
                 } else {
-                    self.tick_counter = (self.tick_counter >> 1)
-                        | ((!self.tick_counter << 2) & 0x4);
+                    self.tick_counter =
+                        (self.tick_counter >> 1) | ((!self.tick_counter << 2) & 0x4);
                 }
             }
         }
@@ -173,10 +173,10 @@ impl Tod {
             }
         }
 
-        self.clock[TENTHS]  = ts;
+        self.clock[TENTHS] = ts;
         self.clock[SECONDS] = sl | (sh << 4);
         self.clock[MINUTES] = ml | (mh << 4);
-        self.clock[HOURS]   = hl | (hh << 4) | pm;
+        self.clock[HOURS] = hl | (hh << 4) | pm;
     }
 
     fn check_alarm(&self) -> bool {
@@ -185,5 +185,7 @@ impl Tod {
 }
 
 impl Default for Tod {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

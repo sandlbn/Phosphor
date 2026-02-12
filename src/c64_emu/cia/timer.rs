@@ -7,20 +7,20 @@
 //! implementation.
 
 /// Control-register / state bits (matching libsidplayfp constants).
-pub const CIAT_CR_START: u32   = 0x01;
-pub const CIAT_STEP: u32       = 0x04;
+pub const CIAT_CR_START: u32 = 0x01;
+pub const CIAT_STEP: u32 = 0x04;
 pub const CIAT_CR_ONESHOT: u32 = 0x08;
-pub const CIAT_CR_FLOAD: u32   = 0x10;
-pub const CIAT_PHI2IN: u32     = 0x20;
-pub const CIAT_CR_MASK: u32    = CIAT_CR_START | CIAT_CR_ONESHOT | CIAT_CR_FLOAD | CIAT_PHI2IN;
+pub const CIAT_CR_FLOAD: u32 = 0x10;
+pub const CIAT_PHI2IN: u32 = 0x20;
+pub const CIAT_CR_MASK: u32 = CIAT_CR_START | CIAT_CR_ONESHOT | CIAT_CR_FLOAD | CIAT_PHI2IN;
 
-pub const CIAT_COUNT2: u32     = 0x100;
-pub const CIAT_COUNT3: u32     = 0x200;
-pub const CIAT_ONESHOT0: u32   = 0x08 << 8;
-pub const CIAT_ONESHOT: u32    = 0x08 << 16;
-pub const CIAT_LOAD1: u32      = 0x10 << 8;
-pub const CIAT_LOAD: u32       = 0x10 << 16;
-pub const CIAT_OUT: u32        = 0x8000_0000;
+pub const CIAT_COUNT2: u32 = 0x100;
+pub const CIAT_COUNT3: u32 = 0x200;
+pub const CIAT_ONESHOT0: u32 = 0x08 << 8;
+pub const CIAT_ONESHOT: u32 = 0x08 << 16;
+pub const CIAT_LOAD1: u32 = 0x10 << 8;
+pub const CIAT_LOAD: u32 = 0x10 << 16;
+pub const CIAT_OUT: u32 = 0x8000_0000;
 
 pub struct Timer {
     pub counter: u16,
@@ -135,5 +135,7 @@ impl Timer {
 }
 
 impl Default for Timer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

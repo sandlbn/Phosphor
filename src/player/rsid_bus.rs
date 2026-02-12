@@ -5,7 +5,7 @@
 
 use mos6502::memory::Bus;
 
-use crate::c64_emu::c64::{C64, C64Model, C64CiaModel};
+use crate::c64_emu::c64::{C64CiaModel, C64Model, C64};
 use crate::c64_emu::mmu::PageMapping;
 
 use super::memory::{SidMapper, SidWrite, SID_REG_SIZE};
@@ -51,7 +51,11 @@ pub struct RsidBus {
 impl RsidBus {
     pub fn new(is_pal: bool, mapper: SidMapper, mono: bool) -> Self {
         let mut c64 = C64::new();
-        c64.set_model(if is_pal { C64Model::PalB } else { C64Model::NtscM });
+        c64.set_model(if is_pal {
+            C64Model::PalB
+        } else {
+            C64Model::NtscM
+        });
         c64.set_cia_model(C64CiaModel::Old);
         c64.reset();
 
@@ -100,54 +104,74 @@ impl RsidBus {
 
         // RTS stubs for KERNAL entry points (same set as Phosphor)
         let rts_stubs: &[u16] = &[
-            0xFF81, 0xFF84, 0xFF87, 0xFF8A, 0xFF8D, 0xFF90, 0xFF93, 0xFF96,
-            0xFF99, 0xFF9C, 0xFFA5, 0xFFB1, 0xFFB4, 0xFFBD, 0xFFC0, 0xFFC3,
-            0xFFC6, 0xFFC9, 0xFFCC, 0xFFCF, 0xFFD2, 0xFFD5, 0xFFD8, 0xFFDB,
-            0xFFDE, 0xFFE7,
+            0xFF81, 0xFF84, 0xFF87, 0xFF8A, 0xFF8D, 0xFF90, 0xFF93, 0xFF96, 0xFF99, 0xFF9C, 0xFFA5,
+            0xFFB1, 0xFFB4, 0xFFBD, 0xFFC0, 0xFFC3, 0xFFC6, 0xFFC9, 0xFFCC, 0xFFCF, 0xFFD2, 0xFFD5,
+            0xFFD8, 0xFFDB, 0xFFDE, 0xFFE7,
         ];
         for &addr in rts_stubs {
             s!(addr, 0x60);
         }
 
         // $FFE4 (GETIN) — LDA #$00; CLC; (RTS at $FFE7 above)
-        s!(0xFFE4, 0xA9); s!(0xFFE5, 0x00); s!(0xFFE6, 0x18);
+        s!(0xFFE4, 0xA9);
+        s!(0xFFE5, 0x00);
+        s!(0xFFE6, 0x18);
         // $FFE1 (STOP) — CLC; RTS
-        s!(0xFFE1, 0x18); s!(0xFFE2, 0x60);
+        s!(0xFFE1, 0x18);
+        s!(0xFFE2, 0x60);
         // $E544 (CLRSCR) — RTS
         s!(0xE544, 0x60);
 
         // $FF48: KERNAL IRQ entry — saves A/X/Y, checks BRK, dispatches
         let kernal_irq: [u8; 19] = [
-            0x48, 0x8A, 0x48, 0x98, 0x48, 0xBA, 0xBD, 0x04,
-            0x01, 0x29, 0x10, 0xD0, 0x03, 0x6C, 0x14, 0x03,
-            0x6C, 0x16, 0x03,
+            0x48, 0x8A, 0x48, 0x98, 0x48, 0xBA, 0xBD, 0x04, 0x01, 0x29, 0x10, 0xD0, 0x03, 0x6C,
+            0x14, 0x03, 0x6C, 0x16, 0x03,
         ];
         rom[0xFF48 - 0xE000..0xFF48 - 0xE000 + 19].copy_from_slice(&kernal_irq);
 
         // $EA31: Default IRQ handler — ack CIA1 + ack VIC + bump jiffy
-        s!(0xEA31, 0xAD); s!(0xEA32, 0x0D); s!(0xEA33, 0xDC); // LDA $DC0D
-        s!(0xEA34, 0xA9); s!(0xEA35, 0xFF);                     // LDA #$FF
-        s!(0xEA36, 0x8D); s!(0xEA37, 0x19); s!(0xEA38, 0xD0);  // STA $D019
-        s!(0xEA39, 0xEE); s!(0xEA3A, 0xA2); s!(0xEA3B, 0x00);  // INC $00A2
-        s!(0xEA3C, 0x4C); s!(0xEA3D, 0x81); s!(0xEA3E, 0xEA);  // JMP $EA81
+        s!(0xEA31, 0xAD);
+        s!(0xEA32, 0x0D);
+        s!(0xEA33, 0xDC); // LDA $DC0D
+        s!(0xEA34, 0xA9);
+        s!(0xEA35, 0xFF); // LDA #$FF
+        s!(0xEA36, 0x8D);
+        s!(0xEA37, 0x19);
+        s!(0xEA38, 0xD0); // STA $D019
+        s!(0xEA39, 0xEE);
+        s!(0xEA3A, 0xA2);
+        s!(0xEA3B, 0x00); // INC $00A2
+        s!(0xEA3C, 0x4C);
+        s!(0xEA3D, 0x81);
+        s!(0xEA3E, 0xEA); // JMP $EA81
 
         // $EA81: IRQ exit — PLA; TAY; PLA; TAX; PLA; RTI
-        s!(0xEA81, 0x68); s!(0xEA82, 0xA8);
-        s!(0xEA83, 0x68); s!(0xEA84, 0xAA);
-        s!(0xEA85, 0x68); s!(0xEA86, 0x40);
+        s!(0xEA81, 0x68);
+        s!(0xEA82, 0xA8);
+        s!(0xEA83, 0x68);
+        s!(0xEA84, 0xAA);
+        s!(0xEA85, 0x68);
+        s!(0xEA86, 0x40);
 
         // $FE43: KERNAL NMI entry
         let kernal_nmi: [u8; 8] = [0x48, 0x8A, 0x48, 0x98, 0x48, 0x6C, 0x18, 0x03];
         rom[0xFE43 - 0xE000..0xFE43 - 0xE000 + 8].copy_from_slice(&kernal_nmi);
 
         // $FE72: Default NMI handler — LDA $DD0D; JMP $EA81
-        s!(0xFE72, 0xAD); s!(0xFE73, 0x0D); s!(0xFE74, 0xDD);
-        s!(0xFE75, 0x4C); s!(0xFE76, 0x81); s!(0xFE77, 0xEA);
+        s!(0xFE72, 0xAD);
+        s!(0xFE73, 0x0D);
+        s!(0xFE74, 0xDD);
+        s!(0xFE75, 0x4C);
+        s!(0xFE76, 0x81);
+        s!(0xFE77, 0xEA);
 
         // Hardware interrupt vectors
-        s!(0xFFFA, 0x43); s!(0xFFFB, 0xFE); // NMI  → $FE43
-        s!(0xFFFC, 0x00); s!(0xFFFD, 0xE0); // RESET
-        s!(0xFFFE, 0x48); s!(0xFFFF, 0xFF); // IRQ  → $FF48
+        s!(0xFFFA, 0x43);
+        s!(0xFFFB, 0xFE); // NMI  → $FE43
+        s!(0xFFFC, 0x00);
+        s!(0xFFFD, 0xE0); // RESET
+        s!(0xFFFE, 0x48);
+        s!(0xFFFF, 0xFF); // IRQ  → $FF48
     }
 
     /// Install software vectors in RAM ($0314–$0319).
@@ -226,7 +250,7 @@ impl RsidBus {
     /// Install trampoline at `at`: JSR target; JMP halt
     pub fn install_trampoline(&mut self, at: u16, target: u16) {
         let a = at as usize;
-        self.c64.ram.ram[a]     = 0x20; // JSR
+        self.c64.ram.ram[a] = 0x20; // JSR
         self.c64.ram.ram[a + 1] = (target & 0xFF) as u8;
         self.c64.ram.ram[a + 2] = (target >> 8) as u8;
         self.c64.ram.ram[a + 3] = 0x4C; // JMP (halt)
@@ -347,14 +371,10 @@ impl RsidBus {
 impl Bus for RsidBus {
     fn get_byte(&mut self, addr: u16) -> u8 {
         // Intercept SID reads for osc3 / envelope when I/O is mapped
-        if addr >= 0xD400 && addr <= 0xD7FF
-            && self.c64.mmu.read_map[0xD] == PageMapping::Io
-        {
+        if addr >= 0xD400 && addr <= 0xD7FF && self.c64.mmu.read_map[0xD] == PageMapping::Io {
             return match (addr & 0x1F) as u8 {
                 0x1B => {
-                    self.osc3_seed = self.osc3_seed
-                        .wrapping_mul(1103515245)
-                        .wrapping_add(12345);
+                    self.osc3_seed = self.osc3_seed.wrapping_mul(1103515245).wrapping_add(12345);
                     (self.osc3_seed >> 16) as u8
                 }
                 0x1C => 0xFF,
@@ -369,9 +389,7 @@ impl Bus for RsidBus {
 
     fn set_byte(&mut self, addr: u16, val: u8) {
         // Intercept SID writes before passing through to the C64 core
-        if addr >= 0xD400 && addr <= 0xD7FF
-            && self.c64.mmu.write_map[0xD] == PageMapping::Io
-        {
+        if addr >= 0xD400 && addr <= 0xD7FF && self.c64.mmu.write_map[0xD] == PageMapping::Io {
             if let Some(reg) = self.map_sid_write(addr) {
                 self.sid_writes.push((self.frame_cycle, reg, val));
                 self.sid_shadow[reg as usize] = val;

@@ -30,11 +30,17 @@ impl Lightpen {
         self.is_triggered = false;
     }
 
-    pub fn get_x(&self) -> u8 { self.lpx }
-    pub fn get_y(&self) -> u8 { self.lpy }
+    pub fn get_x(&self) -> u8 {
+        self.lpx
+    }
+    pub fn get_y(&self) -> u8 {
+        self.lpy
+    }
 
     pub fn retrigger(&mut self, cycles_per_line: u32) -> bool {
-        if self.is_triggered { return false; }
+        if self.is_triggered {
+            return false;
+        }
         self.is_triggered = true;
         self.lpx = match cycles_per_line {
             65 => 0xD5,
@@ -45,7 +51,9 @@ impl Lightpen {
     }
 
     pub fn trigger(&mut self, line_cycle: u32, raster_y: u32) -> bool {
-        if self.is_triggered { return false; }
+        if self.is_triggered {
+            return false;
+        }
         self.is_triggered = true;
 
         if raster_y == self.last_line && line_cycle > 0 {
@@ -75,5 +83,7 @@ impl Lightpen {
 }
 
 impl Default for Lightpen {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

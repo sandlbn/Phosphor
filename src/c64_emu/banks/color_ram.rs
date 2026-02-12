@@ -7,12 +7,18 @@ pub struct ColorRamBank {
 }
 
 impl ColorRamBank {
-    pub fn new() -> Self { Self { ram: [0; 0x400] } }
-    pub fn reset(&mut self) { self.ram.fill(0); }
+    pub fn new() -> Self {
+        Self { ram: [0; 0x400] }
+    }
+    pub fn reset(&mut self) {
+        self.ram.fill(0);
+    }
 }
 
 impl Default for ColorRamBank {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bank for ColorRamBank {
