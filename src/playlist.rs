@@ -160,6 +160,12 @@ impl Playlist {
         count
     }
 
+    /// Bulk-add pre-parsed entries (used by background loading tasks).
+    pub fn add_entries(&mut self, entries: Vec<PlaylistEntry>) {
+        self.entries.extend(entries);
+        self.rebuild_shuffle();
+    }
+
     /// Remove entry at index.
     pub fn remove(&mut self, idx: usize) {
         if idx < self.entries.len() {
@@ -589,4 +595,78 @@ fn parse_pls(content: &str, base_dir: &Path) -> Vec<PathBuf> {
     }
 
     paths
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Background parsing helpers (for use in async tasks, off the UI thread)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse a list of SID file paths into playlist entries (blocking I/O).
+/// Designed to be called from a background thread via `Task::perform`.
+pub fn parse_files(paths: Vec<PathBuf>) -> Vec<PlaylistEntry> {
+    paths
+        .iter()
+        .filter_map(|p| PlaylistEntry::from_path(p).ok())
+        .collect()
+}
+
+/// Recursively walk a directory and parse all .sid files (blocking I/O).
+/// Designed to be called from a background thread via `Task::perform`.
+pub fn parse_directory(dir: PathBuf) -> Vec<PlaylistEntry> {
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(&dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if p.extension().map(|e| e.to_ascii_lowercase()) == Some("sid".into()) {
+            if let Ok(e) = PlaylistEntry::from_path(p) {
+                entries.push(e);
+            }
+        }
+    }
+    entries
+}
+
+/// Parse a playlist file (M3U/PLS) and load all referenced SID files (blocking I/O).
+/// Designed to be called from a background thread via `Task::perform`.
+pub fn parse_playlist_file(path: PathBuf) -> Result<Vec<PlaylistEntry>, String> {
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+
+    let playlist_dir = path.parent().unwrap_or(Path::new("."));
+
+    let ext = path
+        .extension()
+        .map(|e| e.to_ascii_lowercase().to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let paths: Vec<PathBuf> = if ext == "pls" {
+        parse_pls(&content, playlist_dir)
+    } else {
+        parse_m3u(&content, playlist_dir)
+    };
+
+    let mut entries = Vec::new();
+    for p in &paths {
+        if p.is_dir() {
+            entries.extend(parse_directory(p.clone()));
+        } else if let Ok(e) = PlaylistEntry::from_path(p) {
+            entries.push(e);
+        } else {
+            eprintln!(
+                "[phosphor] Playlist: skipping {} (not a valid SID)",
+                p.display()
+            );
+        }
+    }
+
+    eprintln!(
+        "[phosphor] Loaded {}/{} paths from {}",
+        entries.len(),
+        paths.len(),
+        path.display()
+    );
+    Ok(entries)
 }

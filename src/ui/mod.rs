@@ -62,6 +62,11 @@ pub enum Message {
     PlaylistSaved(Result<PathBuf, String>),
     PlaylistFileChosen(Option<PathBuf>),
 
+    // Background loading results (parsed off the UI thread)
+    FilesLoaded(Vec<crate::playlist::PlaylistEntry>),
+    FolderLoaded(Vec<crate::playlist::PlaylistEntry>),
+    PlaylistLoaded(Result<Vec<crate::playlist::PlaylistEntry>, String>),
+
     // Settings
     ToggleSettings,
     ToggleSkipRsid,

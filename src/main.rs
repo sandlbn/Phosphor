@@ -306,19 +306,40 @@ impl App {
 
             // ── Async results ────────────────────────────────────────────
             Message::FilesChosen(paths) => {
-                for path in paths {
-                    let _ = self.playlist.add_file(&path);
+                if paths.is_empty() {
+                    return Task::none();
                 }
-                self.apply_songlengths();
-                self.rebuild_filter();
+                // Parse SID headers off the UI thread
+                return Task::perform(
+                    async move { playlist::parse_files(paths) },
+                    Message::FilesLoaded,
+                );
             }
 
             Message::FolderChosen(Some(path)) => {
-                self.playlist.add_directory(&path);
-                self.apply_songlengths();
-                self.rebuild_filter();
+                // Walk + parse off the UI thread
+                return Task::perform(
+                    async move { playlist::parse_directory(path) },
+                    Message::FolderLoaded,
+                );
             }
             Message::FolderChosen(None) => {}
+
+            Message::FilesLoaded(entries) => {
+                if !entries.is_empty() {
+                    self.playlist.add_entries(entries);
+                    self.apply_songlengths();
+                    self.rebuild_filter();
+                }
+            }
+
+            Message::FolderLoaded(entries) => {
+                if !entries.is_empty() {
+                    self.playlist.add_entries(entries);
+                    self.apply_songlengths();
+                    self.rebuild_filter();
+                }
+            }
 
             Message::SonglengthFileChosen(Some(path)) => match SonglengthDb::load(&path) {
                 Ok(db) => {
@@ -341,16 +362,25 @@ impl App {
             }
 
             Message::PlaylistFileChosen(Some(path)) => {
-                match self.playlist.load_playlist_file(&path) {
-                    Ok(count) => {
-                        eprintln!("[phosphor] Loaded {count} tracks from playlist");
-                        self.apply_songlengths();
-                        self.rebuild_filter();
-                    }
-                    Err(e) => eprintln!("[phosphor] Failed to load playlist: {e}"),
-                }
+                // Parse playlist + SID headers off the UI thread
+                return Task::perform(
+                    async move { playlist::parse_playlist_file(path) },
+                    Message::PlaylistLoaded,
+                );
             }
             Message::PlaylistFileChosen(None) => {}
+
+            Message::PlaylistLoaded(Ok(entries)) => {
+                if !entries.is_empty() {
+                    eprintln!("[phosphor] Loaded {} tracks from playlist", entries.len());
+                    self.playlist.add_entries(entries);
+                    self.apply_songlengths();
+                    self.rebuild_filter();
+                }
+            }
+            Message::PlaylistLoaded(Err(e)) => {
+                eprintln!("[phosphor] Failed to load playlist: {e}");
+            }
 
             // ── Search / filter ───────────────────────────────────────
             Message::SearchChanged(query) => {
