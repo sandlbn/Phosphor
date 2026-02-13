@@ -17,7 +17,6 @@ pub mod zero_ram;
 pub use bank::Bank;
 pub use color_ram::ColorRamBank;
 pub use disconnected_bus::DisconnectedBusBank;
-pub use extra_sid::ExtraSidBank;
 pub use io_bank::IoBank;
 pub use sid_bank::SidBank;
 pub use system_ram::SystemRamBank;

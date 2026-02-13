@@ -206,6 +206,7 @@ impl Playlist {
     /// #EXTINF:123,Artist - Title
     /// /absolute/path/to/file.sid
     /// ```
+    #[allow(dead_code)]
     pub fn save_m3u(&self, path: &Path) -> Result<(), String> {
         use std::io::Write;
 
@@ -497,6 +498,7 @@ impl SonglengthDb {
     }
 
     /// Look up all subtune durations for a given MD5.
+    #[allow(dead_code)]
     pub fn lookup_all(&self, md5: &str) -> Option<&Vec<u32>> {
         self.entries.get(&md5.to_lowercase())
     }

@@ -1,7 +1,6 @@
 // Background player engine. Runs in its own thread, communicates
 // with the GUI via crossbeam channels. USB I/O goes through the
 // setuid usbsid-bridge helper (fixed-size protocol, async ring buffer).
-
 pub mod memory;
 pub mod rsid_bus;
 pub mod sid_file;
@@ -59,6 +58,7 @@ pub enum PlayState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TrackInfo {
     pub path: PathBuf,
     pub name: String,
@@ -478,6 +478,7 @@ fn stop_playback(ctx: &mut Option<PlayContext>, bridge: &mut Option<Box<dyn SidD
 //  Playback setup
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct PlayContext {
     engine: PlayEngine,
     trampoline: u16,
@@ -498,7 +499,7 @@ enum PlayEngine {
         prev_nmi: bool,
     },
 }
-
+#[allow(dead_code)]
 impl PlayContext {
     fn is_rsid(&self) -> bool {
         matches!(self.engine, PlayEngine::Rsid { .. })
@@ -724,15 +725,14 @@ fn setup_psid_engine(
 // ─────────────────────────────────────────────────────────────────────────────
 //  RSID engine setup (uses c64_emu for accurate emulation)
 // ─────────────────────────────────────────────────────────────────────────────
-
 fn setup_rsid_engine(
     sid_file: &SidFile,
     song: u16,
     mapper: &SidMapper,
     mono_mode: bool,
-    cycles_per_frame: u32,
+    _cycles_per_frame: u32,
     trampoline: u16,
-    halt_pc: u16,
+    _halt_pc: u16,
 ) -> PlayEngine {
     let header = &sid_file.header;
 

@@ -54,7 +54,7 @@ pub struct CiaTimer {
     pub oneshot: bool,
     pub underflow: bool,
 }
-
+#[allow(dead_code)]
 impl CiaTimer {
     pub fn new() -> Self {
         Self {
@@ -189,6 +189,7 @@ pub struct Cia {
     tod_hr: u8,
     tod_tick: u32, // cycle accumulator for TOD advance
 }
+#[allow(dead_code)]
 
 impl Cia {
     pub fn new() -> Self {
@@ -422,6 +423,7 @@ const LAST_DMA_LINE: u16 = 0xF7;
 const BADLINE_STEAL_CYCLES: u32 = 40;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Vic {
     pub raster_counter: u16,
     pub raster_compare: u16,
@@ -441,6 +443,7 @@ pub struct Vic {
     regs: [u8; 64],
 }
 
+#[allow(dead_code)]
 impl Vic {
     pub fn new(is_pal: bool) -> Self {
         let mut regs = [0u8; 64];
@@ -658,7 +661,7 @@ fn io_visible(port: u8) -> bool {
 fn kernal_visible(port: u8) -> bool {
     port & 0x02 != 0
 }
-
+#[allow(dead_code)]
 impl C64Memory {
     pub fn new(is_pal: bool, mapper: SidMapper, mono: bool) -> Self {
         let mut ram = [0u8; 65536];
