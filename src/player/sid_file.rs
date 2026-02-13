@@ -1,6 +1,7 @@
 // PSID / RSID header parser (v1–v4) with payload extraction.
 
 /// Parsed SID file header.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SidHeader {
     pub magic: String,

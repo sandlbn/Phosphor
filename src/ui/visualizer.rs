@@ -1,8 +1,3 @@
-// src/ui/visualizer.rs
-//
-// Canvas-based visualisation bar showing per-voice amplitude levels.
-// Inspired by Winamp / foobar2000 spectrum bars.
-
 use iced::widget::canvas::{self, Cache, Canvas, Frame, Geometry};
 use iced::{mouse, Color, Element, Length, Rectangle, Size, Theme};
 
