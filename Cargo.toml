@@ -11,8 +11,8 @@ rfd = "0.15"
 
 # 6502 emulation + USBSID hardware
 mos6502 = "0.8"
-#usbsid-pico = { version = "0.1.4", features = ["usb"] }
-usbsid-pico = { version = "^0", path = "../Usbsid", features = ["usb"] }
+usbsid-pico = { version = "0.1.4", features = ["usb"] }
+#usbsid-pico = { version = "^0", path = "../Usbsid", features = ["usb"] }
 # Player ↔ GUI communication
 crossbeam-channel = "0.5"
 

@@ -4131,7 +4131,9 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "usbsid-pico"
-version = "0.1.5"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be5048ca7f42eb9ad100bddba8f269774d52bc9a87b6347a19cf3781b494d04a"
 dependencies = [
  "log",
  "rusb",
