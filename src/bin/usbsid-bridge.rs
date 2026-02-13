@@ -3,9 +3,9 @@
 // Communicates with Phosphor over a Unix domain socket.
 // Fixed-size protocol — every command has a known byte count.
 //
-// Uses synchronous mode (init false, false) with manual
-// OP_CYCLED_WRITE packet packing — identical firmware packets
-// to C++ players but without the threading complexity.
+// Uses the driver's threaded ring buffer with cycle-accurate writes:
+// CMD_RING writes push to write_ring_cycled(), CMD_FLUSH signals
+// end-of-frame via set_flush().
 //
 // Not needed on Windows — USB access works directly from userspace.
 
@@ -45,9 +45,6 @@ mod unix_main {
     const RESP_OK: u8 = 0x00;
     const RESP_ERR: u8 = 0x01;
 
-    const OP_CYCLED_WRITE: u8 = 2;
-    const MAX_CYCLED_PER_PACKET: usize = 15;
-
     fn send_ok(stream: &mut impl Write) {
         let _ = stream.write_all(&[RESP_OK]);
         let _ = stream.flush();
@@ -65,9 +62,6 @@ mod unix_main {
         let mut dev: Option<UsbSid> = None;
         let mut cmd = [0u8; 1];
 
-        // Ring buffer for collecting cycled writes until flush
-        let mut ring_buf: Vec<(u16, u8, u8)> = Vec::with_capacity(256);
-
         eprintln!("[usbsid-bridge] client connected");
 
         loop {
@@ -84,7 +78,7 @@ mod unix_main {
                     let mut d = UsbSid::new();
                     match d.init(true, true) {
                         Ok(_) => {
-                            eprintln!("[usbsid-bridge] USBSID-Pico opened (synchronous)");
+                            eprintln!("[usbsid-bridge] USBSID-Pico opened (threaded, cycled)");
                             dev = Some(d);
                             send_ok(&mut stream);
                         }
@@ -116,7 +110,6 @@ mod unix_main {
                     if let Some(ref mut d) = dev {
                         d.reset();
                     }
-                    ring_buf.clear();
                     send_ok(&mut stream);
                 }
 
@@ -132,43 +125,35 @@ mod unix_main {
                 }
 
                 CMD_WRITE => {
+                    // Immediate register write (init/setup).
+                    // Uses single_write because write() is blocked in threaded mode.
                     let mut b = [0u8; 2];
                     if stream.read_exact(&mut b).is_err() {
                         break;
                     }
-                    if let Some(ref mut d) = dev {
-                        let _ = d.write(b[0], b[1]);
+                    if let Some(ref d) = dev {
+                        let buf = [0x00, b[0], b[1]];
+                        let _ = d.single_write(&buf);
                     }
                 }
 
                 CMD_RING => {
-                    // Fixed 4 bytes: reg, val, cycles_hi, cycles_lo
+                    // Push to driver's ring buffer: reg, val, cycles_hi, cycles_lo
                     let mut b = [0u8; 4];
                     if stream.read_exact(&mut b).is_err() {
                         break;
                     }
-                    let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
-                    ring_buf.push((cycles, b[0], b[1]));
+                    if let Some(ref d) = dev {
+                        let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
+                        let _ = d.write_ring_cycled(b[0], b[1], cycles);
+                    }
                 }
 
                 CMD_FLUSH => {
-                    // Pack and send all buffered writes as OP_CYCLED_WRITE packets
-                    if let Some(ref d) = dev {
-                        let mut pkt = [0u8; 64];
-                        for chunk in ring_buf.chunks(MAX_CYCLED_PER_PACKET) {
-                            let data_len = (chunk.len() * 4) as u8;
-                            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
-                            for (i, &(cycles, reg, val)) in chunk.iter().enumerate() {
-                                pkt[1 + i * 4] = reg;
-                                pkt[2 + i * 4] = val;
-                                pkt[3 + i * 4] = (cycles >> 8) as u8;
-                                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
-                            }
-                            let total = 1 + chunk.len() * 4;
-                            let _ = d.single_write(&pkt[..total]);
-                        }
+                    // Signal end-of-frame — driver's writer thread drains the ring.
+                    if let Some(ref mut d) = dev {
+                        d.set_flush();
                     }
-                    ring_buf.clear();
                 }
 
                 CMD_MUTE => {
@@ -180,17 +165,18 @@ mod unix_main {
 
                 CMD_CLOSE => {
                     if let Some(ref mut d) = dev {
+                        d.set_flush();
                         d.mute();
                         d.reset();
                         d.close();
                     }
                     dev = None;
-                    ring_buf.clear();
                     send_ok(&mut stream);
                 }
 
                 CMD_QUIT => {
                     if let Some(ref mut d) = dev {
+                        d.set_flush();
                         d.mute();
                         d.reset();
                         d.close();
