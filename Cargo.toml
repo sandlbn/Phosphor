@@ -1,6 +1,6 @@
 [package]
 name = "phosphor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Phosphor — a SID player for USBSID-Pico"
 

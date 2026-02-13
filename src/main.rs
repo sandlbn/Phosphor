@@ -896,7 +896,7 @@ fn main() -> iced::Result {
     };
 
     iced::application(App::boot, App::update, App::view)
-        .title("Phosphor")
+        .title(|_: &App| format!("Phosphor v{}", env!("CARGO_PKG_VERSION")))
         .subscription(App::subscription)
         .theme(App::theme)
         .window_size((900.0, 600.0))
