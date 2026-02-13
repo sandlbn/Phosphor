@@ -3,9 +3,9 @@
 // Communicates with Phosphor over a Unix domain socket.
 // Fixed-size protocol — every command has a known byte count.
 //
-// CMD_RING writes are buffered locally with cycle deltas.
-// CMD_FLUSH packs them into 64-byte OP_CYCLED_WRITE USB bulk
-// packets via single_write — one transfer per 15 tuples.
+// Uses synchronous mode (init false, false) with manual
+// OP_CYCLED_WRITE packet packing — identical firmware packets
+// to C++ players but without the threading complexity.
 //
 // Not needed on Windows — USB access works directly from userspace.
 
@@ -45,10 +45,7 @@ mod unix_main {
     const RESP_OK: u8 = 0x00;
     const RESP_ERR: u8 = 0x01;
 
-    /// OP_CYCLED_WRITE opcode (top 2 bits = 0b10).
     const OP_CYCLED_WRITE: u8 = 2;
-
-    /// Max cycled-write tuples per 64-byte USB packet: (64 - 1 header) / 4 = 15
     const MAX_CYCLED_PER_PACKET: usize = 15;
 
     fn send_ok(stream: &mut impl Write) {
@@ -64,37 +61,12 @@ mod unix_main {
         let _ = stream.flush();
     }
 
-    /// Pack buffered writes into 64-byte OP_CYCLED_WRITE USB bulk packets.
-    ///
-    /// Packet format:
-    ///   byte 0:    (OP_CYCLED_WRITE << 6) | byte_count
-    ///   bytes 1+:  [reg, val, cycles_hi, cycles_lo] × N
-    fn flush_ring_buf(dev: &UsbSid, ring_buf: &[(u8, u8, u16)]) {
-        if ring_buf.is_empty() {
-            return;
-        }
-
-        let mut pkt = [0u8; 64];
-
-        for chunk in ring_buf.chunks(MAX_CYCLED_PER_PACKET) {
-            let data_len = (chunk.len() * 4) as u8;
-            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
-            for (i, &(reg, val, cycles)) in chunk.iter().enumerate() {
-                pkt[1 + i * 4] = reg;
-                pkt[2 + i * 4] = val;
-                pkt[3 + i * 4] = (cycles >> 8) as u8;
-                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
-            }
-            let total = 1 + chunk.len() * 4;
-            let _ = dev.single_write(&pkt[..total]);
-        }
-    }
-
     fn handle_client(mut stream: std::os::unix::net::UnixStream) {
         let mut dev: Option<UsbSid> = None;
         let mut cmd = [0u8; 1];
-        // Buffer for CMD_RING writes — flushed as OP_CYCLED_WRITE on CMD_FLUSH
-        let mut ring_buf: Vec<(u8, u8, u16)> = Vec::with_capacity(128);
+
+        // Ring buffer for collecting cycled writes until flush
+        let mut ring_buf: Vec<(u16, u8, u8)> = Vec::with_capacity(256);
 
         eprintln!("[usbsid-bridge] client connected");
 
@@ -110,9 +82,9 @@ mod unix_main {
                         continue;
                     }
                     let mut d = UsbSid::new();
-                    match d.init(false, false) {
+                    match d.init(true, true) {
                         Ok(_) => {
-                            eprintln!("[usbsid-bridge] USBSID-Pico opened");
+                            eprintln!("[usbsid-bridge] USBSID-Pico opened (synchronous)");
                             dev = Some(d);
                             send_ok(&mut stream);
                         }
@@ -144,6 +116,7 @@ mod unix_main {
                     if let Some(ref mut d) = dev {
                         d.reset();
                     }
+                    ring_buf.clear();
                     send_ok(&mut stream);
                 }
 
@@ -159,7 +132,6 @@ mod unix_main {
                 }
 
                 CMD_WRITE => {
-                    // Immediate single register write (for init/setup)
                     let mut b = [0u8; 2];
                     if stream.read_exact(&mut b).is_err() {
                         break;
@@ -171,19 +143,30 @@ mod unix_main {
 
                 CMD_RING => {
                     // Fixed 4 bytes: reg, val, cycles_hi, cycles_lo
-                    // Buffer the write with cycles — flushed as OP_CYCLED_WRITE on CMD_FLUSH
                     let mut b = [0u8; 4];
                     if stream.read_exact(&mut b).is_err() {
                         break;
                     }
                     let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
-                    ring_buf.push((b[0], b[1], cycles));
+                    ring_buf.push((cycles, b[0], b[1]));
                 }
 
                 CMD_FLUSH => {
-                    // Pack buffered writes into OP_CYCLED_WRITE USB packets and send
+                    // Pack and send all buffered writes as OP_CYCLED_WRITE packets
                     if let Some(ref d) = dev {
-                        flush_ring_buf(d, &ring_buf);
+                        let mut pkt = [0u8; 64];
+                        for chunk in ring_buf.chunks(MAX_CYCLED_PER_PACKET) {
+                            let data_len = (chunk.len() * 4) as u8;
+                            pkt[0] = (OP_CYCLED_WRITE << 6) | data_len;
+                            for (i, &(cycles, reg, val)) in chunk.iter().enumerate() {
+                                pkt[1 + i * 4] = reg;
+                                pkt[2 + i * 4] = val;
+                                pkt[3 + i * 4] = (cycles >> 8) as u8;
+                                pkt[4 + i * 4] = (cycles & 0xFF) as u8;
+                            }
+                            let total = 1 + chunk.len() * 4;
+                            let _ = d.single_write(&pkt[..total]);
+                        }
                     }
                     ring_buf.clear();
                 }
@@ -197,24 +180,17 @@ mod unix_main {
 
                 CMD_CLOSE => {
                     if let Some(ref mut d) = dev {
-                        if !ring_buf.is_empty() {
-                            flush_ring_buf(d, &ring_buf);
-                            ring_buf.clear();
-                        }
                         d.mute();
                         d.reset();
                         d.close();
                     }
                     dev = None;
+                    ring_buf.clear();
                     send_ok(&mut stream);
                 }
 
                 CMD_QUIT => {
                     if let Some(ref mut d) = dev {
-                        if !ring_buf.is_empty() {
-                            flush_ring_buf(d, &ring_buf);
-                            ring_buf.clear();
-                        }
                         d.mute();
                         d.reset();
                         d.close();
