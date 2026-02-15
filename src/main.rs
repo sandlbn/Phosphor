@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use iced::widget::{column, container, rule};
-use iced::{time, Color, Element, Length, Subscription, Task, Theme};
+use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 
 use config::{Config, FavoritesDb};
 use player::{PlayState, PlayerCmd, PlayerStatus};
@@ -112,12 +112,26 @@ impl App {
             }
         }
 
-        // Auto-load Songlength.md5 — try our config dir first, then ultimate64-manager path
-        let songlength_db = config::songlength_db_path()
+        // Auto-load Songlength.md5 — try remembered path, then config dir, then auto-detect
+        let songlength_db = config
+            .last_songlength_file
+            .as_ref()
+            .map(PathBuf::from)
             .filter(|p| p.exists())
             .and_then(|p| {
-                eprintln!("[phosphor] Found Songlengths.md5 at {}", p.display());
+                eprintln!(
+                    "[phosphor] Loading remembered Songlengths at {}",
+                    p.display()
+                );
                 SonglengthDb::load(&p).ok()
+            })
+            .or_else(|| {
+                config::songlength_db_path()
+                    .filter(|p| p.exists())
+                    .and_then(|p| {
+                        eprintln!("[phosphor] Found Songlengths.md5 at {}", p.display());
+                        SonglengthDb::load(&p).ok()
+                    })
             })
             .or_else(|| SonglengthDb::auto_load());
 
@@ -238,11 +252,13 @@ impl App {
             }
 
             Message::AddFiles => {
-                return Task::perform(pick_files(), Message::FilesChosen);
+                let start_dir = self.config.last_sid_dir.clone();
+                return Task::perform(pick_files(start_dir), Message::FilesChosen);
             }
 
             Message::AddFolder => {
-                return Task::perform(pick_folder(), Message::FolderChosen);
+                let start_dir = self.config.last_sid_dir.clone();
+                return Task::perform(pick_folder(start_dir), Message::FolderChosen);
             }
 
             Message::ClearPlaylist => {
@@ -280,7 +296,11 @@ impl App {
 
             // ── Songlength ───────────────────────────────────────────────
             Message::LoadSonglength => {
-                return Task::perform(pick_songlength_file(), Message::SonglengthFileChosen);
+                let start_dir = self.config.last_songlength_dir.clone();
+                return Task::perform(
+                    pick_songlength_file(start_dir),
+                    Message::SonglengthFileChosen,
+                );
             }
 
             // ── Playlist save / load ─────────────────────────────────────
@@ -301,17 +321,26 @@ impl App {
                         )
                     })
                     .collect();
-                return Task::perform(save_playlist_dialog(entries), Message::PlaylistSaved);
+                let start_dir = self.config.last_playlist_dir.clone();
+                return Task::perform(
+                    save_playlist_dialog(entries, start_dir),
+                    Message::PlaylistSaved,
+                );
             }
 
             Message::LoadPlaylist => {
-                return Task::perform(pick_playlist_file(), Message::PlaylistFileChosen);
+                let start_dir = self.config.last_playlist_dir.clone();
+                return Task::perform(pick_playlist_file(start_dir), Message::PlaylistFileChosen);
             }
 
             // ── Async results ────────────────────────────────────────────
             Message::FilesChosen(paths) => {
                 if paths.is_empty() {
                     return Task::none();
+                }
+                // Remember the directory for next time.
+                if let Some(first) = paths.first() {
+                    self.config.remember_sid_dir(first);
                 }
                 // Parse SID headers off the UI thread
                 return Task::perform(
@@ -321,6 +350,7 @@ impl App {
             }
 
             Message::FolderChosen(Some(path)) => {
+                self.config.remember_sid_dir(&path);
                 // Walk + parse off the UI thread
                 return Task::perform(
                     async move { playlist::parse_directory(path) },
@@ -345,20 +375,90 @@ impl App {
                 }
             }
 
-            Message::SonglengthFileChosen(Some(path)) => match SonglengthDb::load(&path) {
-                Ok(db) => {
-                    db.apply_to_playlist(&mut self.playlist);
-                    self.songlength_db = Some(db);
-                    log::info!(
-                        "Songlength DB loaded: {} entries",
-                        self.songlength_db.as_ref().unwrap().entries.len()
-                    );
+            // ── Drag & drop ─────────────────────────────────────────
+            Message::FileDropped(path) => {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                match ext.as_str() {
+                    // SID file → add to playlist
+                    "sid" => {
+                        self.config.remember_sid_dir(&path);
+                        let paths = vec![path];
+                        return Task::perform(
+                            async move { playlist::parse_files(paths) },
+                            Message::FilesLoaded,
+                        );
+                    }
+                    // Songlength database
+                    "md5" | "txt" => {
+                        self.config.remember_songlength_path(&path);
+                        match SonglengthDb::load(&path) {
+                            Ok(db) => {
+                                let count = db.entries.len();
+                                db.apply_to_playlist(&mut self.playlist);
+                                if self.config.default_song_length_secs > 0 {
+                                    apply_default_length(
+                                        &mut self.playlist,
+                                        self.config.default_song_length_secs,
+                                    );
+                                }
+                                self.songlength_db = Some(db);
+                                self.download_status =
+                                    format!("Loaded {} entries from dropped file", count);
+                                eprintln!(
+                                    "[phosphor] Songlength DB loaded via drop: {count} entries"
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[phosphor] Dropped file failed to load: {e}");
+                                // Not a songlength file — might be a playlist
+                            }
+                        }
+                    }
+                    // Playlist files
+                    "m3u" | "m3u8" | "pls" => {
+                        self.config.remember_playlist_dir(&path);
+                        return Task::perform(
+                            async move { playlist::parse_playlist_file(path) },
+                            Message::PlaylistLoaded,
+                        );
+                    }
+                    _ => {
+                        // Try as a directory (folder drop)
+                        if path.is_dir() {
+                            self.config.remember_sid_dir(&path);
+                            let dir = path;
+                            return Task::perform(
+                                async move { playlist::parse_directory(dir) },
+                                Message::FolderLoaded,
+                            );
+                        }
+                    }
                 }
-                Err(e) => log::error!("Failed to load Songlength DB: {e}"),
-            },
+            }
+
+            Message::SonglengthFileChosen(Some(path)) => {
+                self.config.remember_songlength_path(&path);
+                match SonglengthDb::load(&path) {
+                    Ok(db) => {
+                        db.apply_to_playlist(&mut self.playlist);
+                        self.songlength_db = Some(db);
+                        log::info!(
+                            "Songlength DB loaded: {} entries",
+                            self.songlength_db.as_ref().unwrap().entries.len()
+                        );
+                    }
+                    Err(e) => log::error!("Failed to load Songlength DB: {e}"),
+                }
+            }
             Message::SonglengthFileChosen(None) => {}
 
             Message::PlaylistSaved(Ok(path)) => {
+                self.config.remember_playlist_dir(&path);
                 eprintln!("[phosphor] Playlist saved to {}", path.display());
             }
             Message::PlaylistSaved(Err(e)) => {
@@ -366,6 +466,7 @@ impl App {
             }
 
             Message::PlaylistFileChosen(Some(path)) => {
+                self.config.remember_playlist_dir(&path);
                 // Parse playlist + SID headers off the UI thread
                 return Task::perform(
                     async move { playlist::parse_playlist_file(path) },
@@ -595,8 +696,19 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        // Tick at ~30 Hz for smooth visualisation + status polling
-        time::every(Duration::from_millis(33)).map(|_| Message::Tick)
+        // Tick at ~30 Hz for smooth visualisation + status polling.
+        let tick = time::every(Duration::from_millis(33)).map(|_| Message::Tick);
+
+        // Listen for file-drop events from the OS.
+        let file_drop = event::listen_with(|event, _status, _id| {
+            if let iced::Event::Window(iced::window::Event::FileDropped(path)) = event {
+                Some(Message::FileDropped(path))
+            } else {
+                None
+            }
+        });
+
+        Subscription::batch([tick, file_drop])
     }
 
     fn theme(&self) -> Theme {
@@ -782,56 +894,88 @@ impl Drop for App {
 //  Async file dialogs (using rfd via iced Task)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn pick_files() -> Vec<PathBuf> {
-    let result = rfd::AsyncFileDialog::new()
+async fn pick_files(start_dir: Option<String>) -> Vec<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("Add SID files")
-        .add_filter("SID files", &["sid", "SID"])
-        .pick_files()
-        .await;
+        .add_filter("SID files", &["sid", "SID"]);
+
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(&p);
+        }
+    }
+
+    let result = dialog.pick_files().await;
 
     result
         .map(|handles| handles.iter().map(|h| h.path().to_path_buf()).collect())
         .unwrap_or_default()
 }
 
-async fn pick_folder() -> Option<PathBuf> {
-    rfd::AsyncFileDialog::new()
-        .set_title("Add folder of SID files")
-        .pick_folder()
-        .await
-        .map(|h| h.path().to_path_buf())
+async fn pick_folder(start_dir: Option<String>) -> Option<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("Add folder of SID files");
+
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(&p);
+        }
+    }
+
+    dialog.pick_folder().await.map(|h| h.path().to_path_buf())
 }
 
-async fn pick_songlength_file() -> Option<PathBuf> {
-    rfd::AsyncFileDialog::new()
+async fn pick_songlength_file(start_dir: Option<String>) -> Option<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("Load HVSC Songlength.md5")
-        .add_filter("Songlength", &["md5", "txt"])
-        .pick_file()
-        .await
-        .map(|h| h.path().to_path_buf())
+        .add_filter("Songlength", &["md5", "txt"]);
+
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(&p);
+        }
+    }
+
+    dialog.pick_file().await.map(|h| h.path().to_path_buf())
 }
 
-async fn pick_playlist_file() -> Option<PathBuf> {
-    rfd::AsyncFileDialog::new()
+async fn pick_playlist_file(start_dir: Option<String>) -> Option<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("Open Playlist")
         .add_filter("Playlists", &["m3u", "m3u8", "pls"])
-        .add_filter("All files", &["*"])
-        .pick_file()
-        .await
-        .map(|h| h.path().to_path_buf())
+        .add_filter("All files", &["*"]);
+
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(&p);
+        }
+    }
+
+    dialog.pick_file().await.map(|h| h.path().to_path_buf())
 }
 
 /// Show save dialog, then write M3U. The entries are passed in so
 /// we don't need to Send the full Playlist across the async boundary.
 async fn save_playlist_dialog(
     entries: Vec<(PathBuf, String, String, Option<u32>)>,
+    start_dir: Option<String>,
 ) -> Result<PathBuf, String> {
-    let handle = rfd::AsyncFileDialog::new()
+    let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("Save Playlist")
         .add_filter("M3U Playlist", &["m3u"])
-        .set_file_name("playlist.m3u")
-        .save_file()
-        .await;
+        .set_file_name("playlist.m3u");
+
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(&p);
+        }
+    }
+
+    let handle = dialog.save_file().await;
 
     match handle {
         Some(h) => {
