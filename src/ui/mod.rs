@@ -80,6 +80,9 @@ pub enum Message {
     ToggleFavorite(usize),
     ToggleFavoritesFilter,
 
+    // File drag & drop
+    FileDropped(PathBuf),
+
     // No-op
     None,
 }

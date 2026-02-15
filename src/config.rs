@@ -17,8 +17,16 @@ pub struct Config {
     pub default_song_length_secs: u32,
     /// URL to download Songlength.md5 from.
     pub songlength_url: String,
-    /// Audio output engine: "auto", "usb", "emulated", or any future engine.
+    /// Audio output engine name ("auto", "usb", "emulated").
     pub output_engine: String,
+    /// Last directory used when opening SID files / folders.
+    pub last_sid_dir: Option<String>,
+    /// Last directory used when loading Songlength.md5.
+    pub last_songlength_dir: Option<String>,
+    /// Path to last successfully loaded Songlength.md5 file.
+    pub last_songlength_file: Option<String>,
+    /// Last directory used for playlists.
+    pub last_playlist_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -28,6 +36,10 @@ impl Default for Config {
             default_song_length_secs: 0,
             songlength_url: DEFAULT_SONGLENGTH_URL.to_string(),
             output_engine: "auto".to_string(),
+            last_sid_dir: None,
+            last_songlength_dir: None,
+            last_songlength_file: None,
+            last_playlist_dir: None,
         }
     }
 }
@@ -77,11 +89,6 @@ impl Config {
         }
     }
 
-    /// Engine name for the player thread.
-    pub fn output_engine(&self) -> String {
-        self.output_engine.clone()
-    }
-
     /// Parse config from a JSON string. Unknown fields are ignored,
     /// missing fields get defaults.
     fn parse_json(s: &str) -> Self {
@@ -104,14 +111,33 @@ impl Config {
                 }
             } else if let Some(rest) = line.strip_prefix("\"songlength_url\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
-                // Strip surrounding quotes
-                if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-                    config.songlength_url = val[1..val.len() - 1].to_string();
+                if let Some(s) = strip_json_string(val) {
+                    config.songlength_url = s;
                 }
             } else if let Some(rest) = line.strip_prefix("\"output_engine\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
-                if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-                    config.output_engine = val[1..val.len() - 1].to_string();
+                if let Some(s) = strip_json_string(val) {
+                    config.output_engine = s;
+                }
+            } else if let Some(rest) = line.strip_prefix("\"last_sid_dir\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.last_sid_dir = strip_json_string(val);
+                }
+            } else if let Some(rest) = line.strip_prefix("\"last_songlength_dir\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.last_songlength_dir = strip_json_string(val);
+                }
+            } else if let Some(rest) = line.strip_prefix("\"last_songlength_file\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.last_songlength_file = strip_json_string(val);
+                }
+            } else if let Some(rest) = line.strip_prefix("\"last_playlist_dir\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.last_playlist_dir = strip_json_string(val);
                 }
             }
         }
@@ -121,13 +147,78 @@ impl Config {
 
     /// Serialize config to a JSON string.
     fn to_json(&self) -> String {
+        let fmt_opt = |v: &Option<String>| -> String {
+            match v {
+                Some(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+                None => "null".to_string(),
+            }
+        };
         format!(
-            "{{\n  \"skip_rsid\": {},\n  \"default_song_length_secs\": {},\n  \"songlength_url\": \"{}\",\n  \"output_engine\": \"{}\"\n}}\n",
+            concat!(
+                "{{\n",
+                "  \"skip_rsid\": {},\n",
+                "  \"default_song_length_secs\": {},\n",
+                "  \"songlength_url\": \"{}\",\n",
+                "  \"output_engine\": \"{}\",\n",
+                "  \"last_sid_dir\": {},\n",
+                "  \"last_songlength_dir\": {},\n",
+                "  \"last_songlength_file\": {},\n",
+                "  \"last_playlist_dir\": {}\n",
+                "}}\n",
+            ),
             self.skip_rsid,
             self.default_song_length_secs,
             self.songlength_url,
             self.output_engine,
+            fmt_opt(&self.last_sid_dir),
+            fmt_opt(&self.last_songlength_dir),
+            fmt_opt(&self.last_songlength_file),
+            fmt_opt(&self.last_playlist_dir),
         )
+    }
+
+    /// Helper: get the output engine name.
+    pub fn output_engine(&self) -> String {
+        self.output_engine.clone()
+    }
+
+    /// Remember a directory from a file path (for SID file dialogs).
+    pub fn remember_sid_dir(&mut self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            self.last_sid_dir = Some(parent.to_string_lossy().into_owned());
+            self.save();
+        }
+    }
+
+    /// Remember a directory from a songlength file path.
+    pub fn remember_songlength_path(&mut self, path: &std::path::Path) {
+        self.last_songlength_file = Some(path.to_string_lossy().into_owned());
+        if let Some(parent) = path.parent() {
+            self.last_songlength_dir = Some(parent.to_string_lossy().into_owned());
+        }
+        self.save();
+    }
+
+    /// Remember a directory from a playlist file path.
+    pub fn remember_playlist_dir(&mut self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            self.last_playlist_dir = Some(parent.to_string_lossy().into_owned());
+            self.save();
+        }
+    }
+}
+
+/// Strip surrounding quotes from a JSON string value and unescape.
+fn strip_json_string(val: &str) -> Option<String> {
+    if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
+        Some(
+            val[1..val.len() - 1]
+                .replace("\\\\", "\x00")
+                .replace("\\\"", "\"")
+                .replace('\x00', "\\"),
+        )
+    } else {
+        None
     }
 }
 

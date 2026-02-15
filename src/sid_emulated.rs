@@ -1,7 +1,7 @@
 // Software SID emulation output using resid-rs + cpal audio.
 //
 // Key design decisions:
-//   - Query cpal for the device's ACTUAL sample rate (macOS often = 48000)
+//   - Query cpal for the device's ACTUAL sample rate
 //   - Tell resid to generate at that rate via set_sampling_parameters()
 //   - ring_cycled() clocks SID between writes (cycle-accurate intra-frame)
 //   - flush() clocks remaining frame cycles and resets frame counter
