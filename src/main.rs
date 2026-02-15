@@ -11,6 +11,9 @@ mod ui;
 #[cfg(all(feature = "usb", target_os = "macos"))]
 mod usb_bridge;
 
+#[cfg(all(feature = "usb", target_os = "macos"))]
+mod daemon_installer;
+
 #[cfg(all(feature = "usb", not(target_os = "macos")))]
 mod sid_direct;
 
@@ -78,6 +81,20 @@ impl App {
             "[phosphor] Config: skip_rsid={}, default_length={}s, engine={}",
             config.skip_rsid, config.default_song_length_secs, config.output_engine,
         );
+
+        // macOS: if the daemon plist points to a stale binary (e.g. app was
+        // moved or updated), proactively reinstall so the user doesn't hit
+        // a confusing error later when they try to play a tune.
+        #[cfg(all(feature = "usb", target_os = "macos"))]
+        {
+            let eng = config.output_engine.as_str();
+            if (eng == "usb" || eng == "auto") && daemon_installer::daemon_needs_update() {
+                eprintln!("[phosphor] Daemon binary path changed — triggering update");
+                if let Err(e) = daemon_installer::ensure_daemon() {
+                    eprintln!("[phosphor] Daemon auto-update skipped: {e}");
+                }
+            }
+        }
 
         let (cmd_tx, status_rx) = player::spawn_player(
             config.output_engine(),

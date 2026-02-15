@@ -32,14 +32,31 @@ pub struct BridgeDevice {
 impl BridgeDevice {
     pub fn connect() -> Result<Self, String> {
         eprintln!("[usb-bridge] connecting to {SOCKET_PATH}");
-        let stream = UnixStream::connect(SOCKET_PATH).map_err(|e| {
-            format!(
-                "Cannot connect to usbsid-bridge daemon at {SOCKET_PATH}: {e}\n\
-                 Install with: ./install.sh"
-            )
-        })?;
-        eprintln!("[usb-bridge] connected");
-        Ok(Self { stream })
+
+        // First attempt
+        match UnixStream::connect(SOCKET_PATH) {
+            Ok(stream) => {
+                eprintln!("[usb-bridge] connected");
+                return Ok(Self { stream });
+            }
+            Err(first_err) => {
+                eprintln!("[usb-bridge] socket not available: {first_err}");
+
+                // Auto-install the daemon (prompts user for admin password)
+                eprintln!("[usb-bridge] attempting automatic daemon installation...");
+                crate::daemon_installer::ensure_daemon()?;
+
+                // Retry after install
+                let stream = UnixStream::connect(SOCKET_PATH).map_err(|e| {
+                    format!(
+                        "Daemon was installed but still cannot connect to {SOCKET_PATH}: {e}\n\
+                         Check logs: tail -f /tmp/usbsid-bridge.log"
+                    )
+                })?;
+                eprintln!("[usb-bridge] connected (after daemon install)");
+                return Ok(Self { stream });
+            }
+        }
     }
 
     fn send_cmd(&mut self, data: &[u8]) {
