@@ -1,16 +1,23 @@
 # Phosphor
-
-A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hardware. Built with Rust and Iced.
+A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hardware, software emulation, and Commodore [Ultimate 64](https://ultimate64.com/) network playback. Built with Rust and Iced.
 
 ![Phosphor](assets/screenshot.png)
 
 > **⚠️ Work in progress.** PSID playback works well. RSID support is experimental and many tunes won't play correctly yet.
 
+## Playback Engines
+
+Phosphor supports three SID output engines, selectable in Settings:
+
+- **USB** — USBSID-Pico hardware (register-level writes)
+- **Emulated** — Software SID via resid-rs + cpal audio
+- **Commodore Ultimate 64 / Elite** — Native playback on real C64 hardware via REST API
+
 ## Requirements
 
-- USBSID-Pico device
 - Rust toolchain (`cargo`)
 - SID files (e.g. from [HVSC](https://www.hvsc.c64.org/))
+- One or more of: USBSID-Pico device, audio output (for emulation), or Commodore Ultimate 64 / Elite / Ultimate-II+ on the network
 
 ## Install
 
