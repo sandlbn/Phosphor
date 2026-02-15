@@ -8,20 +8,28 @@
 // end-of-frame via set_flush().
 //
 // Not needed on Windows — USB access works directly from userspace.
+// Not needed when building with only the "emulated" feature.
 
-#[cfg(not(unix))]
+#[cfg(not(feature = "usb"))]
+fn main() {
+    eprintln!("usbsid-bridge requires the 'usb' feature.");
+    eprintln!("Rebuild with: cargo build --features usb --bin usbsid-bridge");
+    std::process::exit(1);
+}
+
+#[cfg(all(feature = "usb", not(unix)))]
 fn main() {
     eprintln!("usbsid-bridge is only needed on macOS/Linux.");
     eprintln!("On Windows, Phosphor accesses USB directly.");
     std::process::exit(1);
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "usb", unix))]
 fn main() {
     unix_main::run();
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "usb", unix))]
 mod unix_main {
 
     use std::io::{Read, Write};
