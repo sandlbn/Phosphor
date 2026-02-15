@@ -14,8 +14,8 @@ mod usb_bridge;
 #[cfg(all(feature = "usb", not(target_os = "macos")))]
 mod sid_direct;
 
-#[cfg(feature = "emulated")]
 mod sid_emulated;
+mod sid_u64;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -79,7 +79,11 @@ impl App {
             config.skip_rsid, config.default_song_length_secs, config.output_engine,
         );
 
-        let (cmd_tx, status_rx) = player::spawn_player(config.output_engine());
+        let (cmd_tx, status_rx) = player::spawn_player(
+            config.output_engine(),
+            config.u64_address.clone(),
+            config.u64_password.clone(),
+        );
 
         let mut playlist = Playlist::new();
 
@@ -541,9 +545,23 @@ impl App {
                     eprintln!("[phosphor] Output engine → '{engine}'");
                     self.config.output_engine = engine.clone();
                     self.config.save();
-                    // Tell the player thread to switch engines.
-                    let _ = self.cmd_tx.try_send(PlayerCmd::SetEngine(engine));
+                    // Tell the player thread to switch engines (include U64 config).
+                    let _ = self.cmd_tx.try_send(PlayerCmd::SetEngine(
+                        engine,
+                        self.config.u64_address.clone(),
+                        self.config.u64_password.clone(),
+                    ));
                 }
+            }
+
+            Message::SetU64Address(addr) => {
+                self.config.u64_address = addr;
+                self.config.save();
+            }
+
+            Message::SetU64Password(pass) => {
+                self.config.u64_password = pass;
+                self.config.save();
             }
 
             Message::DownloadSonglength => {

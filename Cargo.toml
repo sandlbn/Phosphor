@@ -1,28 +1,29 @@
 [package]
 name = "phosphor"
-version = "0.2.0"
+version = "0.1.1"
 edition = "2021"
-description = "Phosphor — a SID player for USBSID-Pico and software emulation"
+description = "Phosphor — a SID player for USBSID-Pico"
 
 [features]
-default = ["usb", "emulated"]
-usb = ["dep:usbsid-pico"]
-emulated = ["dep:resid-rs", "dep:cpal"]
+default = ["usb"]
+usb = []
 
 [dependencies]
 # GUI
 iced = { version = "0.14", features = ["canvas", "tokio", "image"] }
 rfd = "0.15"
 
-# 6502 emulation
+# 6502 emulation + USBSID hardware
 mos6502 = "0.8"
+usbsid-pico = { version = "0.1.5", features = ["usb"] }
 
-# USBSID hardware (optional — only needed for real SID chip output)
-usbsid-pico = { version = "0.1.5", features = ["usb"], optional = true }
+# Software SID emulation
+resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
+cpal = "0.15"
 
-# Software SID emulation (optional — for audio output without hardware)
-resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = true }
-cpal = { version = "0.15", optional = true }
+# Ultimate 64 REST API
+ultimate64 = "0.5"
+url = "2.5"
 
 # Player ↔ GUI communication
 crossbeam-channel = "0.5"
@@ -47,10 +48,3 @@ libc = "0.2"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
-
-# The bridge binary is feature-gated in source, but this hint tells
-# `cargo install` and `cargo run --bin` to require the usb feature.
-[[bin]]
-name = "usbsid-bridge"
-path = "src/bin/usbsid-bridge.rs"
-required-features = ["usb"]

@@ -17,8 +17,12 @@ pub struct Config {
     pub default_song_length_secs: u32,
     /// URL to download Songlength.md5 from.
     pub songlength_url: String,
-    /// Audio output engine name ("auto", "usb", "emulated").
+    /// Audio output engine name ("auto", "usb", "emulated", "u64").
     pub output_engine: String,
+    /// Ultimate 64 IP address or hostname (for "u64" engine).
+    pub u64_address: String,
+    /// Ultimate 64 network password (optional, empty = none).
+    pub u64_password: String,
     /// Last directory used when opening SID files / folders.
     pub last_sid_dir: Option<String>,
     /// Last directory used when loading Songlength.md5.
@@ -36,6 +40,8 @@ impl Default for Config {
             default_song_length_secs: 0,
             songlength_url: DEFAULT_SONGLENGTH_URL.to_string(),
             output_engine: "auto".to_string(),
+            u64_address: String::new(),
+            u64_password: String::new(),
             last_sid_dir: None,
             last_songlength_dir: None,
             last_songlength_file: None,
@@ -119,6 +125,16 @@ impl Config {
                 if let Some(s) = strip_json_string(val) {
                     config.output_engine = s;
                 }
+            } else if let Some(rest) = line.strip_prefix("\"u64_address\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    config.u64_address = s;
+                }
+            } else if let Some(rest) = line.strip_prefix("\"u64_password\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    config.u64_password = s;
+                }
             } else if let Some(rest) = line.strip_prefix("\"last_sid_dir\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if val != "null" {
@@ -160,6 +176,8 @@ impl Config {
                 "  \"default_song_length_secs\": {},\n",
                 "  \"songlength_url\": \"{}\",\n",
                 "  \"output_engine\": \"{}\",\n",
+                "  \"u64_address\": \"{}\",\n",
+                "  \"u64_password\": \"{}\",\n",
                 "  \"last_sid_dir\": {},\n",
                 "  \"last_songlength_dir\": {},\n",
                 "  \"last_songlength_file\": {},\n",
@@ -170,6 +188,8 @@ impl Config {
             self.default_song_length_secs,
             self.songlength_url,
             self.output_engine,
+            self.u64_address.replace('\\', "\\\\").replace('"', "\\\""),
+            self.u64_password.replace('\\', "\\\\").replace('"', "\\\""),
             fmt_opt(&self.last_sid_dir),
             fmt_opt(&self.last_songlength_dir),
             fmt_opt(&self.last_songlength_file),

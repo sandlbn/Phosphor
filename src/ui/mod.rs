@@ -75,6 +75,8 @@ pub enum Message {
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
     SetOutputEngine(String),
+    SetU64Address(String),
+    SetU64Password(String),
 
     // Favorites
     ToggleFavorite(usize),
@@ -755,6 +757,7 @@ pub fn settings_panel<'a>(
             let display = match name {
                 "usb" => "🔌 USB Hardware (USBSID-Pico)",
                 "emulated" => "🎵 Software Emulation (reSID)",
+                "u64" => "🌐 Ultimate 64 (Network)",
                 other => other,
             };
             let is_active = current_engine == name
@@ -860,7 +863,35 @@ pub fn settings_panel<'a>(
     let engine_help = text("Changes take effect when next song starts playing.")
         .size(11)
         .color(Color::from_rgb(0.45, 0.47, 0.52));
-    let engine_section = engine_col.push(engine_help);
+    let engine_col = engine_col.push(engine_help);
+
+    // ── U64 connection settings (always visible so user can pre-configure) ──
+    let u64_label = text("Ultimate 64 connection:")
+        .size(12)
+        .color(Color::from_rgb(0.65, 0.67, 0.72));
+
+    let u64_addr_input = text_input("IP address (e.g. 192.168.1.64)", &config.u64_address)
+        .on_input(Message::SetU64Address)
+        .size(12)
+        .padding(Padding::from([4, 8]))
+        .width(Length::Fill);
+
+    let u64_pass_input = text_input("Password (leave empty if none)", &config.u64_password)
+        .on_input(Message::SetU64Password)
+        .size(12)
+        .padding(Padding::from([4, 8]))
+        .width(Length::Fill);
+
+    let u64_help = text("Set IP/hostname of your Ultimate 64 or Ultimate-II+ device.")
+        .size(11)
+        .color(Color::from_rgb(0.45, 0.47, 0.52));
+
+    let engine_section = engine_col
+        .push(rule::horizontal(1))
+        .push(u64_label)
+        .push(u64_addr_input)
+        .push(u64_pass_input)
+        .push(u64_help);
 
     // ── Skip RSID ────────────────────────────────────────────────
     let rsid_label = text("Skip RSID tunes:")
