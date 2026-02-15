@@ -3,6 +3,12 @@ A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hard
 
 ![Phosphor](assets/screenshot.png)
 
+
+## Downloads
+
+Prebuilt binaries for macOS, Windows are available on the GitHub **Releases** page:
+https://github.com/sandlbn/Phosphor/releases
+
 > **⚠️ Work in progress.** PSID playback works well. RSID support is experimental and many tunes won't play correctly yet.
 
 ## Playback Engines
