@@ -36,9 +36,7 @@ pub enum PlayerCmd {
     Stop,
     TogglePause,
     SetSubtune(u16),
-    /// Switch audio output engine (e.g. "usb", "emulated", "auto").
-    /// Takes effect on next Play — drops the current device immediately.
-    SetEngine(String),
+    SetEngine(String, String, String), // (engine_name, u64_address, u64_password)
     Quit,
 }
 
@@ -162,26 +160,35 @@ fn run_until(cpu: &mut CPU<C64Memory, Nmos6502>, halt: u16, max_steps: u32) {
 //  Player thread
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn spawn_player(engine_name: String) -> (Sender<PlayerCmd>, Receiver<PlayerStatus>) {
+pub fn spawn_player(
+    engine_name: String,
+    u64_address: String,
+    u64_password: String,
+) -> (Sender<PlayerCmd>, Receiver<PlayerStatus>) {
     let (cmd_tx, cmd_rx) = bounded::<PlayerCmd>(64);
     let (status_tx, status_rx) = bounded::<PlayerStatus>(16);
 
     thread::Builder::new()
         .name("sid-player".into())
         .spawn(move || {
-            player_loop(cmd_rx, status_tx, engine_name);
+            player_loop(cmd_rx, status_tx, engine_name, u64_address, u64_password);
         })
         .expect("Failed to spawn player thread");
 
     (cmd_tx, status_rx)
 }
 
-fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>, engine_name: String) {
+fn player_loop(
+    cmd_rx: Receiver<PlayerCmd>,
+    status_tx: Sender<PlayerStatus>,
+    mut engine_name: String,
+    mut u64_address: String,
+    mut u64_password: String,
+) {
     let mut bridge: Option<Box<dyn SidDevice>> = None;
     let mut state = PlayState::Stopped;
     let mut play_ctx: Option<PlayContext> = None;
     let mut last_error: Option<String> = None;
-    let mut engine_name = engine_name; // allow runtime changes
 
     let idle_tick = tick(Duration::from_millis(100));
 
@@ -195,7 +202,7 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>, eng
                             Ok(cmd) => handle_cmd(
                                 cmd, &mut state, &mut play_ctx,
                                 &mut bridge, &mut last_error, &status_tx,
-                                &mut engine_name,
+                                &mut engine_name, &mut u64_address, &mut u64_password,
                             ),
                             Err(_) => break,
                         }
@@ -224,6 +231,8 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>, eng
                                 &mut last_error,
                                 &status_tx,
                                 &mut engine_name,
+                                &mut u64_address,
+                                &mut u64_password,
                             ),
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -268,13 +277,19 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>, eng
                                     );
                                 }
                             }
+                            PlayEngine::Native => {
+                                // ── U64 native — real hardware plays the SID ─
+                                // Nothing to do here; the U64 handles playback.
+                                // We just pace frames for elapsed time tracking.
+                            }
                         }
 
                         // Signal the device to flush any remaining buffered
-                        // writes for this frame (matches SidBerry's
-                        // USBSID_SetFlush() at end of each frame).
-                        if let Some(ref mut br) = bridge {
-                            br.flush();
+                        // writes for this frame (no-op for Native engine).
+                        if !ctx.is_native() {
+                            if let Some(ref mut br) = bridge {
+                                br.flush();
+                            }
                         }
 
                         // ── Absolute-timeline frame pacing ───────────────────
@@ -322,11 +337,13 @@ fn cleanup(bridge: &mut Option<Box<dyn SidDevice>>) {
 fn ensure_hardware(
     bridge: &mut Option<Box<dyn SidDevice>>,
     engine_name: &str,
+    u64_address: &str,
+    u64_password: &str,
 ) -> Result<(), String> {
     if bridge.is_some() {
         return Ok(());
     }
-    let mut br = create_engine(engine_name)?;
+    let mut br = create_engine(engine_name, u64_address, u64_password)?;
     br.init()?;
     *bridge = Some(br);
     Ok(())
@@ -366,6 +383,8 @@ fn handle_cmd(
     last_error: &mut Option<String>,
     status_tx: &Sender<PlayerStatus>,
     engine_name: &mut String,
+    u64_address: &mut String,
+    u64_password: &mut String,
 ) {
     match cmd {
         PlayerCmd::Play {
@@ -377,7 +396,7 @@ fn handle_cmd(
             *last_error = None;
             stop_playback(play_ctx, bridge);
 
-            if let Err(e) = ensure_hardware(bridge, engine_name) {
+            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
                 *last_error = Some(e);
                 *state = PlayState::Stopped;
                 send_status(state, play_ctx, last_error, status_tx);
@@ -417,16 +436,82 @@ fn handle_cmd(
                 if is_rsid { "RSID" } else { "PSID" },
             );
 
-            let ctx = setup_playback(
-                sid_file,
-                path,
-                song,
-                force_stereo,
-                sid4_addr,
-                is_rsid,
-                bridge,
-            );
-            *play_ctx = Some(ctx);
+            // ── Try native playback (U64) ────────────────────────────────
+            // If the engine supports play_sid_native, skip CPU emulation
+            // entirely and let the real hardware do everything.
+            let native = if let Some(ref mut br) = bridge {
+                match br.play_sid_native(&data, song) {
+                    Ok(true) => {
+                        eprintln!("[phosphor] Native playback active — skipping CPU emulation");
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(e) => {
+                        eprintln!("[phosphor] Native playback failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if native {
+                // Build a lightweight context — only for time tracking.
+                let header = &sid_file.header;
+                let num_sids = 1
+                    + (header.extra_sid_addrs[0] != 0) as usize
+                    + (header.extra_sid_addrs[1] != 0) as usize;
+                let sid_type = match num_sids {
+                    1 => "Mono".to_string(),
+                    2 => "2SID Stereo".to_string(),
+                    3 => "3SID".to_string(),
+                    n => format!("{}SID", n),
+                };
+                let md5 = compute_hvsc_md5(&sid_file);
+                let frame_us = header.frame_us();
+                let cycles_per_frame = if header.is_pal {
+                    PAL_CYCLES_PER_FRAME
+                } else {
+                    NTSC_CYCLES_PER_FRAME
+                };
+                let track_info = TrackInfo {
+                    path,
+                    name: header.name.clone(),
+                    author: header.author.clone(),
+                    released: header.released.clone(),
+                    songs: header.songs,
+                    current_song: song,
+                    is_pal: header.is_pal,
+                    is_rsid,
+                    num_sids,
+                    sid_type,
+                    md5,
+                };
+                *play_ctx = Some(PlayContext {
+                    engine: PlayEngine::Native,
+                    trampoline: 0,
+                    halt_pc: 0,
+                    frame_us,
+                    cycles_per_frame,
+                    elapsed: Duration::ZERO,
+                    mirror_mono: false,
+                    track_info,
+                    frame_count: 0,
+                    next_frame: Instant::now(),
+                });
+            } else {
+                let ctx = setup_playback(
+                    sid_file,
+                    path,
+                    song,
+                    force_stereo,
+                    sid4_addr,
+                    is_rsid,
+                    bridge,
+                );
+                *play_ctx = Some(ctx);
+            }
+
             *state = PlayState::Playing;
             send_status(state, play_ctx, last_error, status_tx);
         }
@@ -452,10 +537,69 @@ fn handle_cmd(
                 let path = ctx.track_info.path.clone();
                 let stereo = ctx.mirror_mono;
                 let is_rsid = ctx.is_rsid();
+                let was_native = ctx.is_native();
                 let sid4 = 0;
                 stop_playback(play_ctx, bridge);
 
-                if let Ok(data) = std::fs::read(&path) {
+                if was_native {
+                    // For native playback, re-send the SID file with new song number.
+                    if let Ok(data) = std::fs::read(&path) {
+                        if let Some(ref mut br) = bridge {
+                            match br.play_sid_native(&data, song) {
+                                Ok(true) => {
+                                    if let Ok(sid_file) = load_sid(&data) {
+                                        let header = &sid_file.header;
+                                        let num_sids = 1
+                                            + (header.extra_sid_addrs[0] != 0) as usize
+                                            + (header.extra_sid_addrs[1] != 0) as usize;
+                                        let sid_type = match num_sids {
+                                            1 => "Mono".to_string(),
+                                            2 => "2SID Stereo".to_string(),
+                                            3 => "3SID".to_string(),
+                                            n => format!("{}SID", n),
+                                        };
+                                        let md5 = compute_hvsc_md5(&sid_file);
+                                        let frame_us = header.frame_us();
+                                        let cycles_per_frame = if header.is_pal {
+                                            PAL_CYCLES_PER_FRAME
+                                        } else {
+                                            NTSC_CYCLES_PER_FRAME
+                                        };
+                                        let track_info = TrackInfo {
+                                            path,
+                                            name: header.name.clone(),
+                                            author: header.author.clone(),
+                                            released: header.released.clone(),
+                                            songs: header.songs,
+                                            current_song: song,
+                                            is_pal: header.is_pal,
+                                            is_rsid,
+                                            num_sids,
+                                            sid_type,
+                                            md5,
+                                        };
+                                        *play_ctx = Some(PlayContext {
+                                            engine: PlayEngine::Native,
+                                            trampoline: 0,
+                                            halt_pc: 0,
+                                            frame_us,
+                                            cycles_per_frame,
+                                            elapsed: Duration::ZERO,
+                                            mirror_mono: false,
+                                            track_info,
+                                            frame_count: 0,
+                                            next_frame: Instant::now(),
+                                        });
+                                        *state = PlayState::Playing;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("[phosphor] Native subtune change failed");
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(data) = std::fs::read(&path) {
                     if let Ok(sid_file) = load_sid(&data) {
                         let new_ctx =
                             setup_playback(sid_file, path, song, stereo, sid4, is_rsid, bridge);
@@ -467,12 +611,21 @@ fn handle_cmd(
             send_status(state, play_ctx, last_error, status_tx);
         }
 
-        PlayerCmd::SetEngine(new_engine) => {
-            eprintln!("[phosphor] Switching engine to '{new_engine}'");
-            // Drop the current device so the next Play creates one with the new engine.
+        PlayerCmd::SetEngine(name, addr, pass) => {
+            eprintln!("[phosphor] Engine switch → '{name}'");
             stop_playback(play_ctx, bridge);
-            cleanup(bridge);
-            *engine_name = new_engine;
+            // Drop old device.
+            if let Some(ref mut br) = bridge {
+                br.mute();
+                br.close();
+                br.shutdown();
+            }
+            *bridge = None;
+            *engine_name = name;
+            *u64_address = addr;
+            *u64_password = pass;
+            *state = PlayState::Stopped;
+            send_status(state, play_ctx, last_error, status_tx);
         }
 
         PlayerCmd::Quit => {}
@@ -516,6 +669,9 @@ enum PlayEngine {
         cpu: CPU<RsidBus, Nmos6502>,
         prev_nmi: bool,
     },
+    /// U64 native playback — the real C64 handles SID output.
+    /// We only track time; no CPU emulation or register writes.
+    Native,
 }
 #[allow(dead_code)]
 impl PlayContext {
@@ -523,10 +679,15 @@ impl PlayContext {
         matches!(self.engine, PlayEngine::Rsid { .. })
     }
 
+    fn is_native(&self) -> bool {
+        matches!(self.engine, PlayEngine::Native)
+    }
+
     fn sid_writes(&self) -> &[SidWrite] {
         match &self.engine {
             PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
             PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
+            PlayEngine::Native => &[],
         }
     }
 
@@ -534,6 +695,7 @@ impl PlayContext {
         match &self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.voice_levels(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.voice_levels(),
+            PlayEngine::Native => vec![],
         }
     }
 
@@ -541,6 +703,7 @@ impl PlayContext {
         match &mut self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.clear_writes(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.clear_writes(),
+            PlayEngine::Native => {}
         }
     }
 }
@@ -654,9 +817,11 @@ fn setup_playback(
     };
 
     // Send INIT writes to hardware
+    let empty_writes: Vec<(u32, u8, u8)> = Vec::new();
     let init_writes = match &engine {
         PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
         PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
+        PlayEngine::Native => &empty_writes,
     };
 
     if let Some(ref mut br) = bridge {
@@ -683,6 +848,7 @@ fn setup_playback(
             cpu.memory.clear_writes();
             PlayEngine::Rsid { cpu, prev_nmi }
         }
+        PlayEngine::Native => PlayEngine::Native,
     };
 
     PlayContext {
@@ -1014,7 +1180,7 @@ fn deliver_irq_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
     let hi = cpu.memory.get_byte(0xFFFF) as u16;
     cpu.registers.program_counter = (hi << 8) | lo;
 
-    return 7;
+    7
 }
 
 /// Deliver an NMI to the CPU (emu variant).
@@ -1037,5 +1203,5 @@ fn deliver_nmi_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
     let hi = cpu.memory.get_byte(0xFFFB) as u16;
     cpu.registers.program_counter = (hi << 8) | lo;
 
-    return 7;
+    7
 }
