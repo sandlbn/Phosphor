@@ -37,6 +37,7 @@ pub enum PlayerCmd {
     TogglePause,
     SetSubtune(u16),
     SetEngine(String, String, String), // (engine_name, u64_address, u64_password)
+    UpdateU64Config(String, String),   // (u64_address, u64_password) — no device teardown
     Quit,
 }
 
@@ -626,6 +627,19 @@ fn handle_cmd(
             *u64_password = pass;
             *state = PlayState::Stopped;
             send_status(state, play_ctx, last_error, status_tx);
+        }
+
+        PlayerCmd::UpdateU64Config(addr, pass) => {
+            eprintln!("[phosphor] U64 config updated (addr={addr})");
+            *u64_address = addr;
+            *u64_password = pass;
+            // Drop existing U64 connection so next Play reconnects with new config.
+            if engine_name == "u64" {
+                if let Some(ref mut br) = bridge {
+                    br.close();
+                }
+                *bridge = None;
+            }
         }
 
         PlayerCmd::Quit => {}

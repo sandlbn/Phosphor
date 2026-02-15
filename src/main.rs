@@ -557,11 +557,20 @@ impl App {
             Message::SetU64Address(addr) => {
                 self.config.u64_address = addr;
                 self.config.save();
+                // Update player thread config without stopping playback.
+                let _ = self.cmd_tx.try_send(PlayerCmd::UpdateU64Config(
+                    self.config.u64_address.clone(),
+                    self.config.u64_password.clone(),
+                ));
             }
 
             Message::SetU64Password(pass) => {
                 self.config.u64_password = pass;
                 self.config.save();
+                let _ = self.cmd_tx.try_send(PlayerCmd::UpdateU64Config(
+                    self.config.u64_address.clone(),
+                    self.config.u64_password.clone(),
+                ));
             }
 
             Message::DownloadSonglength => {
