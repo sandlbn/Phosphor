@@ -74,6 +74,7 @@ pub enum Message {
     SonglengthUrlChanged(String),
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
+    SetOutputEngine(String),
 
     // Favorites
     ToggleFavorite(usize),
@@ -737,6 +738,127 @@ pub fn settings_panel<'a>(
     let header =
         row![title, Space::new().width(Length::Fill), close_btn,].align_y(Alignment::Center);
 
+    // ── Output Engine ──────────────────────────────────────────
+    let engine_label = text("Audio output engine:")
+        .size(14)
+        .color(Color::from_rgb(0.75, 0.77, 0.82));
+
+    let engines = crate::sid_device::available_engines();
+    let current_engine = &config.output_engine;
+
+    let engine_buttons: Vec<Element<'a, Message>> = engines
+        .iter()
+        .map(|&name| {
+            let display = match name {
+                "usb" => "🔌 USB Hardware (USBSID-Pico)",
+                "emulated" => "🎵 Software Emulation (reSID)",
+                other => other,
+            };
+            let is_active = current_engine == name
+                || (current_engine == "auto" && engines.first() == Some(&name));
+            let label = if current_engine == name {
+                format!("● {display}")
+            } else {
+                format!("○ {display}")
+            };
+            let btn = button(text(label).size(12))
+                .on_press(Message::SetOutputEngine(name.to_string()))
+                .padding(Padding::from([4, 10]))
+                .width(Length::Fill)
+                .style(move |_theme: &Theme, status| {
+                    let bg = if is_active {
+                        match status {
+                            button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
+                            button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
+                            _ => Color::from_rgb(0.16, 0.25, 0.40),
+                        }
+                    } else {
+                        match status {
+                            button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                            button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                            _ => Color::from_rgb(0.18, 0.19, 0.22),
+                        }
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        text_color: if is_active {
+                            Color::from_rgb(0.9, 0.92, 0.96)
+                        } else {
+                            Color::from_rgb(0.8, 0.82, 0.88)
+                        },
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            width: 1.0,
+                            color: if is_active {
+                                Color::from_rgb(0.3, 0.45, 0.7)
+                            } else {
+                                Color::from_rgb(0.25, 0.27, 0.30)
+                            },
+                        },
+                        ..Default::default()
+                    }
+                });
+            btn.into()
+        })
+        .collect();
+
+    // Auto button
+    let auto_active = current_engine == "auto";
+    let auto_btn = button(
+        text(if auto_active {
+            "● Auto (try USB, fall back to emulation)"
+        } else {
+            "○ Auto (try USB, fall back to emulation)"
+        })
+        .size(12),
+    )
+    .on_press(Message::SetOutputEngine("auto".to_string()))
+    .padding(Padding::from([4, 10]))
+    .width(Length::Fill)
+    .style(move |_theme: &Theme, status| {
+        let bg = if auto_active {
+            match status {
+                button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
+                button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
+                _ => Color::from_rgb(0.16, 0.25, 0.40),
+            }
+        } else {
+            match status {
+                button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                _ => Color::from_rgb(0.18, 0.19, 0.22),
+            }
+        };
+        button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color: if auto_active {
+                Color::from_rgb(0.9, 0.92, 0.96)
+            } else {
+                Color::from_rgb(0.8, 0.82, 0.88)
+            },
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: if auto_active {
+                    Color::from_rgb(0.3, 0.45, 0.7)
+                } else {
+                    Color::from_rgb(0.25, 0.27, 0.30)
+                },
+            },
+            ..Default::default()
+        }
+    });
+
+    let mut engine_col = column![engine_label, auto_btn].spacing(6);
+    for btn in engine_buttons {
+        engine_col = engine_col.push(btn);
+    }
+
+    let engine_help = text("Changes take effect when next song starts playing.")
+        .size(11)
+        .color(Color::from_rgb(0.45, 0.47, 0.52));
+    let engine_section = engine_col.push(engine_help);
+
     // ── Skip RSID ────────────────────────────────────────────────
     let rsid_label = text("Skip RSID tunes:")
         .size(14)
@@ -846,6 +968,8 @@ pub fn settings_panel<'a>(
     // ── Assemble ─────────────────────────────────────────────────
     let content = column![
         header,
+        rule::horizontal(1),
+        engine_section,
         rule::horizontal(1),
         rsid_section,
         rule::horizontal(1),

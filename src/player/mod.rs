@@ -15,7 +15,7 @@ use mos6502::instruction::Nmos6502;
 use mos6502::memory::Bus;
 use mos6502::registers::{StackPointer, Status};
 
-use crate::sid_device::{create_device, SidDevice};
+use crate::sid_device::{create_engine, SidDevice};
 use memory::*;
 use rsid_bus::RsidBus;
 use sid_file::*;
@@ -36,6 +36,9 @@ pub enum PlayerCmd {
     Stop,
     TogglePause,
     SetSubtune(u16),
+    /// Switch audio output engine (e.g. "usb", "emulated", "auto").
+    /// Takes effect on next Play — drops the current device immediately.
+    SetEngine(String),
     Quit,
 }
 
@@ -159,25 +162,26 @@ fn run_until(cpu: &mut CPU<C64Memory, Nmos6502>, halt: u16, max_steps: u32) {
 //  Player thread
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn spawn_player() -> (Sender<PlayerCmd>, Receiver<PlayerStatus>) {
+pub fn spawn_player(engine_name: String) -> (Sender<PlayerCmd>, Receiver<PlayerStatus>) {
     let (cmd_tx, cmd_rx) = bounded::<PlayerCmd>(64);
     let (status_tx, status_rx) = bounded::<PlayerStatus>(16);
 
     thread::Builder::new()
         .name("sid-player".into())
         .spawn(move || {
-            player_loop(cmd_rx, status_tx);
+            player_loop(cmd_rx, status_tx, engine_name);
         })
         .expect("Failed to spawn player thread");
 
     (cmd_tx, status_rx)
 }
 
-fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>) {
+fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>, engine_name: String) {
     let mut bridge: Option<Box<dyn SidDevice>> = None;
     let mut state = PlayState::Stopped;
     let mut play_ctx: Option<PlayContext> = None;
     let mut last_error: Option<String> = None;
+    let mut engine_name = engine_name; // allow runtime changes
 
     let idle_tick = tick(Duration::from_millis(100));
 
@@ -191,6 +195,7 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>) {
                             Ok(cmd) => handle_cmd(
                                 cmd, &mut state, &mut play_ctx,
                                 &mut bridge, &mut last_error, &status_tx,
+                                &mut engine_name,
                             ),
                             Err(_) => break,
                         }
@@ -218,6 +223,7 @@ fn player_loop(cmd_rx: Receiver<PlayerCmd>, status_tx: Sender<PlayerStatus>) {
                                 &mut bridge,
                                 &mut last_error,
                                 &status_tx,
+                                &mut engine_name,
                             ),
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -313,11 +319,14 @@ fn cleanup(bridge: &mut Option<Box<dyn SidDevice>>) {
     eprintln!("[phosphor] Player thread exiting");
 }
 
-fn ensure_hardware(bridge: &mut Option<Box<dyn SidDevice>>) -> Result<(), String> {
+fn ensure_hardware(
+    bridge: &mut Option<Box<dyn SidDevice>>,
+    engine_name: &str,
+) -> Result<(), String> {
     if bridge.is_some() {
         return Ok(());
     }
-    let mut br = create_device()?;
+    let mut br = create_engine(engine_name)?;
     br.init()?;
     *bridge = Some(br);
     Ok(())
@@ -356,6 +365,7 @@ fn handle_cmd(
     bridge: &mut Option<Box<dyn SidDevice>>,
     last_error: &mut Option<String>,
     status_tx: &Sender<PlayerStatus>,
+    engine_name: &mut String,
 ) {
     match cmd {
         PlayerCmd::Play {
@@ -367,7 +377,7 @@ fn handle_cmd(
             *last_error = None;
             stop_playback(play_ctx, bridge);
 
-            if let Err(e) = ensure_hardware(bridge) {
+            if let Err(e) = ensure_hardware(bridge, engine_name) {
                 *last_error = Some(e);
                 *state = PlayState::Stopped;
                 send_status(state, play_ctx, last_error, status_tx);
@@ -455,6 +465,14 @@ fn handle_cmd(
                 }
             }
             send_status(state, play_ctx, last_error, status_tx);
+        }
+
+        PlayerCmd::SetEngine(new_engine) => {
+            eprintln!("[phosphor] Switching engine to '{new_engine}'");
+            // Drop the current device so the next Play creates one with the new engine.
+            stop_playback(play_ctx, bridge);
+            cleanup(bridge);
+            *engine_name = new_engine;
         }
 
         PlayerCmd::Quit => {}
@@ -996,7 +1014,7 @@ fn deliver_irq_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
     let hi = cpu.memory.get_byte(0xFFFF) as u16;
     cpu.registers.program_counter = (hi << 8) | lo;
 
-    7
+    return 7;
 }
 
 /// Deliver an NMI to the CPU (emu variant).
@@ -1019,5 +1037,5 @@ fn deliver_nmi_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
     let hi = cpu.memory.get_byte(0xFFFB) as u16;
     cpu.registers.program_counter = (hi << 8) | lo;
 
-    7
+    return 7;
 }

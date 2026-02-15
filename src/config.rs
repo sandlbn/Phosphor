@@ -17,6 +17,8 @@ pub struct Config {
     pub default_song_length_secs: u32,
     /// URL to download Songlength.md5 from.
     pub songlength_url: String,
+    /// Audio output engine: "auto", "usb", "emulated", or any future engine.
+    pub output_engine: String,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             skip_rsid: false,
             default_song_length_secs: 0,
             songlength_url: DEFAULT_SONGLENGTH_URL.to_string(),
+            output_engine: "auto".to_string(),
         }
     }
 }
@@ -74,13 +77,17 @@ impl Config {
         }
     }
 
+    /// Engine name for the player thread.
+    pub fn output_engine(&self) -> String {
+        self.output_engine.clone()
+    }
+
     /// Parse config from a JSON string. Unknown fields are ignored,
     /// missing fields get defaults.
     fn parse_json(s: &str) -> Self {
         let mut config = Self::default();
 
         // Simple manual JSON parsing to avoid serde dependency.
-        // We only need a flat object with three fields.
         for line in s.lines() {
             let line = line.trim().trim_end_matches(',');
             if let Some(rest) = line.strip_prefix("\"skip_rsid\"") {
@@ -101,6 +108,11 @@ impl Config {
                 if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
                     config.songlength_url = val[1..val.len() - 1].to_string();
                 }
+            } else if let Some(rest) = line.strip_prefix("\"output_engine\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
+                    config.output_engine = val[1..val.len() - 1].to_string();
+                }
             }
         }
 
@@ -110,10 +122,11 @@ impl Config {
     /// Serialize config to a JSON string.
     fn to_json(&self) -> String {
         format!(
-            "{{\n  \"skip_rsid\": {},\n  \"default_song_length_secs\": {},\n  \"songlength_url\": \"{}\"\n}}\n",
+            "{{\n  \"skip_rsid\": {},\n  \"default_song_length_secs\": {},\n  \"songlength_url\": \"{}\",\n  \"output_engine\": \"{}\"\n}}\n",
             self.skip_rsid,
             self.default_song_length_secs,
             self.songlength_url,
+            self.output_engine,
         )
     }
 }

@@ -8,11 +8,14 @@ mod playlist;
 mod sid_device;
 mod ui;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "usb", target_os = "macos"))]
 mod usb_bridge;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(feature = "usb", not(target_os = "macos")))]
 mod sid_direct;
+
+#[cfg(feature = "emulated")]
+mod sid_emulated;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -70,13 +73,13 @@ struct App {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
-        let (cmd_tx, status_rx) = player::spawn_player();
-
         let config = Config::load();
         eprintln!(
-            "[phosphor] Config: skip_rsid={}, default_length={}s",
-            config.skip_rsid, config.default_song_length_secs,
+            "[phosphor] Config: skip_rsid={}, default_length={}s, engine={}",
+            config.skip_rsid, config.default_song_length_secs, config.output_engine,
         );
+
+        let (cmd_tx, status_rx) = player::spawn_player(config.output_engine());
 
         let mut playlist = Playlist::new();
 
@@ -430,6 +433,16 @@ impl App {
             Message::SonglengthUrlChanged(url) => {
                 self.config.songlength_url = url;
                 self.config.save();
+            }
+
+            Message::SetOutputEngine(engine) => {
+                if engine != self.config.output_engine {
+                    eprintln!("[phosphor] Output engine → '{engine}'");
+                    self.config.output_engine = engine.clone();
+                    self.config.save();
+                    // Tell the player thread to switch engines.
+                    let _ = self.cmd_tx.try_send(PlayerCmd::SetEngine(engine));
+                }
             }
 
             Message::DownloadSonglength => {
