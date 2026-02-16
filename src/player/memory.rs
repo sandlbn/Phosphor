@@ -791,10 +791,9 @@ impl C64Memory {
 
     pub fn voice_levels(&self) -> Vec<f32> {
         let num_sids = self.mapper.num_sids().max(1);
-        let actual = if self.mono { 1 } else { num_sids };
-        let mut levels = Vec::with_capacity(actual * 3);
+        let mut levels = Vec::with_capacity(num_sids * 3);
 
-        for sid in 0..actual {
+        for sid in 0..num_sids {
             let base = (sid as usize) * SID_REG_SIZE as usize;
             let global_vol = (self.sid_shadow[base + 0x18] & 0x0F) as f32 / 15.0;
             for voice in 0..3 {
