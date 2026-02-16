@@ -1,8 +1,8 @@
 use iced::widget::canvas::{self, Cache, Canvas, Frame, Geometry};
 use iced::{mouse, Color, Element, Length, Rectangle, Size, Theme};
 
-/// Number of bars to display (smoothed with decay).
-const MAX_BARS: usize = 12; // 3 voices × 4 SIDs max
+/// Maximum bars we'll ever show (3 voices × 4 SIDs max).
+const MAX_BARS: usize = 12;
 
 /// Decay factor per frame (multiplied each frame when no new data).
 const DECAY: f32 = 0.92;
@@ -10,12 +10,18 @@ const DECAY: f32 = 0.92;
 /// Peak hold decay (slower).
 const PEAK_DECAY: f32 = 0.985;
 
+/// Minimum bar height (fraction of full height) so empty bars are visible.
+const MIN_BAR_HEIGHT: f32 = 0.02;
+
 #[derive(Debug)]
 pub struct Visualizer {
     /// Current bar heights (0.0–1.0).
     bars: Vec<f32>,
     /// Peak hold values.
     peaks: Vec<f32>,
+    /// Number of SIDs in the current tune (1–4).
+    /// Determines how many bars are drawn: num_sids × 3.
+    num_sids: usize,
     cache: Cache,
 }
 
@@ -24,8 +30,16 @@ impl Visualizer {
         Self {
             bars: vec![0.0; MAX_BARS],
             peaks: vec![0.0; MAX_BARS],
+            num_sids: 1,
             cache: Cache::new(),
         }
+    }
+
+    /// Set the number of SIDs for the current tune.
+    /// Call this when a new track starts.
+    pub fn set_num_sids(&mut self, n: usize) {
+        self.num_sids = n.clamp(1, 4);
+        self.cache.clear();
     }
 
     /// Update with new voice levels from the player.
@@ -54,18 +68,13 @@ impl Visualizer {
     pub fn reset(&mut self) {
         self.bars.fill(0.0);
         self.peaks.fill(0.0);
+        self.num_sids = 1;
         self.cache.clear();
     }
 
-    /// Number of active bars (based on last update).
-    fn active_bars(&self) -> usize {
-        // Show only bars that have had activity
-        self.bars
-            .iter()
-            .rposition(|&v| v > 0.001)
-            .map(|i| i + 1)
-            .unwrap_or(3)
-            .max(3)
+    /// Number of bars to draw: always num_sids × 3.
+    fn bar_count(&self) -> usize {
+        self.num_sids * 3
     }
 
     pub fn view(&self) -> Element<'_, super::Message> {
@@ -90,7 +99,7 @@ impl canvas::Program<super::Message> for &Visualizer {
         let geom = self
             .cache
             .draw(renderer, bounds.size(), |frame: &mut Frame| {
-                let n = self.active_bars();
+                let n = self.bar_count();
                 if n == 0 {
                     return;
                 }
@@ -134,7 +143,6 @@ impl canvas::Program<super::Message> for &Visualizer {
                 for i in 0..n {
                     let x = i as f32 * (bar_w + gap);
                     let level = self.bars[i].clamp(0.0, 1.0);
-                    let bar_h = level * (h - 4.0);
 
                     let sid_idx = i / 3;
                     let voice_idx = i % 3;
@@ -144,8 +152,25 @@ impl canvas::Program<super::Message> for &Visualizer {
                         .copied()
                         .unwrap_or(Color::from_rgb(0.5, 0.5, 0.5));
 
-                    // Bar
-                    if bar_h > 0.5 {
+                    // Dim base color for the empty bar slot
+                    let dim_color = Color {
+                        r: color.r * 0.2,
+                        g: color.g * 0.2,
+                        b: color.b * 0.2,
+                        a: 0.5,
+                    };
+
+                    // Always draw the bar slot (dim background for each voice)
+                    let min_h = MIN_BAR_HEIGHT * (h - 4.0);
+                    frame.fill_rectangle(
+                        iced::Point::new(x, h - 2.0 - min_h),
+                        Size::new(bar_w, min_h),
+                        dim_color,
+                    );
+
+                    // Active bar on top
+                    let bar_h = level * (h - 4.0);
+                    if bar_h > min_h {
                         frame.fill_rectangle(
                             iced::Point::new(x, h - 2.0 - bar_h),
                             Size::new(bar_w, bar_h),

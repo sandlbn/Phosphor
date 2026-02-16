@@ -802,6 +802,11 @@ impl App {
             self.status = status;
         }
 
+        // Tell the visualiser how many SIDs this tune uses
+        if let Some(ref info) = self.status.track_info {
+            self.visualizer.set_num_sids(info.num_sids);
+        }
+
         // Update visualiser
         self.visualizer.update(&self.status.voice_levels);
 
