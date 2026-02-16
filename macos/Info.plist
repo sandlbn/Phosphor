@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Phosphor</string>
+    <key>CFBundleDisplayName</key>
+    <string>Phosphor</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.phosphor.player</string>
+    <key>CFBundleVersion</key>
+    <string>0.2.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>PHOS</string>
+    <key>CFBundleExecutable</key>
+    <string>phosphor</string>
+    <key>CFBundleIconFile</key>
+    <string>phosphor</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>SID Music File</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.data</string>
+            </array>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>sid</string>
+                <string>psid</string>
+                <string>rsid</string>
+            </array>
+        </dict>
+    </array>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2024-2026 Phosphor contributors</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.music</string>
+</dict>
+</plist>
