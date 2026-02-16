@@ -204,8 +204,14 @@ impl Playlist {
     /// ```text
     /// #EXTM3U
     /// #EXTINF:123,Artist - Title
+    /// #PHOSPHOR:song=2
     /// /absolute/path/to/file.sid
     /// ```
+    ///
+    /// The `#PHOSPHOR:` line is optional metadata that preserves the
+    /// selected sub-tune. Standard M3U players ignore unknown `#` lines.
+    /// Duration from `#EXTINF` is restored on load, so the Songlength DB
+    /// doesn't need to be re-scanned for known tunes.
     #[allow(dead_code)]
     pub fn save_m3u(&self, path: &Path) -> Result<(), String> {
         use std::io::Write;
@@ -224,6 +230,11 @@ impl Playlist {
             };
             writeln!(f, "#EXTINF:{},{}", duration, display)
                 .map_err(|e| format!("Write error: {e}"))?;
+            // Persist selected sub-tune so it survives reload
+            if entry.selected_song != 1 || entry.songs > 1 {
+                writeln!(f, "#PHOSPHOR:song={}", entry.selected_song)
+                    .map_err(|e| format!("Write error: {e}"))?;
+            }
             writeln!(f, "{}", entry.path.display()).map_err(|e| format!("Write error: {e}"))?;
         }
 
@@ -237,6 +248,8 @@ impl Playlist {
 
     /// Load tracks from an M3U or PLS playlist file.
     /// Supports: plain M3U, extended M3U (#EXTM3U), and basic PLS.
+    /// Durations from #EXTINF and sub-tune selections from #PHOSPHOR
+    /// are restored, avoiding a Songlength DB re-scan for known tunes.
     /// Returns the number of tracks successfully loaded.
     pub fn load_playlist_file(&mut self, path: &Path) -> Result<usize, String> {
         let content = std::fs::read_to_string(path)
@@ -249,33 +262,52 @@ impl Playlist {
             .map(|e| e.to_ascii_lowercase().to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let paths: Vec<PathBuf> = if ext == "pls" {
-            parse_pls(&content, playlist_dir)
-        } else {
-            parse_m3u(&content, playlist_dir)
-        };
-
         let mut loaded = 0;
-        for p in &paths {
-            if p.is_dir() {
-                loaded += self.add_directory(p);
-            } else if self.add_file(p).is_ok() {
-                loaded += 1;
-            } else {
-                eprintln!(
-                    "[phosphor] Playlist: skipping {} (not a valid SID)",
-                    p.display()
-                );
+
+        if ext == "pls" {
+            let paths = parse_pls(&content, playlist_dir);
+            for p in &paths {
+                if p.is_dir() {
+                    loaded += self.add_directory(p);
+                } else if self.add_file(p).is_ok() {
+                    loaded += 1;
+                } else {
+                    eprintln!(
+                        "[phosphor] Playlist: skipping {} (not a valid SID)",
+                        p.display()
+                    );
+                }
+            }
+        } else {
+            let items = parse_m3u(&content, playlist_dir);
+            for item in items {
+                if item.path.is_dir() {
+                    loaded += self.add_directory(&item.path);
+                } else if self.add_file(&item.path).is_ok() {
+                    // Apply saved metadata to the entry we just added
+                    if let Some(entry) = self.entries.last_mut() {
+                        if let Some(dur) = item.duration_secs {
+                            entry.duration_secs = Some(dur);
+                        }
+                        if let Some(song) = item.selected_song {
+                            if song >= 1 && song <= entry.songs {
+                                entry.selected_song = song;
+                            }
+                        }
+                    }
+                    loaded += 1;
+                } else {
+                    eprintln!(
+                        "[phosphor] Playlist: skipping {} (not a valid SID)",
+                        item.path.display()
+                    );
+                }
             }
         }
 
         self.rebuild_shuffle();
 
-        eprintln!(
-            "[phosphor] Loaded {loaded}/{} paths from {}",
-            paths.len(),
-            path.display()
-        );
+        eprintln!("[phosphor] Loaded {loaded} tracks from {}", path.display());
         Ok(loaded)
     }
 
@@ -504,9 +536,17 @@ impl SonglengthDb {
     }
 
     /// Apply durations to all playlist entries that have MD5s.
+    /// Entries that already have a duration (e.g. restored from an M3U file)
+    /// are left untouched.
     pub fn apply_to_playlist(&self, playlist: &mut Playlist) {
         let mut applied = 0;
+        let mut skipped = 0;
         for entry in &mut playlist.entries {
+            // Don't overwrite durations already loaded from the playlist file
+            if entry.duration_secs.is_some() {
+                skipped += 1;
+                continue;
+            }
             if let Some(ref md5) = entry.md5 {
                 let subtune = entry.selected_song.saturating_sub(1) as usize;
                 if let Some(dur) = self.lookup(md5, subtune) {
@@ -520,9 +560,9 @@ impl SonglengthDb {
                 }
             }
         }
-        if applied > 0 {
+        if applied > 0 || skipped > 0 {
             eprintln!(
-                "[phosphor] Applied songlengths to {applied}/{} entries",
+                "[phosphor] Songlengths: applied={applied}, already_known={skipped}, total={}",
                 playlist.entries.len()
             );
         }
@@ -548,21 +588,66 @@ fn parse_songlength_time(s: &str) -> Option<u32> {
 
 /// Parse an M3U/M3U8 playlist. Handles both plain and extended (#EXTM3U).
 /// Relative paths are resolved against `base_dir`.
-fn parse_m3u(content: &str, base_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Metadata parsed from M3U comment lines preceding a file path.
+struct M3uMeta {
+    path: PathBuf,
+    duration_secs: Option<u32>,
+    selected_song: Option<u16>,
+}
+
+fn parse_m3u(content: &str, base_dir: &Path) -> Vec<M3uMeta> {
+    let mut results = Vec::new();
+    let mut pending_duration: Option<u32> = None;
+    let mut pending_song: Option<u16> = None;
 
     for line in content.lines() {
         let line = line.trim();
-        // Skip empty lines, comments, and extended info
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
             continue;
         }
+
+        // Parse #EXTINF:duration,title
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            if let Some((dur_str, _title)) = rest.split_once(',') {
+                if let Ok(dur) = dur_str.trim().parse::<i64>() {
+                    if dur > 0 {
+                        pending_duration = Some(dur as u32);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Parse #PHOSPHOR:song=N
+        if let Some(rest) = line.strip_prefix("#PHOSPHOR:") {
+            for part in rest.split(',') {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("song=") {
+                    if let Ok(s) = val.parse::<u16>() {
+                        pending_song = Some(s);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Skip other comments
+        if line.starts_with('#') {
+            continue;
+        }
+
+        // This is a file path — consume pending metadata
         let p = PathBuf::from(line);
         let resolved = if p.is_absolute() { p } else { base_dir.join(p) };
-        paths.push(resolved);
+
+        results.push(M3uMeta {
+            path: resolved,
+            duration_secs: pending_duration.take(),
+            selected_song: pending_song.take(),
+        });
     }
 
-    paths
+    results
 }
 
 /// Parse a PLS playlist file.
@@ -633,6 +718,7 @@ pub fn parse_directory(dir: PathBuf) -> Vec<PlaylistEntry> {
 
 /// Parse a playlist file (M3U/PLS) and load all referenced SID files (blocking I/O).
 /// Designed to be called from a background thread via `Task::perform`.
+/// For M3U files, saved durations and sub-tune selections are restored.
 pub fn parse_playlist_file(path: PathBuf) -> Result<Vec<PlaylistEntry>, String> {
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
@@ -644,30 +730,50 @@ pub fn parse_playlist_file(path: PathBuf) -> Result<Vec<PlaylistEntry>, String> 
         .map(|e| e.to_ascii_lowercase().to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let paths: Vec<PathBuf> = if ext == "pls" {
-        parse_pls(&content, playlist_dir)
-    } else {
-        parse_m3u(&content, playlist_dir)
-    };
-
     let mut entries = Vec::new();
-    for p in &paths {
-        if p.is_dir() {
-            entries.extend(parse_directory(p.clone()));
-        } else if let Ok(e) = PlaylistEntry::from_path(p) {
-            entries.push(e);
-        } else {
-            eprintln!(
-                "[phosphor] Playlist: skipping {} (not a valid SID)",
-                p.display()
-            );
+
+    if ext == "pls" {
+        let paths = parse_pls(&content, playlist_dir);
+        for p in &paths {
+            if p.is_dir() {
+                entries.extend(parse_directory(p.clone()));
+            } else if let Ok(e) = PlaylistEntry::from_path(p) {
+                entries.push(e);
+            } else {
+                eprintln!(
+                    "[phosphor] Playlist: skipping {} (not a valid SID)",
+                    p.display()
+                );
+            }
+        }
+    } else {
+        let items = parse_m3u(&content, playlist_dir);
+        for item in items {
+            if item.path.is_dir() {
+                entries.extend(parse_directory(item.path));
+            } else if let Ok(mut e) = PlaylistEntry::from_path(&item.path) {
+                // Restore saved metadata from the M3U
+                if let Some(dur) = item.duration_secs {
+                    e.duration_secs = Some(dur);
+                }
+                if let Some(song) = item.selected_song {
+                    if song >= 1 && song <= e.songs {
+                        e.selected_song = song;
+                    }
+                }
+                entries.push(e);
+            } else {
+                eprintln!(
+                    "[phosphor] Playlist: skipping {} (not a valid SID)",
+                    item.path.display()
+                );
+            }
         }
     }
 
     eprintln!(
-        "[phosphor] Loaded {}/{} paths from {}",
+        "[phosphor] Loaded {} entries from {}",
         entries.len(),
-        paths.len(),
         path.display()
     );
     Ok(entries)
