@@ -71,6 +71,9 @@ struct App {
     /// Shared progress string for background file loading tasks.
     loading_progress: playlist::LoadingProgress,
 
+    /// Entries waiting to be processed (chained message pipeline).
+    pending_entries: Option<Vec<playlist::PlaylistEntry>>,
+
     /// Favorites database (MD5 hashes).
     favorites: FavoritesDb,
     /// Whether to show only favorite tunes.
@@ -199,6 +202,7 @@ impl App {
             default_length_text,
             download_status: String::new(),
             loading_progress: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            pending_entries: None,
             favorites,
             favorites_only: false,
         };
@@ -387,32 +391,33 @@ impl App {
             Message::FolderChosen(None) => {}
 
             Message::FilesLoaded(entries) => {
-                if !entries.is_empty() {
-                    let n = entries.len();
+                if entries.is_empty() {
                     if let Ok(mut pg) = self.loading_progress.lock() {
-                        *pg = format!("⏳ Indexing {} tracks…", n);
+                        pg.clear();
                     }
-                    self.playlist.add_entries(entries);
-                    self.apply_songlengths();
-                    self.rebuild_filter();
-                }
-                if let Ok(mut pg) = self.loading_progress.lock() {
-                    pg.clear();
+                } else {
+                    let n = entries.len();
+                    self.pending_entries = Some(entries);
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Adding {} tracks…", n);
+                    }
+                    // Yield to iced so it can redraw, then continue processing
+                    return Task::perform(flush_frame(), |_| Message::ProcessPendingEntries);
                 }
             }
 
             Message::FolderLoaded(entries) => {
-                if !entries.is_empty() {
-                    let n = entries.len();
+                if entries.is_empty() {
                     if let Ok(mut pg) = self.loading_progress.lock() {
-                        *pg = format!("⏳ Indexing {} tracks…", n);
+                        pg.clear();
                     }
-                    self.playlist.add_entries(entries);
-                    self.apply_songlengths();
-                    self.rebuild_filter();
-                }
-                if let Ok(mut pg) = self.loading_progress.lock() {
-                    pg.clear();
+                } else {
+                    let n = entries.len();
+                    self.pending_entries = Some(entries);
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Adding {} tracks…", n);
+                    }
+                    return Task::perform(flush_frame(), |_| Message::ProcessPendingEntries);
                 }
             }
 
@@ -521,22 +526,45 @@ impl App {
             Message::PlaylistFileChosen(None) => {}
 
             Message::PlaylistLoaded(Ok(entries)) => {
-                if !entries.is_empty() {
+                if entries.is_empty() {
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        pg.clear();
+                    }
+                } else {
                     let n = entries.len();
                     eprintln!("[phosphor] Loaded {} tracks from playlist", n);
+                    self.pending_entries = Some(entries);
                     if let Ok(mut pg) = self.loading_progress.lock() {
-                        *pg = format!("⏳ Indexing {} tracks…", n);
+                        *pg = format!("⏳ Adding {} tracks…", n);
                     }
-                    self.playlist.add_entries(entries);
-                    self.apply_songlengths();
-                    self.rebuild_filter();
-                }
-                if let Ok(mut pg) = self.loading_progress.lock() {
-                    pg.clear();
+                    return Task::perform(flush_frame(), |_| Message::ProcessPendingEntries);
                 }
             }
             Message::PlaylistLoaded(Err(e)) => {
                 eprintln!("[phosphor] Failed to load playlist: {e}");
+                if let Ok(mut pg) = self.loading_progress.lock() {
+                    pg.clear();
+                }
+            }
+
+            // ── Chained post-processing (yields between steps for UI redraws) ──
+            Message::ProcessPendingEntries => {
+                if let Some(entries) = self.pending_entries.take() {
+                    let n = entries.len();
+                    self.playlist.add_entries(entries);
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Applying songlengths to {} tracks…", n);
+                    }
+                    return Task::perform(flush_frame(), |_| Message::FinalizePendingEntries);
+                } else {
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        pg.clear();
+                    }
+                }
+            }
+            Message::FinalizePendingEntries => {
+                self.apply_songlengths();
+                self.rebuild_filter();
                 if let Ok(mut pg) = self.loading_progress.lock() {
                     pg.clear();
                 }
@@ -1128,6 +1156,12 @@ fn parse_hex_addr(s: &str) -> Option<u16> {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Entry point
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Yield to the iced runtime so it can redraw before processing the next message.
+///
+async fn flush_frame() {
+    tokio::time::sleep(Duration::from_millis(5)).await;
+}
 
 fn main() -> iced::Result {
     env_logger::init();

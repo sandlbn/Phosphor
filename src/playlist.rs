@@ -705,9 +705,8 @@ pub fn parse_files(paths: Vec<PathBuf>, progress: LoadingProgress) -> Vec<Playli
             entries.push(e);
         }
     }
-    if let Ok(mut pg) = progress.lock() {
-        *pg = format!("⏳ Adding {} tracks to playlist…", entries.len());
-    }
+    // Don't clear progress here — the main thread handler will clear it
+    // after post-processing (add_entries, songlengths, filter) is done.
     entries
 }
 
@@ -732,9 +731,7 @@ pub fn parse_directory(dir: PathBuf, progress: LoadingProgress) -> Vec<PlaylistE
             }
         }
     }
-    if let Ok(mut pg) = progress.lock() {
-        *pg = format!("⏳ Adding {} tracks to playlist…", entries.len());
-    }
+    // Don't clear — main thread handler clears after post-processing.
     entries
 }
 
@@ -816,8 +813,6 @@ pub fn parse_playlist_file(
         entries.len(),
         path.display()
     );
-    if let Ok(mut pg) = progress.lock() {
-        *pg = format!("⏳ Adding {} tracks to playlist…", entries.len());
-    }
+    // Don't clear — main thread handler clears after post-processing.
     Ok(entries)
 }

@@ -67,6 +67,10 @@ pub enum Message {
     FolderLoaded(Vec<crate::playlist::PlaylistEntry>),
     PlaylistLoaded(Result<Vec<crate::playlist::PlaylistEntry>, String>),
 
+    // Chained post-processing (allows UI redraws between steps)
+    ProcessPendingEntries,
+    FinalizePendingEntries,
+
     // Settings
     ToggleSettings,
     ToggleSkipRsid,

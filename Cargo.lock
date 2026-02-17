@@ -3484,6 +3484,7 @@ dependencies = [
  "rand 0.8.5",
  "resid-rs",
  "rfd",
+ "tokio",
  "ultimate64",
  "url",
  "usbsid-pico",
