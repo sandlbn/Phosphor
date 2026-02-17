@@ -74,6 +74,9 @@ struct App {
     /// Entries waiting to be processed (chained message pipeline).
     pending_entries: Option<Vec<playlist::PlaylistEntry>>,
 
+    /// Scroll playlist to current track on next tick.
+    scroll_to_current: bool,
+
     /// Favorites database (MD5 hashes).
     favorites: FavoritesDb,
     /// Whether to show only favorite tunes.
@@ -203,6 +206,7 @@ impl App {
             download_status: String::new(),
             loading_progress: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             pending_entries: None,
+            scroll_to_current: false,
             favorites,
             favorites_only: false,
         };
@@ -718,9 +722,72 @@ impl App {
                 self.rebuild_filter();
             }
 
+            Message::FavoriteNowPlaying => {
+                if let Some(idx) = self.playlist.current {
+                    if let Some(entry) = self.playlist.entries.get(idx) {
+                        if let Some(ref md5) = entry.md5 {
+                            let is_fav = self.favorites.toggle(md5);
+                            self.favorites.save();
+                            eprintln!(
+                                "[phosphor] {} \"{}\" ({})",
+                                if is_fav {
+                                    "♥ Favorited"
+                                } else {
+                                    "♡ Unfavorited"
+                                },
+                                entry.title,
+                                md5,
+                            );
+                            if self.favorites_only {
+                                self.rebuild_filter();
+                            }
+                        }
+                    }
+                }
+            }
+
+            Message::ScrollToNowPlaying => {
+                if let Some(cur_idx) = self.playlist.current {
+                    // Find position of current track in the filtered list
+                    if let Some(pos) = self.filtered_indices.iter().position(|&i| i == cur_idx) {
+                        let total = self.filtered_indices.len();
+                        if total > 1 {
+                            let fraction = pos as f32 / (total - 1) as f32;
+                            return iced::widget::operation::snap_to(
+                                ui::playlist_scrollable_id(),
+                                iced::widget::scrollable::RelativeOffset {
+                                    x: 0.0,
+                                    y: fraction,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
             // ── Tick ─────────────────────────────────────────────────────
             Message::Tick => {
                 self.poll_status();
+                // Auto-scroll playlist to current track
+                if self.scroll_to_current {
+                    self.scroll_to_current = false;
+                    if let Some(cur_idx) = self.playlist.current {
+                        if let Some(pos) = self.filtered_indices.iter().position(|&i| i == cur_idx)
+                        {
+                            let total = self.filtered_indices.len();
+                            if total > 1 {
+                                let fraction = pos as f32 / (total - 1) as f32;
+                                return iced::widget::operation::snap_to(
+                                    ui::playlist_scrollable_id(),
+                                    iced::widget::scrollable::RelativeOffset {
+                                        x: 0.0,
+                                        y: fraction,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             Message::None => {}
@@ -730,7 +797,19 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let info_bar = ui::track_info_bar(&self.status, &self.visualizer);
+        let is_now_playing_fav = self
+            .playlist
+            .current_entry()
+            .and_then(|e| e.md5.as_ref())
+            .map(|m| self.favorites.is_favorite(m))
+            .unwrap_or(false);
+        let has_track = self.status.track_info.is_some();
+        let info_bar = ui::track_info_bar(
+            &self.status,
+            &self.visualizer,
+            is_now_playing_fav,
+            has_track,
+        );
         let controls = ui::controls_bar(&self.status, &self.playlist);
 
         // Progress bar: get current track duration
@@ -851,6 +930,7 @@ impl App {
 
             self.playlist.current = Some(idx);
             self.selected = Some(idx);
+            self.scroll_to_current = true;
 
             let force_stereo = std::env::args().any(|a| a == "--stereo");
             let sid4_addr = parse_sid4_from_args();

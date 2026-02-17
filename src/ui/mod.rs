@@ -13,6 +13,11 @@ use crate::player::{PlayState, PlayerStatus};
 use crate::playlist::Playlist;
 use visualizer::Visualizer;
 
+/// Fixed scrollable ID for the playlist widget.
+pub fn playlist_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("phosphor-playlist")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Messages
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +90,8 @@ pub enum Message {
     // Favorites
     ToggleFavorite(usize),
     ToggleFavoritesFilter,
+    FavoriteNowPlaying,
+    ScrollToNowPlaying,
 
     // File drag & drop
     FileDropped(PathBuf),
@@ -101,6 +108,8 @@ pub enum Message {
 pub fn track_info_bar<'a>(
     status: &'a PlayerStatus,
     visualizer: &'a Visualizer,
+    is_now_playing_favorite: bool,
+    has_track: bool,
 ) -> Element<'a, Message> {
     let (title, author, extra) = match &status.track_info {
         Some(info) => (
@@ -144,13 +153,52 @@ pub fn track_info_bar<'a>(
 
     let vis = visualizer.view();
 
+    // Heart button for currently playing track
+    let now_playing_buttons: Element<'_, Message> = if has_track {
+        let heart_label = if is_now_playing_favorite {
+            "♥"
+        } else {
+            "♡"
+        };
+        let heart_color = if is_now_playing_favorite {
+            Color::from_rgb(1.0, 0.35, 0.45)
+        } else {
+            Color::from_rgb(0.5, 0.5, 0.6)
+        };
+        let heart_btn = button(text(heart_label).size(18).color(heart_color))
+            .on_press(Message::FavoriteNowPlaying)
+            .padding(Padding::from([4, 6]))
+            .style(|_theme: &Theme, _status| button::Style {
+                background: None,
+                text_color: Color::WHITE,
+                ..Default::default()
+            });
+
+        let scroll_btn = button(text("◎").size(16).color(Color::from_rgb(0.5, 0.5, 0.6)))
+            .on_press(Message::ScrollToNowPlaying)
+            .padding(Padding::from([4, 6]))
+            .style(|_theme: &Theme, _status| button::Style {
+                background: None,
+                text_color: Color::WHITE,
+                ..Default::default()
+            });
+
+        column![heart_btn, scroll_btn]
+            .spacing(0)
+            .align_x(Alignment::Center)
+            .into()
+    } else {
+        column![].into()
+    };
+
     let content = row![
         info_col,
+        now_playing_buttons,
         container(vis)
             .width(Length::Fixed(300.0))
             .height(Length::Fixed(60.0)),
     ]
-    .spacing(16)
+    .spacing(8)
     .align_y(Alignment::Center);
 
     container(content)
@@ -474,6 +522,7 @@ pub fn playlist_view<'a>(
     }
 
     scrollable(rows)
+        .id(playlist_scrollable_id())
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
