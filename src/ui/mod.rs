@@ -67,6 +67,10 @@ pub enum Message {
     FolderLoaded(Vec<crate::playlist::PlaylistEntry>),
     PlaylistLoaded(Result<Vec<crate::playlist::PlaylistEntry>, String>),
 
+    // Chained post-processing (allows UI redraws between steps)
+    ProcessPendingEntries,
+    FinalizePendingEntries,
+
     // Settings
     ToggleSettings,
     ToggleSkipRsid,
@@ -300,6 +304,7 @@ pub fn search_bar<'a>(
     total_count: usize,
     favorites_only: bool,
     favorites_count: usize,
+    loading_status: &str,
 ) -> Element<'a, Message> {
     let search_input = text_input("Search playlist...", search_text)
         .on_input(Message::SearchChanged)
@@ -319,7 +324,9 @@ pub fn search_bar<'a>(
             selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
         });
 
-    let count_text = if favorites_only {
+    let count_text = if !loading_status.is_empty() {
+        loading_status.to_string()
+    } else if favorites_only {
         format!("♥ {} / {} tracks", visible_count, total_count)
     } else if !search_text.is_empty() {
         format!("{} / {} tracks", visible_count, total_count)
@@ -327,9 +334,13 @@ pub fn search_bar<'a>(
         format!("{} tracks", total_count)
     };
 
-    let count_label = text(count_text)
-        .size(12)
-        .color(Color::from_rgb(0.5, 0.5, 0.6));
+    let count_color = if !loading_status.is_empty() {
+        Color::from_rgb(0.4, 0.75, 0.9) // Blue-ish for loading
+    } else {
+        Color::from_rgb(0.5, 0.5, 0.6)
+    };
+
+    let count_label = text(count_text).size(12).color(count_color);
 
     let fav_label = if favorites_only {
         format!("♥ {}", favorites_count)

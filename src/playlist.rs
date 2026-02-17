@@ -688,19 +688,33 @@ fn parse_pls(content: &str, base_dir: &Path) -> Vec<PathBuf> {
 //  Background parsing helpers (for use in async tasks, off the UI thread)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Shared progress string for background loading tasks.
+/// Updated by the background thread, read by the UI on each tick.
+pub type LoadingProgress = std::sync::Arc<std::sync::Mutex<String>>;
+
 /// Parse a list of SID file paths into playlist entries (blocking I/O).
 /// Designed to be called from a background thread via `Task::perform`.
-pub fn parse_files(paths: Vec<PathBuf>) -> Vec<PlaylistEntry> {
-    paths
-        .iter()
-        .filter_map(|p| PlaylistEntry::from_path(p).ok())
-        .collect()
+pub fn parse_files(paths: Vec<PathBuf>, progress: LoadingProgress) -> Vec<PlaylistEntry> {
+    let total = paths.len();
+    let mut entries = Vec::with_capacity(total);
+    for (i, p) in paths.iter().enumerate() {
+        if let Ok(mut pg) = progress.lock() {
+            *pg = format!("⏳ Adding files: {} / {}", i + 1, total);
+        }
+        if let Ok(e) = PlaylistEntry::from_path(p) {
+            entries.push(e);
+        }
+    }
+    // Don't clear progress here — the main thread handler will clear it
+    // after post-processing (add_entries, songlengths, filter) is done.
+    entries
 }
 
 /// Recursively walk a directory and parse all .sid files (blocking I/O).
 /// Designed to be called from a background thread via `Task::perform`.
-pub fn parse_directory(dir: PathBuf) -> Vec<PlaylistEntry> {
+pub fn parse_directory(dir: PathBuf, progress: LoadingProgress) -> Vec<PlaylistEntry> {
     let mut entries = Vec::new();
+    let mut count = 0usize;
     for entry in WalkDir::new(&dir)
         .follow_links(true)
         .into_iter()
@@ -708,18 +722,26 @@ pub fn parse_directory(dir: PathBuf) -> Vec<PlaylistEntry> {
     {
         let p = entry.path();
         if p.extension().map(|e| e.to_ascii_lowercase()) == Some("sid".into()) {
+            count += 1;
+            if let Ok(mut pg) = progress.lock() {
+                *pg = format!("⏳ Scanning folder: {} files found", count);
+            }
             if let Ok(e) = PlaylistEntry::from_path(p) {
                 entries.push(e);
             }
         }
     }
+    // Don't clear — main thread handler clears after post-processing.
     entries
 }
 
 /// Parse a playlist file (M3U/PLS) and load all referenced SID files (blocking I/O).
 /// Designed to be called from a background thread via `Task::perform`.
 /// For M3U files, saved durations and sub-tune selections are restored.
-pub fn parse_playlist_file(path: PathBuf) -> Result<Vec<PlaylistEntry>, String> {
+pub fn parse_playlist_file(
+    path: PathBuf,
+    progress: LoadingProgress,
+) -> Result<Vec<PlaylistEntry>, String> {
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
 
@@ -731,42 +753,57 @@ pub fn parse_playlist_file(path: PathBuf) -> Result<Vec<PlaylistEntry>, String> 
         .unwrap_or_default();
 
     let mut entries = Vec::new();
+    let mut count = 0usize;
 
     if ext == "pls" {
         let paths = parse_pls(&content, playlist_dir);
+        let total = paths.len();
         for p in &paths {
             if p.is_dir() {
-                entries.extend(parse_directory(p.clone()));
-            } else if let Ok(e) = PlaylistEntry::from_path(p) {
-                entries.push(e);
+                entries.extend(parse_directory(p.clone(), progress.clone()));
             } else {
-                eprintln!(
-                    "[phosphor] Playlist: skipping {} (not a valid SID)",
-                    p.display()
-                );
+                count += 1;
+                if let Ok(mut pg) = progress.lock() {
+                    *pg = format!("⏳ Loading playlist: {} / {}", count, total);
+                }
+                if let Ok(e) = PlaylistEntry::from_path(p) {
+                    entries.push(e);
+                } else {
+                    eprintln!(
+                        "[phosphor] Playlist: skipping {} (not a valid SID)",
+                        p.display()
+                    );
+                }
             }
         }
     } else {
         let items = parse_m3u(&content, playlist_dir);
+        let total = items.len();
         for item in items {
             if item.path.is_dir() {
-                entries.extend(parse_directory(item.path));
-            } else if let Ok(mut e) = PlaylistEntry::from_path(&item.path) {
-                // Restore saved metadata from the M3U
-                if let Some(dur) = item.duration_secs {
-                    e.duration_secs = Some(dur);
-                }
-                if let Some(song) = item.selected_song {
-                    if song >= 1 && song <= e.songs {
-                        e.selected_song = song;
-                    }
-                }
-                entries.push(e);
+                entries.extend(parse_directory(item.path, progress.clone()));
             } else {
-                eprintln!(
-                    "[phosphor] Playlist: skipping {} (not a valid SID)",
-                    item.path.display()
-                );
+                count += 1;
+                if let Ok(mut pg) = progress.lock() {
+                    *pg = format!("⏳ Loading playlist: {} / {}", count, total);
+                }
+                if let Ok(mut e) = PlaylistEntry::from_path(&item.path) {
+                    // Restore saved metadata from the M3U
+                    if let Some(dur) = item.duration_secs {
+                        e.duration_secs = Some(dur);
+                    }
+                    if let Some(song) = item.selected_song {
+                        if song >= 1 && song <= e.songs {
+                            e.selected_song = song;
+                        }
+                    }
+                    entries.push(e);
+                } else {
+                    eprintln!(
+                        "[phosphor] Playlist: skipping {} (not a valid SID)",
+                        item.path.display()
+                    );
+                }
             }
         }
     }
@@ -776,5 +813,6 @@ pub fn parse_playlist_file(path: PathBuf) -> Result<Vec<PlaylistEntry>, String> 
         entries.len(),
         path.display()
     );
+    // Don't clear — main thread handler clears after post-processing.
     Ok(entries)
 }

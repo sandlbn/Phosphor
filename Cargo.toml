@@ -41,6 +41,7 @@ walkdir = "2"
 env_logger = "0.11"
 log = "0.4"
 image = "0.25.9"
+tokio = "1.49.0"
 
 # Unix signal handling (macOS/Linux)
 [target.'cfg(unix)'.dependencies]
