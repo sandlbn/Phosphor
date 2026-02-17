@@ -68,6 +68,9 @@ struct App {
     /// Status message for songlength download.
     download_status: String,
 
+    /// Shared progress string for background file loading tasks.
+    loading_progress: playlist::LoadingProgress,
+
     /// Favorites database (MD5 hashes).
     favorites: FavoritesDb,
     /// Whether to show only favorite tunes.
@@ -195,6 +198,7 @@ impl App {
             show_settings: false,
             default_length_text,
             download_status: String::new(),
+            loading_progress: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             favorites,
             favorites_only: false,
         };
@@ -364,8 +368,9 @@ impl App {
                     self.config.remember_sid_dir(first);
                 }
                 // Parse SID headers off the UI thread
+                let pg = self.loading_progress.clone();
                 return Task::perform(
-                    async move { playlist::parse_files(paths) },
+                    async move { playlist::parse_files(paths, pg) },
                     Message::FilesLoaded,
                 );
             }
@@ -373,8 +378,9 @@ impl App {
             Message::FolderChosen(Some(path)) => {
                 self.config.remember_sid_dir(&path);
                 // Walk + parse off the UI thread
+                let pg = self.loading_progress.clone();
                 return Task::perform(
-                    async move { playlist::parse_directory(path) },
+                    async move { playlist::parse_directory(path, pg) },
                     Message::FolderLoaded,
                 );
             }
@@ -382,17 +388,31 @@ impl App {
 
             Message::FilesLoaded(entries) => {
                 if !entries.is_empty() {
+                    let n = entries.len();
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Indexing {} tracks…", n);
+                    }
                     self.playlist.add_entries(entries);
                     self.apply_songlengths();
                     self.rebuild_filter();
+                }
+                if let Ok(mut pg) = self.loading_progress.lock() {
+                    pg.clear();
                 }
             }
 
             Message::FolderLoaded(entries) => {
                 if !entries.is_empty() {
+                    let n = entries.len();
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Indexing {} tracks…", n);
+                    }
                     self.playlist.add_entries(entries);
                     self.apply_songlengths();
                     self.rebuild_filter();
+                }
+                if let Ok(mut pg) = self.loading_progress.lock() {
+                    pg.clear();
                 }
             }
 
@@ -409,8 +429,9 @@ impl App {
                     "sid" => {
                         self.config.remember_sid_dir(&path);
                         let paths = vec![path];
+                        let pg = self.loading_progress.clone();
                         return Task::perform(
-                            async move { playlist::parse_files(paths) },
+                            async move { playlist::parse_files(paths, pg) },
                             Message::FilesLoaded,
                         );
                     }
@@ -443,8 +464,9 @@ impl App {
                     // Playlist files
                     "m3u" | "m3u8" | "pls" => {
                         self.config.remember_playlist_dir(&path);
+                        let pg = self.loading_progress.clone();
                         return Task::perform(
-                            async move { playlist::parse_playlist_file(path) },
+                            async move { playlist::parse_playlist_file(path, pg) },
                             Message::PlaylistLoaded,
                         );
                     }
@@ -453,8 +475,9 @@ impl App {
                         if path.is_dir() {
                             self.config.remember_sid_dir(&path);
                             let dir = path;
+                            let pg = self.loading_progress.clone();
                             return Task::perform(
-                                async move { playlist::parse_directory(dir) },
+                                async move { playlist::parse_directory(dir, pg) },
                                 Message::FolderLoaded,
                             );
                         }
@@ -489,8 +512,9 @@ impl App {
             Message::PlaylistFileChosen(Some(path)) => {
                 self.config.remember_playlist_dir(&path);
                 // Parse playlist + SID headers off the UI thread
+                let pg = self.loading_progress.clone();
                 return Task::perform(
-                    async move { playlist::parse_playlist_file(path) },
+                    async move { playlist::parse_playlist_file(path, pg) },
                     Message::PlaylistLoaded,
                 );
             }
@@ -498,14 +522,24 @@ impl App {
 
             Message::PlaylistLoaded(Ok(entries)) => {
                 if !entries.is_empty() {
-                    eprintln!("[phosphor] Loaded {} tracks from playlist", entries.len());
+                    let n = entries.len();
+                    eprintln!("[phosphor] Loaded {} tracks from playlist", n);
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Indexing {} tracks…", n);
+                    }
                     self.playlist.add_entries(entries);
                     self.apply_songlengths();
                     self.rebuild_filter();
                 }
+                if let Ok(mut pg) = self.loading_progress.lock() {
+                    pg.clear();
+                }
             }
             Message::PlaylistLoaded(Err(e)) => {
                 eprintln!("[phosphor] Failed to load playlist: {e}");
+                if let Ok(mut pg) = self.loading_progress.lock() {
+                    pg.clear();
+                }
             }
 
             // ── Search / filter ───────────────────────────────────────
@@ -702,12 +736,18 @@ impl App {
                 .into()
         } else {
             // Normal view: search + playlist
+            let loading_status = self
+                .loading_progress
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
             let search = ui::search_bar(
                 &self.search_text,
                 self.filtered_indices.len(),
                 self.playlist.len(),
                 self.favorites_only,
                 self.favorites.count(),
+                &loading_status,
             );
 
             let playlist = ui::playlist_view(
