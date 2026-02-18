@@ -7,6 +7,7 @@ mod player;
 mod playlist;
 mod sid_device;
 mod ui;
+mod version_check;
 
 #[cfg(all(feature = "usb", target_os = "macos"))]
 mod usb_bridge;
@@ -76,6 +77,9 @@ struct App {
 
     /// Scroll playlist to current track on next tick.
     scroll_to_current: bool,
+
+    /// Available update info (if any).
+    new_version: Option<version_check::NewVersionInfo>,
 
     /// Favorites database (MD5 hashes).
     favorites: FavoritesDb,
@@ -207,11 +211,19 @@ impl App {
             loading_progress: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             pending_entries: None,
             scroll_to_current: false,
+            new_version: None,
             favorites,
             favorites_only: false,
         };
 
-        (app, Task::none())
+        // Fire a background version check
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let version_task = Task::perform(
+            async move { version_check::check_github_release(&current_version).await },
+            Message::VersionCheckDone,
+        );
+
+        (app, version_task)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -790,6 +802,27 @@ impl App {
                 }
             }
 
+            Message::VersionCheckDone(Ok(Some(info))) => {
+                eprintln!(
+                    "[phosphor] New version available: {} → {}",
+                    env!("CARGO_PKG_VERSION"),
+                    info.version
+                );
+                self.new_version = Some(info);
+            }
+            Message::VersionCheckDone(Ok(None)) => {
+                eprintln!("[phosphor] Version is up to date");
+            }
+            Message::VersionCheckDone(Err(e)) => {
+                eprintln!("[phosphor] Version check failed: {e}");
+            }
+
+            Message::OpenUpdateUrl => {
+                if let Some(ref info) = self.new_version {
+                    let _ = open::that(&info.download_url);
+                }
+            }
+
             Message::None => {}
         }
 
@@ -810,7 +843,7 @@ impl App {
             is_now_playing_fav,
             has_track,
         );
-        let controls = ui::controls_bar(&self.status, &self.playlist);
+        let controls = ui::controls_bar(&self.status, &self.playlist, self.new_version.as_ref());
 
         // Progress bar: get current track duration
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
@@ -1239,6 +1272,10 @@ fn parse_hex_addr(s: &str) -> Option<u16> {
 
 /// Yield to the iced runtime so it can redraw before processing the next message.
 ///
+/// In iced 0.14, `async {}` and `Task::done` resolve synchronously within the
+/// same "batch" — the UI never gets a chance to redraw. A real `tokio::time::sleep`
+/// forces the future to resolve in a *later* event-loop tick, guaranteeing iced
+/// calls `view()` → draw before dispatching the next chained message.
 async fn flush_frame() {
     tokio::time::sleep(Duration::from_millis(5)).await;
 }

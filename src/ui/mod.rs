@@ -96,6 +96,10 @@ pub enum Message {
     // File drag & drop
     FileDropped(PathBuf),
 
+    // Version check
+    VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
+    OpenUpdateUrl,
+
     // No-op
     None,
 }
@@ -174,7 +178,7 @@ pub fn track_info_bar<'a>(
                 ..Default::default()
             });
 
-        let scroll_btn = button(text("◎").size(16).color(Color::from_rgb(0.5, 0.5, 0.6)))
+        let scroll_btn = button(text("⌖").size(16).color(Color::from_rgb(0.5, 0.5, 0.6)))
             .on_press(Message::ScrollToNowPlaying)
             .padding(Padding::from([4, 6]))
             .style(|_theme: &Theme, _status| button::Style {
@@ -280,7 +284,11 @@ pub fn progress_bar<'a>(
 }
 
 /// Build the transport controls bar.
-pub fn controls_bar<'a>(status: &PlayerStatus, playlist: &Playlist) -> Element<'a, Message> {
+pub fn controls_bar<'a>(
+    status: &PlayerStatus,
+    playlist: &Playlist,
+    new_version: Option<&crate::version_check::NewVersionInfo>,
+) -> Element<'a, Message> {
     let play_label = match status.state {
         PlayState::Playing => "❚❚",
         _ => "▶",
@@ -323,18 +331,40 @@ pub fn controls_bar<'a>(status: &PlayerStatus, playlist: &Playlist) -> Element<'
     ]
     .spacing(4);
 
-    let bar = row![
+    let mut bar = row![
         transport,
         text(" │ ").color(Color::from_rgb(0.3, 0.3, 0.35)),
         subtune_controls,
         text(" │ ").color(Color::from_rgb(0.3, 0.3, 0.35)),
         mode_controls,
         Space::new().width(Length::Fill),
-        playlist_controls,
     ]
     .spacing(8)
     .align_y(Alignment::Center)
     .padding(Padding::from([6, 16]));
+
+    // Show update badge if new version is available
+    if let Some(info) = new_version {
+        let badge = button(
+            text(format!("⬆ {}", info.version))
+                .size(12)
+                .color(Color::from_rgb(0.1, 0.1, 0.12)),
+        )
+        .on_press(Message::OpenUpdateUrl)
+        .padding(Padding::from([3, 8]))
+        .style(|_theme: &Theme, _status| button::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
+            text_color: Color::from_rgb(0.1, 0.1, 0.12),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        bar = bar.push(badge);
+    }
+
+    bar = bar.push(playlist_controls);
 
     container(bar)
         .width(Length::Fill)

@@ -71,7 +71,7 @@ fn read_be_u32(d: &[u8], o: usize) -> u32 {
 fn read_string(d: &[u8], o: usize, len: usize) -> String {
     let s = &d[o..o + len];
     let end = s.iter().position(|&b| b == 0).unwrap_or(len);
-    String::from_utf8_lossy(&s[..end]).to_string()
+    s[..end].iter().map(|&b| b as char).collect()
 }
 
 /// Decode a SID address byte (from header offset $7A or $7B).
