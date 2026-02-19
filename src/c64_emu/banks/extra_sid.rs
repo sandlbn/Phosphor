@@ -1,15 +1,16 @@
 //! Extra SID bank — supports mapping up to 8 additional SID chips
-//! within a 256-byte I/O page (each SID occupies 32 bytes).
+//! anywhere in the I/O space ($D000–$DFFF, 128 × 32-byte slots).
 
 use super::sid_bank::SidChip;
 
-const MAPPER_SIZE: usize = 8;
+/// Number of 32-byte slots in the 4 KB I/O space ($D000–$DFFF).
+const MAPPER_SIZE: usize = 128;
 
 pub struct ExtraSidBank {
-    /// For each 32-byte slot, either an extra SID or a fallback that
-    /// just returns 0xFF.
+    /// Registered extra SID chips.
     sids: Vec<Box<dyn SidChip>>,
-    /// Maps 32-byte slot index → SID index (or `None` for fallback).
+    /// For each 32-byte slot in $D000–$DFFF, which SID handles it (if any).
+    /// Slot index = ((address >> 5) & 0x7F), covering $D000–$DFFF.
     mapper: [Option<usize>; MAPPER_SIZE],
 }
 
@@ -21,7 +22,9 @@ impl ExtraSidBank {
         }
     }
 
-    fn mapper_index(address: u16) -> usize {
+    /// Convert a full 16-bit address to its 32-byte slot index (0–127).
+    /// Valid for $D000–$DFFF only.
+    fn slot(address: u16) -> usize {
         ((address >> 5) as usize) & (MAPPER_SIZE - 1)
     }
 
@@ -31,24 +34,28 @@ impl ExtraSidBank {
         }
     }
 
-    /// Add a SID chip mapped at the given base address (e.g. $D420).
-    pub fn add_sid(&mut self, sid: Box<dyn SidChip>, address: u16) {
+    /// Add a SID chip mapped at `base_address` (e.g. $D420, $D500, $DE00).
+    /// The chip occupies the 32-byte slot containing that address.
+    pub fn add_sid(&mut self, sid: Box<dyn SidChip>, base_address: u16) {
         let idx = self.sids.len();
         self.sids.push(sid);
-        self.mapper[Self::mapper_index(address)] = Some(idx);
+        self.mapper[Self::slot(base_address)] = Some(idx);
+    }
+
+    /// Returns true if a chip is mapped at the 32-byte slot for this address.
+    pub fn has_slot(&self, address: u16) -> bool {
+        self.mapper[Self::slot(address)].is_some()
     }
 
     pub fn peek(&self, addr: u16) -> u8 {
-        let slot = Self::mapper_index(addr);
-        match self.mapper[slot] {
+        match self.mapper[Self::slot(addr)] {
             Some(i) => self.sids[i].read((addr & 0x1F) as u8),
             None => 0xFF,
         }
     }
 
     pub fn poke(&mut self, addr: u16, data: u8) {
-        let slot = Self::mapper_index(addr);
-        if let Some(i) = self.mapper[slot] {
+        if let Some(i) = self.mapper[Self::slot(addr)] {
             self.sids[i].write((addr & 0x1F) as u8, data);
         }
     }

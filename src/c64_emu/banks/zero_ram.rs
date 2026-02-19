@@ -67,6 +67,9 @@ pub struct ZeroRamBank {
     /// Receives the 3-bit PLA state (LORAM | HIRAM | CHAREN).
     on_port_change: Option<CpuPortCallback>,
 
+    /// Current PHI2 cycle time — set by C64 each tick_peripherals() call.
+    pub phi2_time: EventClock,
+
     /// Getter for PHI2 time (provided by the C64 / scheduler).
     phi2_time_fn: Option<Box<dyn Fn() -> EventClock>>,
 
@@ -84,6 +87,7 @@ impl ZeroRamBank {
             bit6: DataBit::new(6),
             bit7: DataBit::new(7),
             on_port_change: None,
+            phi2_time: 0,
             phi2_time_fn: None,
             last_read_byte_fn: None,
         }
@@ -113,7 +117,7 @@ impl ZeroRamBank {
     }
 
     fn phi2_time(&self) -> EventClock {
-        self.phi2_time_fn.as_ref().map_or(0, |f| f())
+        self.phi2_time
     }
 
     #[allow(dead_code)]
