@@ -89,8 +89,8 @@ pub struct Mos656x {
 
     /// Accumulated IRQ assertion state.
     pub irq_state: bool,
-    /// Accumulated BA state.
-    ba_state: bool,
+    /// Current BA (Bus Available) state: true = high = CPU can run, false = low = CPU stalled.
+    pub ba_state: bool,
     /// Set when raster wraps to line 0 (new frame). Cleared by caller.
     pub new_frame: bool,
 }
@@ -257,14 +257,16 @@ impl Mos656x {
         // Beginning of line
         if self.line_cycle == 0 {
             self.check_vblank();
-            out.irq = self.handle_irq_state();
+            // IRQ flag is set inside check_vblank via raster_y_irq_edge_detect(),
+            // but the IRQ line becomes visible to the CPU at cycle 1.
         }
         if self.line_cycle == 1 {
             self.vblank();
+            out.irq = self.handle_irq_state();
         }
 
-        // Bad line → BA low
-        if self.line_cycle == FETCH_CYCLE && self.is_bad_line {
+        // Bad line → BA low (3-cycle pre-stall warning before actual DMA)
+        if self.line_cycle == FETCH_CYCLE - 3 && self.is_bad_line && self.ba_state {
             self.ba_state = false;
             out.ba = Some(false);
         }
@@ -275,11 +277,21 @@ impl Mos656x {
         }
         if self.line_cycle == 15 {
             self.sprites.update_mc_base();
+            // Release BA if all sprite DMA finished and no bad line is active
+            if self.sprites.dma == 0 && !self.ba_state && !self.is_bad_line {
+                self.ba_state = true;
+                out.ba = Some(true);
+            }
         }
         if self.line_cycle == 55 || self.line_cycle == 56 {
             self.sprites.check_dma(self.raster_y, &self.regs);
             if self.line_cycle == 55 {
-                self.sprites.check_exp();
+                self.sprites.check_exp_with_reg(self.regs[0x17]);
+                // Sprite DMA active: assert BA (3-cycle warning before first fetch)
+                if self.sprites.dma != 0 && self.ba_state {
+                    self.ba_state = false;
+                    out.ba = Some(false);
+                }
             }
         }
         if self.line_cycle == 58 {
@@ -288,7 +300,7 @@ impl Mos656x {
 
         // End of bad-line fetch period
         if self.line_cycle == FETCH_CYCLE + SCREEN_TEXTCOLS + 3 && self.is_bad_line {
-            if !self.sprites.is_dma(0x01) {
+            if self.sprites.dma == 0 && !self.ba_state {
                 self.ba_state = true;
                 out.ba = Some(true);
             }

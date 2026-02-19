@@ -76,14 +76,10 @@ impl InterruptSource {
                     }
                 }
                 CiaModel::Mos6526 | CiaModel::Mos6526W4485 => {
-                    // delayed by 1 cycle — we store the pending state
-                    // and the caller must call `tick_delayed()` next cycle.
+                    // delayed by 1 cycle — the IRQ line asserts next cycle
+                    // via tick_delayed().  The flag is already in idr above.
                     self.pending_trigger = Some(flag);
-                    if !self.is_triggered() {
-                        self.idr |= INT_REQUEST;
-                        self.asserted = true;
-                        return true;
-                    }
+                    return false;
                 }
             }
         }

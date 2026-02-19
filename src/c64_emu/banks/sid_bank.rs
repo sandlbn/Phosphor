@@ -60,6 +60,12 @@ impl Bank for SidBank {
         self.sid.write(reg as u8, value);
     }
     fn peek(&self, address: u16) -> u8 {
-        self.sid.read((address & 0x1F) as u8)
+        let reg = (address & 0x1F) as u8;
+        if reg < 0x19 {
+            // Registers $00-$18 are write-only; reads return last written value
+            self.last_poke[reg as usize]
+        } else {
+            self.sid.read(reg)
+        }
     }
 }

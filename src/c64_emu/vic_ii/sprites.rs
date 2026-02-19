@@ -4,7 +4,7 @@ const NUM_SPRITES: usize = 8;
 
 pub struct Sprites {
     exp_flop: u8,
-    dma: u8,
+    pub dma: u8,
     mc_base: [u8; NUM_SPRITES],
     mc: [u8; NUM_SPRITES],
 }

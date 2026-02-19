@@ -113,6 +113,14 @@ impl KernalRomBank {
         self.set_val(0xFE46, 0x03);
         self.set_val(0xFE47, opc::RTI);
 
+        // CIA2 NMI acknowledge ($FE72) — default target of $0318.
+        // Real Kernal: read CIA2 ICR ($DD0D) to clear the interrupt flag, then RTI.
+        // Without this the NMI frame (PC+P on stack) is consumed by RTS → crash.
+        self.set_val(0xFE72, 0xAD); // LDA absolute
+        self.set_val(0xFE73, 0x0D); // $DD0D low
+        self.set_val(0xFE74, 0xDD); // $DD0D high
+        self.set_val(0xFE75, opc::RTI);
+
         // IRQ entry
         self.set_val(0xFF48, opc::PHA);
         self.set_val(0xFF49, opc::TXA);

@@ -56,6 +56,9 @@ pub struct Mos652x {
 
     /// Ticks elapsed (caller must feed this).
     pub clock: u64,
+
+    /// Counts Timer-A underflows in SDR output mode; INT_SP fires after 8.
+    sdr_shift_count: u8,
 }
 
 impl Mos652x {
@@ -67,6 +70,7 @@ impl Mos652x {
             tod: Tod::new(),
             interrupt: InterruptSource::new(model),
             clock: 0,
+            sdr_shift_count: 0,
         };
         cia.reset();
         cia
@@ -82,6 +86,7 @@ impl Mos652x {
         self.timer_b.reset();
         self.tod.reset();
         self.interrupt.reset();
+        self.sdr_shift_count = 0;
     }
 
     /// Read a CIA register.  Returns the byte value and an optional
@@ -104,7 +109,9 @@ impl Mos652x {
             TOD_TEN..=TOD_HR => self.tod.read(addr - TOD_TEN),
             ICR => {
                 let old = self.interrupt.clear();
-                irq_delta = Some(false); // reading ICR clears the IRQ line
+                if (old & INT_REQUEST) != 0 {
+                    irq_delta = Some(false);
+                }
                 old
             }
             CRA => (self.regs[CRA as usize] & 0xEE) | (self.timer_a.started() as u8),
@@ -136,7 +143,12 @@ impl Mos652x {
                     self.regs[CRB as usize],
                 );
             }
-            SDR => { /* serial port start — simplified */ }
+            SDR => {
+                // Writing SDR in output mode (CRA bit 6 = 1) starts a fresh 8-bit transfer.
+                if self.regs[CRA as usize] & 0x40 != 0 {
+                    self.sdr_shift_count = 0;
+                }
+            }
             ICR => {
                 irq_delta = self.interrupt.set_mask(data);
             }
@@ -163,47 +175,59 @@ impl Mos652x {
     /// `Some(true)` = IRQ asserted, `Some(false)` = IRQ deasserted, `None` = no change.
     pub fn tick(&mut self) -> Option<bool> {
         self.clock += 1;
+        let mut irq_asserted = false;
+
+        // --- Old CIA: deliver 1-cycle delayed interrupt from previous cycle ---
+        if self.interrupt.tick_delayed() {
+            irq_asserted = true;
+        }
 
         // --- Timer A ---
         let ua = self.timer_a.tick_phi2();
         if ua {
-            // Timer A underflow → trigger interrupt
-            let irq = self.interrupt.trigger(INT_UNDERFLOW_A);
+            if self.interrupt.trigger(INT_UNDERFLOW_A) {
+                irq_asserted = true;
+            }
 
-            // If Timer B counts Timer A underflows (CRB bits 6,0 = 1,1)
-            if (self.regs[CRB as usize] & 0x41) == 0x41 && self.timer_b.started() {
+            // If Timer B counts Timer A underflows (CRB bits 6:5 = 10, bit 0 = 1)
+            if (self.regs[CRB as usize] & 0x61) == 0x41 && self.timer_b.started() {
                 self.timer_b.cascade_step();
             }
 
-            // Serial port handling (simplified)
+            // SDR output mode (CRA bit 6 = 1): each Timer A underflow shifts one bit.
+            // After 8 bits the SP interrupt fires.
             if self.regs[CRA as usize] & 0x40 != 0 {
-                // output mode — count underflows for shift register
-            }
-
-            if irq {
-                return Some(true);
+                self.sdr_shift_count += 1;
+                if self.sdr_shift_count >= 8 {
+                    self.sdr_shift_count = 0;
+                    if self.interrupt.trigger(INT_SP) {
+                        irq_asserted = true;
+                    }
+                }
             }
         }
 
         // --- Timer B ---
         let ub = self.timer_b.tick_phi2();
         if ub {
-            let irq = self.interrupt.trigger(INT_UNDERFLOW_B);
-            if irq {
-                return Some(true);
+            if self.interrupt.trigger(INT_UNDERFLOW_B) {
+                irq_asserted = true;
             }
         }
 
         // --- TOD ---
         let alarm = self.tod.tick(self.regs[CRA as usize]);
         if alarm {
-            let irq = self.interrupt.trigger(INT_ALARM);
-            if irq {
-                return Some(true);
+            if self.interrupt.trigger(INT_ALARM) {
+                irq_asserted = true;
             }
         }
 
-        None
+        if irq_asserted {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     fn adjust_data_port(&self, mut data: u8) -> u8 {
@@ -226,5 +250,21 @@ impl Mos652x {
 
     pub fn set_day_of_time_rate(&mut self, rate: u32) {
         self.tod.set_period(rate);
+    }
+
+    /// Assert the FLAG pin (falling edge on the external FLAG line).
+    /// Triggers INT_FLAG; returns Some(true) if this causes a new IRQ assertion.
+    pub fn set_flag(&mut self) -> Option<bool> {
+        if self.interrupt.trigger(INT_FLAG) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the CIA's IRQ/NMI line is currently asserted.
+    /// Used by C64 to expose the NMI state to the CPU's Bus trait.
+    pub fn interrupt_asserted(&self) -> bool {
+        self.interrupt.asserted
     }
 }

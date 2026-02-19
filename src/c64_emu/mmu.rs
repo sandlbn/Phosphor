@@ -19,6 +19,10 @@ pub struct Mmu {
     loram: bool,
     hiram: bool,
     charen: bool,
+    /// EXROM line state: true = high = no cartridge ROM at $8000.
+    exrom: bool,
+    /// GAME line state: true = high = no cartridge ROM at $A000; false+exrom=true = Ultimax mode.
+    game: bool,
 
     /// Read mapping for each 4 KB page.
     pub read_map: [PageMapping; 16],
@@ -35,6 +39,8 @@ impl Mmu {
             loram: false,
             hiram: false,
             charen: false,
+            exrom: true,
+            game: true,
             read_map: [PageMapping::Ram; 16],
             write_map: [PageMapping::Ram; 16],
             seed: 3_686_734,
@@ -47,6 +53,18 @@ impl Mmu {
         self.loram = false;
         self.hiram = false;
         self.charen = false;
+        self.exrom = true;
+        self.game = true;
+        self.update_mapping();
+    }
+
+    /// Set the EXROM and GAME cartridge port lines.
+    /// Both true = no cartridge (default).
+    /// exrom=false, game=true = Ultimax mode: $D000-$DFFF always I/O,
+    /// $E000-$FFFF always Kernal, regardless of CPU port bits.
+    pub fn set_exrom_game(&mut self, exrom: bool, game: bool) {
+        self.exrom = exrom;
+        self.game = game;
         self.update_mapping();
     }
 
@@ -62,6 +80,18 @@ impl Mmu {
         // Default everything to RAM.
         self.read_map.fill(PageMapping::Ram);
         self.write_map.fill(PageMapping::Ram);
+
+        // Ultimax mode (EXROM low, GAME high): $D000-$DFFF always I/O,
+        // $E000-$FFFF always Kernal ROM. CPU port bits are ignored for these.
+        if !self.exrom && self.game {
+            self.read_map[0xD] = PageMapping::Io;
+            self.write_map[0xD] = PageMapping::Io;
+            self.read_map[0xE] = PageMapping::KernalRom;
+            self.read_map[0xF] = PageMapping::KernalRom;
+            return;
+        }
+
+        // Normal mode: CPU port bits select banks.
 
         // $E000-$FFFF: Kernal ROM when HIRAM is set.
         if self.hiram {

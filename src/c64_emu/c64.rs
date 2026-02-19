@@ -6,6 +6,7 @@
 use mos6502::memory::Bus;
 
 use super::banks::io_bank::IoChip;
+use super::banks::sid_bank::SidChip;
 use super::banks::*;
 use super::cia::interrupt::CiaModel;
 use super::cia::Mos652x;
@@ -102,6 +103,7 @@ pub struct C64 {
     pub char_rom: CharacterRomBank,
     pub color_ram: ColorRamBank,
     pub sid_bank: SidBank,
+    pub extra_sid: ExtraSidBank,
     pub disconnected_bus: DisconnectedBusBank,
     pub zero_ram: ZeroRamBank,
     pub io_bank: IoBank,
@@ -131,6 +133,7 @@ impl C64 {
             char_rom: CharacterRomBank::new(),
             color_ram: ColorRamBank::new(),
             sid_bank: SidBank::new(),
+            extra_sid: ExtraSidBank::new(),
             disconnected_bus: DisconnectedBusBank::new(),
             zero_ram: ZeroRamBank::new(),
             io_bank: IoBank::default(),
@@ -182,6 +185,20 @@ impl C64 {
         self.sid_bank.set_sid(s);
     }
 
+    /// Register an extra SID chip at the given full C64 address (e.g. $D420, $D500, $DE00, $DF00).
+    ///
+    /// For addresses outside the primary SID page ($D4xx), the io_bank is updated to route
+    /// that 256-byte page to ExtraSid automatically.  For $D4xx addresses (e.g. $D420), the
+    /// extra chip lives alongside the primary SID bank; get_byte/set_byte checks extra_sid first.
+    pub fn set_extra_sid(&mut self, addr: u16, sid: Box<dyn SidChip>) {
+        self.extra_sid.add_sid(sid, addr);
+        // Route pages other than $D4 (primary SID page) at the io_bank level.
+        let page = ((addr >> 8) & 0x0F) as usize;
+        if page != 0x4 {
+            self.io_bank.set_bank(page, IoChip::ExtraSid(0));
+        }
+    }
+
     // ── Reset ─────────────────────────────────────────────────
 
     pub fn reset(&mut self) {
@@ -189,6 +206,7 @@ impl C64 {
         self.cia2.reset();
         self.vic.reset();
         self.sid_bank.reset();
+        self.extra_sid.reset();
         self.color_ram.reset();
         self.ram.reset();
         self.zero_ram.reset();
@@ -206,18 +224,28 @@ impl C64 {
     /// Returns `(irq_asserted, nmi_asserted)`.
     pub fn tick_peripherals(&mut self) -> (bool, bool) {
         self.cycle_count += 1;
-        let mut irq = false;
+        self.zero_ram.phi2_time = self.cycle_count as i64;
         let mut nmi = false;
 
         // VIC-II
         let vic_out = self.vic.tick();
-        if let Some(true) = vic_out.irq {
-            irq = true;
+        if let Some(changed) = vic_out.irq {
+            self.irq_count += if changed { 1 } else { -1 };
+            if self.irq_count < 0 {
+                self.irq_count = 0;
+            }
+        }
+        // Track BA state transitions for the caller.
+        if let Some(ba) = vic_out.ba {
+            self.old_ba_state = ba;
         }
 
         // CIA1 → IRQ
-        if let Some(true) = self.cia1.tick() {
-            irq = true;
+        if let Some(changed) = self.cia1.tick() {
+            self.irq_count += if changed { 1 } else { -1 };
+            if self.irq_count < 0 {
+                self.irq_count = 0;
+            }
         }
 
         // CIA2 → NMI
@@ -225,13 +253,38 @@ impl C64 {
             nmi = true;
         }
 
-        (irq, nmi)
+        (self.irq_count > 0, nmi)
+    }
+
+    /// Returns true when the VIC is holding BA low (CPU bus not available).
+    /// The caller's main loop should skip `cpu.step()` when this is true.
+    pub fn is_cpu_jammed(&self) -> bool {
+        !self.vic.ba_state
+    }
+
+    /// Assert CIA1 FLAG pin (e.g. from serial bus or cassette).
+    /// The caller must invoke this; `tick_peripherals` does not do it automatically.
+    pub fn cia1_set_flag(&mut self) {
+        if let Some(true) = self.cia1.set_flag() {
+            self.irq_count += 1;
+        }
+    }
+
+    /// Assert CIA2 FLAG pin (e.g. from serial bus).
+    pub fn cia2_set_flag(&mut self) {
+        // CIA2 is wired to NMI; FLAG assertion is handled by the caller's NMI logic.
+        let _ = self.cia2.set_flag();
     }
 
     // ── Time helpers ──────────────────────────────────────────
 
     pub fn get_time_ms(&self) -> u32 {
-        ((self.cycle_count as f64 * 1000.0) / self.cpu_frequency) as u32
+        // Use u64 arithmetic to avoid f64 precision drift and u32 overflow (~72 min at 1 MHz).
+        let freq = self.cpu_frequency as u64;
+        if freq == 0 {
+            return 0;
+        }
+        (self.cycle_count * 1000 / freq) as u32
     }
 
     /// Helper: read memory the way the CPU sees it (with banking).
@@ -299,18 +352,36 @@ impl Bus for C64 {
             PageMapping::CharacterRom => self.char_rom.peek(addr),
             PageMapping::Io => match self.io_bank.dispatch(addr) {
                 IoChip::Vic => self.vic.read((addr & 0x3F) as u8),
-                IoChip::Sid => self.sid_bank.peek(addr),
+                IoChip::Sid => {
+                    // Extra SID at $D420 etc. overlaps the primary-SID page;
+                    // check whether this 32-byte slot belongs to extra_sid first.
+                    if self.extra_sid.has_slot(addr) {
+                        self.extra_sid.peek(addr)
+                    } else {
+                        self.sid_bank.peek(addr)
+                    }
+                }
                 IoChip::ColorRam => self.color_ram.peek(addr),
                 IoChip::Cia1 => {
-                    let (val, _irq_delta) = self.cia1.read((addr & 0x0F) as u8);
+                    let (val, irq_delta) = self.cia1.read((addr & 0x0F) as u8);
+                    if let Some(changed) = irq_delta {
+                        self.irq_count += if changed { 1 } else { -1 };
+                        if self.irq_count < 0 {
+                            self.irq_count = 0;
+                        }
+                    }
                     val
                 }
                 IoChip::Cia2 => {
                     let (val, _irq_delta) = self.cia2.read((addr & 0x0F) as u8);
+                    // CIA2 ICR read ($DD0D) acknowledges and clears the NMI flag.
+                    // The interrupt.asserted field is cleared inside cia2.read() via
+                    // InterruptSource::clear() when the ICR register is read.
+                    // Nothing extra needed here — interrupt_asserted() reflects the new state.
                     val
                 }
                 IoChip::DisconnectedBus => self.mmu.last_read_byte(),
-                IoChip::ExtraSid(_) => 0xFF,
+                IoChip::ExtraSid(_) => self.extra_sid.peek(addr),
             },
         }
     }
@@ -340,18 +411,37 @@ impl Bus for C64 {
 
                 match self.io_bank.dispatch(addr) {
                     IoChip::Vic => {
-                        let _out = self.vic.write((addr & 0x3F) as u8, val);
+                        let out = self.vic.write((addr & 0x3F) as u8, val);
+                        if let Some(changed) = out.irq {
+                            self.irq_count += if changed { 1 } else { -1 };
+                            if self.irq_count < 0 {
+                                self.irq_count = 0;
+                            }
+                        }
                     }
-                    IoChip::Sid => self.sid_bank.poke(addr, val),
+                    IoChip::Sid => {
+                        // Extra SID at $D420 etc.: write to it if this slot is mapped.
+                        if self.extra_sid.has_slot(addr) {
+                            self.extra_sid.poke(addr, val);
+                        } else {
+                            self.sid_bank.poke(addr, val);
+                        }
+                    }
                     IoChip::ColorRam => self.color_ram.poke(addr, val),
                     IoChip::Cia1 => {
-                        let _irq_delta = self.cia1.write((addr & 0x0F) as u8, val);
+                        let irq_delta = self.cia1.write((addr & 0x0F) as u8, val);
+                        if let Some(changed) = irq_delta {
+                            self.irq_count += if changed { 1 } else { -1 };
+                            if self.irq_count < 0 {
+                                self.irq_count = 0;
+                            }
+                        }
                     }
                     IoChip::Cia2 => {
                         let _irq_delta = self.cia2.write((addr & 0x0F) as u8, val);
                     }
                     IoChip::DisconnectedBus => { /* no-op */ }
-                    IoChip::ExtraSid(_) => { /* handled by extra sid bank */ }
+                    IoChip::ExtraSid(_) => self.extra_sid.poke(addr, val),
                 }
             }
             _ => {
@@ -359,5 +449,18 @@ impl Bus for C64 {
                 self.ram.poke(addr, val);
             }
         }
+    }
+
+    /// Called by the CPU's `check_interrupts()` after every instruction.
+    /// Returns true when any IRQ source (VIC or CIA1) is asserting the line.
+    fn irq_pending(&mut self) -> bool {
+        self.irq_count > 0
+    }
+
+    /// Called by the CPU's `check_interrupts()` for NMI edge detection after every instruction.
+    /// Returns the current NMI line level (high = asserted).
+    /// CIA2 is the only NMI source in the C64; it deasserts when its ICR is read ($DD0D).
+    fn nmi_pending(&mut self) -> bool {
+        self.cia2.interrupt_asserted()
     }
 }
