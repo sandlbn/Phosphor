@@ -11,6 +11,7 @@ use super::banks::*;
 use super::cia::interrupt::CiaModel;
 use super::cia::Mos652x;
 use super::mmu::{Mmu, PageMapping};
+use super::roms::RomSet;
 use super::vic_ii::{Mos656x, VicModel};
 
 // ── C64 model definitions ─────────────────────────────────────
@@ -121,8 +122,66 @@ pub struct C64 {
 }
 
 impl C64 {
+    // ── Constructors ──────────────────────────────────────────
+
+    /// Create a C64 with the minimal stub ROMs (no real ROM files needed).
+    ///
+    /// Suitable for running raw machine-code / SID tunes that set up their
+    /// own environment.  Call [`C64::with_roms`] for full BASIC/Kernal boot.
     pub fn new() -> Self {
-        let mut c64 = Self {
+        let mut c64 = Self::new_uninit();
+        // Install stub ROM so vectors are valid even without real images.
+        c64.kernal_rom.set(None);
+        c64
+    }
+
+    /// Create a C64 and load the three standard ROM images from `roms`.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use c64_emu::roms::RomSet;
+    /// use c64_emu::c64::C64;
+    ///
+    /// let roms = RomSet::load().expect("could not find C64 ROMs");
+    /// let mut c64 = C64::with_roms(&roms);
+    /// ```
+    pub fn with_roms(roms: &RomSet) -> Self {
+        let mut c64 = Self::new_uninit();
+        c64.kernal_rom.set(Some(&roms.kernal));
+        c64.basic_rom.set(Some(&roms.basic));
+        c64.char_rom.set(Some(&roms.chargen));
+        c64
+    }
+
+    /// Create a C64 and attempt to auto-discover ROM files on disk.
+    ///
+    /// If ROM files cannot be found the emulator falls back to the minimal
+    /// stub ROMs (same behaviour as [`C64::new`]) and the returned `bool`
+    /// will be `false`.
+    ///
+    /// Search order for ROM files:
+    /// 1. `$C64_ROM_DIR` environment variable
+    /// 2. `./roms/`
+    /// 3. `./`
+    /// 4. `~/.local/share/c64/roms/`
+    /// 5. `/usr/share/vice/C64/`
+    ///
+    /// Required files: `kernal.rom` (8 KiB), `basic.rom` (8 KiB),
+    /// `chargen.rom` (4 KiB).
+    pub fn new_with_auto_roms() -> (Self, bool) {
+        match RomSet::load() {
+            Ok(roms) => (Self::with_roms(&roms), true),
+            Err(e) => {
+                eprintln!("[c64] ROM auto-load failed: {e}");
+                eprintln!("[c64] Falling back to stub ROMs.");
+                (Self::new(), false)
+            }
+        }
+    }
+
+    /// Internal: allocate all fields but do not install any ROM content yet.
+    fn new_uninit() -> Self {
+        Self {
             vic: Mos656x::new(),
             cia1: Mos652x::new(CiaModel::Mos6526),
             cia2: Mos652x::new(CiaModel::Mos6526),
@@ -145,9 +204,7 @@ impl C64 {
 
             cpu_frequency: cpu_freq(C64Model::PalB),
             cycle_count: 0,
-        };
-        c64.kernal_rom.set(None);
-        c64
+        }
     }
 
     // ── Model configuration ───────────────────────────────────
@@ -169,14 +226,28 @@ impl C64 {
 
     // ── ROM loading ───────────────────────────────────────────
 
+    /// Load or replace the Kernal ROM image at runtime.
+    ///
+    /// Pass `None` to revert to the minimal stub.
     pub fn set_kernal(&mut self, rom: Option<&[u8]>) {
         self.kernal_rom.set(rom);
     }
+
+    /// Load or replace the BASIC ROM image at runtime.
     pub fn set_basic(&mut self, rom: Option<&[u8]>) {
         self.basic_rom.set(rom);
     }
+
+    /// Load or replace the Character ROM image at runtime.
     pub fn set_chargen(&mut self, rom: Option<&[u8]>) {
         self.char_rom.set(rom);
+    }
+
+    /// Convenience: reload all three ROMs from a `RomSet`.
+    pub fn load_roms(&mut self, roms: &RomSet) {
+        self.kernal_rom.set(Some(&roms.kernal));
+        self.basic_rom.set(Some(&roms.basic));
+        self.char_rom.set(Some(&roms.chargen));
     }
 
     // ── SID ───────────────────────────────────────────────────
@@ -185,14 +256,15 @@ impl C64 {
         self.sid_bank.set_sid(s);
     }
 
-    /// Register an extra SID chip at the given full C64 address (e.g. $D420, $D500, $DE00, $DF00).
+    /// Register an extra SID chip at the given full C64 address
+    /// (e.g. $D420, $D500, $DE00, $DF00).
     ///
-    /// For addresses outside the primary SID page ($D4xx), the io_bank is updated to route
-    /// that 256-byte page to ExtraSid automatically.  For $D4xx addresses (e.g. $D420), the
-    /// extra chip lives alongside the primary SID bank; get_byte/set_byte checks extra_sid first.
+    /// For addresses outside the primary SID page ($D4xx), the io_bank is
+    /// updated to route that 256-byte page to ExtraSid automatically.
+    /// For $D4xx addresses (e.g. $D420), the extra chip lives alongside
+    /// the primary SID bank; get_byte/set_byte checks extra_sid first.
     pub fn set_extra_sid(&mut self, addr: u16, sid: Box<dyn SidChip>) {
         self.extra_sid.add_sid(sid, addr);
-        // Route pages other than $D4 (primary SID page) at the io_bank level.
         let page = ((addr >> 8) & 0x0F) as usize;
         if page != 0x4 {
             self.io_bank.set_bank(page, IoChip::ExtraSid(0));
@@ -235,7 +307,6 @@ impl C64 {
                 self.irq_count = 0;
             }
         }
-        // Track BA state transitions for the caller.
         if let Some(ba) = vic_out.ba {
             self.old_ba_state = ba;
         }
@@ -257,13 +328,11 @@ impl C64 {
     }
 
     /// Returns true when the VIC is holding BA low (CPU bus not available).
-    /// The caller's main loop should skip `cpu.step()` when this is true.
     pub fn is_cpu_jammed(&self) -> bool {
         !self.vic.ba_state
     }
 
     /// Assert CIA1 FLAG pin (e.g. from serial bus or cassette).
-    /// The caller must invoke this; `tick_peripherals` does not do it automatically.
     pub fn cia1_set_flag(&mut self) {
         if let Some(true) = self.cia1.set_flag() {
             self.irq_count += 1;
@@ -272,14 +341,12 @@ impl C64 {
 
     /// Assert CIA2 FLAG pin (e.g. from serial bus).
     pub fn cia2_set_flag(&mut self) {
-        // CIA2 is wired to NMI; FLAG assertion is handled by the caller's NMI logic.
         let _ = self.cia2.set_flag();
     }
 
     // ── Time helpers ──────────────────────────────────────────
 
     pub fn get_time_ms(&self) -> u32 {
-        // Use u64 arithmetic to avoid f64 precision drift and u32 overflow (~72 min at 1 MHz).
         let freq = self.cpu_frequency as u64;
         if freq == 0 {
             return 0;
@@ -287,19 +354,12 @@ impl C64 {
         (self.cycle_count * 1000 / freq) as u32
     }
 
-    /// Helper: read memory the way the CPU sees it (with banking).
-    /// Useful for debuggers / disassemblers.
     #[allow(dead_code)]
     fn cpu_read_internal(&self, addr: u16) -> u8 {
         let page = (addr >> 12) as usize;
-
-        // Page 0: zero-page / CPU port
         if page == 0 && addr < 2 {
-            // Need mutable access for side-effects; handled via Bus trait.
-            // For const peek we return a reasonable default.
             return 0;
         }
-
         match self.mmu.read_map[page] {
             PageMapping::Ram => self.ram.peek(addr),
             PageMapping::BasicRom => self.basic_rom.peek(addr),
@@ -315,10 +375,7 @@ impl C64 {
             IoChip::Vic => self.vic.read((addr & 0x3F) as u8),
             IoChip::Sid => self.sid_bank.peek(addr),
             IoChip::ColorRam => self.color_ram.peek(addr),
-            IoChip::Cia1 | IoChip::Cia2 => {
-                // CIA reads have side-effects; done in Bus::get_byte.
-                0
-            }
+            IoChip::Cia1 | IoChip::Cia2 => 0,
             IoChip::DisconnectedBus => self.disconnected_bus.peek(addr),
             IoChip::ExtraSid(_) => 0xFF,
         }
@@ -332,15 +389,11 @@ impl Default for C64 {
 }
 
 // ── mos6502 Bus implementation ────────────────────────────────
-//
-// This is the bridge between the `mos6502` crate's CPU and our C64.
-// The CPU calls `get_byte` / `set_byte` and we route through the MMU.
 
 impl Bus for C64 {
     fn get_byte(&mut self, addr: u16) -> u8 {
         let page = (addr >> 12) as usize;
 
-        // Zero-page: CPU port
         if page == 0 && addr < 2 {
             return self.zero_ram.peek_mut(addr);
         }
@@ -353,8 +406,6 @@ impl Bus for C64 {
             PageMapping::Io => match self.io_bank.dispatch(addr) {
                 IoChip::Vic => self.vic.read((addr & 0x3F) as u8),
                 IoChip::Sid => {
-                    // Extra SID at $D420 etc. overlaps the primary-SID page;
-                    // check whether this 32-byte slot belongs to extra_sid first.
                     if self.extra_sid.has_slot(addr) {
                         self.extra_sid.peek(addr)
                     } else {
@@ -374,10 +425,6 @@ impl Bus for C64 {
                 }
                 IoChip::Cia2 => {
                     let (val, _irq_delta) = self.cia2.read((addr & 0x0F) as u8);
-                    // CIA2 ICR read ($DD0D) acknowledges and clears the NMI flag.
-                    // The interrupt.asserted field is cleared inside cia2.read() via
-                    // InterruptSource::clear() when the ICR register is read.
-                    // Nothing extra needed here — interrupt_asserted() reflects the new state.
                     val
                 }
                 IoChip::DisconnectedBus => self.mmu.last_read_byte(),
@@ -389,12 +436,9 @@ impl Bus for C64 {
     fn set_byte(&mut self, addr: u16, val: u8) {
         let page = (addr >> 12) as usize;
 
-        // Zero-page: CPU port (and also write to underlying RAM)
         if page == 0 {
             if addr < 2 {
                 self.zero_ram.poke(addr, val);
-                // Sync the PLA state from the zero_ram bank to the MMU.
-                // We re-read the effective port value.
                 let dir = self.zero_ram.peek_mut(0);
                 let data = self.zero_ram.peek_mut(1);
                 let state = (data | !dir) & 0x07;
@@ -406,9 +450,7 @@ impl Bus for C64 {
 
         match self.mmu.write_map[page] {
             PageMapping::Io => {
-                // Also write to underlying RAM (C64 always writes to RAM).
                 self.ram.poke(addr, val);
-
                 match self.io_bank.dispatch(addr) {
                     IoChip::Vic => {
                         let out = self.vic.write((addr & 0x3F) as u8, val);
@@ -420,7 +462,6 @@ impl Bus for C64 {
                         }
                     }
                     IoChip::Sid => {
-                        // Extra SID at $D420 etc.: write to it if this slot is mapped.
                         if self.extra_sid.has_slot(addr) {
                             self.extra_sid.poke(addr, val);
                         } else {
@@ -440,26 +481,20 @@ impl Bus for C64 {
                     IoChip::Cia2 => {
                         let _irq_delta = self.cia2.write((addr & 0x0F) as u8, val);
                     }
-                    IoChip::DisconnectedBus => { /* no-op */ }
+                    IoChip::DisconnectedBus => {}
                     IoChip::ExtraSid(_) => self.extra_sid.poke(addr, val),
                 }
             }
             _ => {
-                // RAM (ROM writes are ignored; writes always hit RAM).
                 self.ram.poke(addr, val);
             }
         }
     }
 
-    /// Called by the CPU's `check_interrupts()` after every instruction.
-    /// Returns true when any IRQ source (VIC or CIA1) is asserting the line.
     fn irq_pending(&mut self) -> bool {
         self.irq_count > 0
     }
 
-    /// Called by the CPU's `check_interrupts()` for NMI edge detection after every instruction.
-    /// Returns the current NMI line level (high = asserted).
-    /// CIA2 is the only NMI source in the C64; it deasserts when its ICR is read ($DD0D).
     fn nmi_pending(&mut self) -> bool {
         self.cia2.interrupt_asserted()
     }

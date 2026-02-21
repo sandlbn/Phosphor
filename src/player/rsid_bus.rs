@@ -50,7 +50,13 @@ pub struct RsidBus {
 
 impl RsidBus {
     pub fn new(is_pal: bool, mapper: SidMapper, mono: bool) -> Self {
-        let mut c64 = C64::new();
+        let (mut c64, roms_loaded) = C64::new_with_auto_roms();
+        if !roms_loaded {
+            eprintln!("[rsid_bus] ROM files not found — running with stub ROMs");
+        } else {
+            eprintln!("[rsid_bus] ROM files  found");
+        }
+
         c64.set_model(if is_pal {
             C64Model::PalB
         } else {
