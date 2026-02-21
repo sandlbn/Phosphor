@@ -9,4 +9,5 @@ pub mod c64;
 pub mod cia;
 pub mod event;
 pub mod mmu;
+pub mod roms;
 pub mod vic_ii;

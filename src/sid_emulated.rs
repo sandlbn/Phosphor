@@ -1,11 +1,10 @@
 // Software SID emulation output using resid-rs + cpal audio.
 //
-// Key design decisions:
-//   - Query cpal for the device's ACTUAL sample rate
-//   - Tell resid to generate at that rate via set_sampling_parameters()
-//   - ring_cycled() clocks SID between writes (cycle-accurate intra-frame)
-//   - flush() clocks remaining frame cycles and resets frame counter
-//   - Audio thread owns the !Send cpal::Stream on a dedicated thread
+//   Models the C64 mainboard RC output stage present on every real C64:
+//     - Low-pass:  R=10kΩ, C=1000pF  → cutoff ~15.9kHz  (kills ultrasonic content)
+//     - High-pass: R=10kΩ, C=10μF    → cutoff ~1.6Hz    (DC-blocker, kills clicks)
+//   Each SID chip gets its own ExternalFilter instance, applied per-sample
+//   before the stereo mix, matching how a real C64 sounds through the board.
 //
 // Reference usage from resid-rs README:
 //   while delta > 0 {
@@ -42,6 +41,80 @@ const MAX_BUFFER_SAMPLES: usize = 8192;
 
 /// Scratch buffer for resid sample() output.
 const SCRATCH_SIZE: usize = 2048;
+
+//  Models the C64 mainboard two-stage RC network on the SID audio output line.
+//  Every C64 has this circuit, so its frequency response is part of the authentic
+//  sound — especially the LP roll-off that softens the harshness at the top end,
+//  and the HP DC-blocker that prevents the audible "thump" when the SID is muted.
+//
+//  Circuit (from libresidfp docs):
+//      SID out → 1kΩ → ─┬─ 1000pF → GND    (LP, ~15.9 kHz)
+//                        └─ 10kΩ  → C 10μF → amp  (HP, ~1.59 Hz)
+//
+//  Fixed-point implementation directly matches libresidfp ExternalFilter.h:
+//      Vi   = input << 11
+//      dVlp = (w0lp_1_s7  * (Vi  - Vlp)) >> 7
+//      dVhp = (w0hp_1_s17 * (Vlp - Vhp)) >> 17
+//      Vlp += dVlp
+//      Vhp += dVhp
+//      output = (Vlp - Vhp) >> 11
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ExternalFilter {
+    /// Low-pass integrator state (fixed-point ×2¹¹).
+    vlp: i32,
+    /// High-pass integrator state (fixed-point ×2¹¹).
+    vhp: i32,
+    /// LP coefficient: dt/(dt+RC_lp) × 2⁷, nearest int.
+    /// PAL 985 248 Hz → 12   NTSC 1 022 727 Hz → 11
+    w0lp_1_s7: i32,
+    /// HP coefficient: dt/(dt+RC_hp) × 2¹⁷, nearest int.
+    /// Both PAL and NTSC → 1  (RC_hp is so large the step is tiny)
+    w0hp_1_s17: i32,
+}
+
+impl ExternalFilter {
+    fn new() -> Self {
+        Self {
+            vlp: 0,
+            vhp: 0,
+            w0lp_1_s7: 0,
+            w0hp_1_s17: 0,
+        }
+    }
+
+    /// Compute and store filter coefficients for the given C64 clock frequency.
+    ///
+    /// Must be called after construction and again on every PAL↔NTSC switch.
+    fn set_clock_frequency(&mut self, frequency: f64) {
+        let dt = 1.0 / frequency;
+        // LP: R = 10 kΩ, C = 1000 pF  →  RC = 10e-6 s
+        let rc_lp: f64 = 10_000.0 * 1_000e-12;
+        // HP: R = 10 kΩ, C = 10 μF   →  RC = 0.1 s
+        let rc_hp: f64 = 10_000.0 * 10e-6;
+        self.w0lp_1_s7 = ((dt / (dt + rc_lp)) * 128.0 + 0.5) as i32;
+        self.w0hp_1_s17 = ((dt / (dt + rc_hp)) * 131_072.0 + 0.5) as i32;
+    }
+
+    fn reset(&mut self) {
+        self.vlp = 0;
+        self.vhp = 0;
+    }
+
+    /// Clock the filter by one sample.  Input/output are signed 16-bit audio.
+    ///
+    /// Matches ExternalFilter::clock() from libresidfp — one multiply-shift per stage.
+    #[inline(always)]
+    fn clock(&mut self, input: i16) -> i16 {
+        let vi = (input as i32) << 11;
+        let dvlp = (self.w0lp_1_s7 * (vi - self.vlp)) >> 7;
+        let dvhp = (self.w0hp_1_s17 * (self.vlp - self.vhp)) >> 17;
+        self.vlp += dvlp;
+        self.vhp += dvhp;
+        // Shift back to i16 range.  Clamp defends against cold-start transients.
+        ((self.vlp - self.vhp) >> 11).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Send wrapper for resid::Sid  (Sid is !Send due to internal Rc)
@@ -173,6 +246,12 @@ pub struct EmulatedDevice {
     sid2: Option<SendSid>,
     sid3: Option<SendSid>,
 
+    // ExternalFilter — one instance per SID chip, matching real C64 hardware.
+    // Each filter models the RC output stage on the C64 mainboard (libresidfp port).
+    ext1: ExternalFilter,
+    ext2: ExternalFilter,
+    ext3: ExternalFilter,
+
     clock_freq: u32,
     sample_rate: u32,
     chip_model: ChipModel,
@@ -204,8 +283,16 @@ impl EmulatedDevice {
         sid1.inner()
             .set_sampling_parameters(SamplingMethod::Fast, clock_freq, sample_rate);
 
+        // Build ExternalFilter for the initial clock rate.
+        let mut ext1 = ExternalFilter::new();
+        let mut ext2 = ExternalFilter::new();
+        let mut ext3 = ExternalFilter::new();
+        ext1.set_clock_frequency(clock_freq as f64);
+        ext2.set_clock_frequency(clock_freq as f64);
+        ext3.set_clock_frequency(clock_freq as f64);
+
         eprintln!(
-            "[emulated] SID opened: MOS6581, clock={}Hz, output={}Hz",
+            "[emulated] SID opened: MOS6581, clock={}Hz, output={}Hz, ExternalFilter=ON",
             clock_freq, sample_rate,
         );
 
@@ -213,6 +300,9 @@ impl EmulatedDevice {
             sid1,
             sid2: None,
             sid3: None,
+            ext1,
+            ext2,
+            ext3,
             clock_freq,
             sample_rate,
             chip_model,
@@ -252,14 +342,15 @@ impl EmulatedDevice {
             }
             // Guard against infinite loop if sample() doesn't make progress.
             if next_delta >= remaining && n_samples == 0 {
-                // Force clock to consume the cycles even without generating samples.
                 sid.inner().clock_delta(remaining);
                 break;
             }
             remaining = next_delta;
             loops += 1;
             if loops > 50000 {
-                eprintln!("[emulated] WARNING: sample() loop exceeded 50k iterations, remaining={remaining}");
+                eprintln!(
+                    "[emulated] WARNING: sample() loop exceeded 50k iterations, remaining={remaining}"
+                );
                 break;
             }
         }
@@ -286,7 +377,12 @@ impl EmulatedDevice {
         }
     }
 
-    /// Clock all active SIDs forward by `delta` cycles, push stereo samples.
+    /// Clock all active SIDs forward by `delta` cycles, apply ExternalFilter
+    /// per sample, then push stereo pairs to the audio ring buffer.
+    ///
+    /// ExternalFilter is applied to each SID's raw samples before mixing,
+    /// modelling the C64 mainboard RC output stage (LP ~15.9kHz + HP ~1.6Hz).
+    /// The filter state is per-SID so stereo separation is preserved.
     fn clock_and_push(&mut self, delta: u32) {
         if delta == 0 {
             return;
@@ -308,21 +404,32 @@ impl EmulatedDevice {
             return;
         }
 
+        // Apply ExternalFilter to each SID's samples before mixing.
+        // Done here (before locking audio_buf) to keep the borrow checker happy.
+        //
+        // Each ExternalFilter::clock() call is 4 multiplies + 4 adds — negligible cost.
+        // The LP stage rolls off content above ~15.9kHz.
+        // The HP stage removes DC, eliminating the "thump" on SID mute/silence.
+        let filtered1: Vec<i16> = s1.iter().map(|&s| self.ext1.clock(s)).collect();
+        let filtered2: Vec<i16> = s2.iter().map(|&s| self.ext2.clock(s)).collect();
+        let filtered3: Vec<i16> = s3.iter().map(|&s| self.ext3.clock(s)).collect();
+
         // Push to ring buffer as stereo pairs.
         let mut buf = self.audio_buf.lock().unwrap();
         let room = MAX_BUFFER_SAMPLES.saturating_sub(buf.len());
-        let count = s1.len().min(room);
+        let count = filtered1.len().min(room);
 
         for i in 0..count {
-            let left = s1[i];
-            let right = if !s2.is_empty() {
-                *s2.get(i).unwrap_or(&0)
+            let left = filtered1[i];
+            let right = if !filtered2.is_empty() {
+                *filtered2.get(i).unwrap_or(&0)
             } else {
-                left // mono: mirror to both channels
+                left // mono: mirror SID1 (already filtered) to right channel
             };
 
-            if !s3.is_empty() {
-                let centre = *s3.get(i).unwrap_or(&0) / 2;
+            if !filtered3.is_empty() {
+                // SID3 centre-mixed equally into both channels at half volume.
+                let centre = *filtered3.get(i).unwrap_or(&0) / 2;
                 buf.push_back((left.saturating_add(centre), right.saturating_add(centre)));
             } else {
                 buf.push_back((left, right));
@@ -369,6 +476,14 @@ impl SidDevice for EmulatedDevice {
             );
         }
 
+        // Update ExternalFilter coefficients to match the new clock frequency.
+        // Cutoff frequencies are physical constants (RC values), so the coefficients
+        // change slightly between PAL (~985kHz) and NTSC (~1023kHz).
+        let freq = self.clock_freq as f64;
+        self.ext1.set_clock_frequency(freq);
+        self.ext2.set_clock_frequency(freq);
+        self.ext3.set_clock_frequency(freq);
+
         eprintln!(
             "[emulated] Clock: {} {}Hz, {}/frame, output={}Hz",
             if is_pal { "PAL" } else { "NTSC" },
@@ -386,6 +501,11 @@ impl SidDevice for EmulatedDevice {
         if let Some(ref mut s) = self.sid3 {
             s.inner().reset();
         }
+        // Reset ExternalFilter state — prevents DC transient after reset.
+        self.ext1.reset();
+        self.ext2.reset();
+        self.ext3.reset();
+
         self.cycles_this_frame = 0;
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
@@ -395,15 +515,20 @@ impl SidDevice for EmulatedDevice {
     fn set_stereo(&mut self, mode: i32) {
         if mode >= 1 && self.sid2.is_none() {
             self.sid2 = Some(self.make_sid());
+            // ext2 already created and configured; just reset state.
+            self.ext2.reset();
             eprintln!("[emulated] SID2 enabled");
         }
         if mode >= 2 && self.sid3.is_none() {
             self.sid3 = Some(self.make_sid());
+            self.ext3.reset();
             eprintln!("[emulated] SID3 enabled");
         }
         if mode == 0 {
             self.sid2 = None;
             self.sid3 = None;
+            self.ext2.reset();
+            self.ext3.reset();
         }
     }
 
@@ -466,6 +591,11 @@ impl SidDevice for EmulatedDevice {
         if let Some(ref mut s) = self.sid3 {
             s.inner().write(0x18, 0x00);
         }
+        // Reset filter state to avoid a DC-offset thump after mute.
+        self.ext1.reset();
+        self.ext2.reset();
+        self.ext3.reset();
+
         self.cycles_this_frame = 0;
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
