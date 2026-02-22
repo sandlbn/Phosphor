@@ -1,0 +1,14 @@
+APP_NAME = Phosphor
+BIN_NAME = phosphor
+DIST_DIR = dist
+
+SHELL := powershell.exe
+.SHELLFLAGS := -NoProfile -ExecutionPolicy Bypass -Command
+
+.PHONY: windows clean
+
+windows:
+	$$ErrorActionPreference='Stop'; $$toml=Get-Content 'Cargo.toml' -Raw; $$m=[regex]::Match($$toml,'(?m)^version\s*=\s*"([^"]+)"'); $$ver=$$m.Groups[1].Value; New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; cargo build --release; $$out=Join-Path '$(DIST_DIR)' ('$(APP_NAME)-'+$$ver+'-windows-x86_64.exe'); Copy-Item 'target\release\$(BIN_NAME).exe' $$out -Force; Write-Host ('Built: '+$$out)
+
+clean:
+	if (Test-Path "$(DIST_DIR)") { Remove-Item -Recurse -Force "$(DIST_DIR)" }
