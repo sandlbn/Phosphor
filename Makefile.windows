@@ -1,0 +1,17 @@
+# Makefile.windows (PowerShell-native, no backslashes)
+APP_NAME = Phosphor
+BIN_NAME = phosphor
+DIST_DIR = dist
+
+SHELL := powershell.exe
+.SHELLFLAGS := -NoProfile -ExecutionPolicy Bypass -Command
+
+.PHONY: windows_zip windows clean
+
+windows: windows_zip
+
+clean:
+	if (Test-Path "$(DIST_DIR)") { Remove-Item -Recurse -Force "$(DIST_DIR)" }
+
+windows_zip:
+	& { $$ErrorActionPreference='Stop'; $$toml=Get-Content 'Cargo.toml' -Raw; $$m=[regex]::Match($$toml,'(?m)^version\s*=\s*"([^"]+)"'); if(-not $$m.Success){ throw 'Could not parse version from Cargo.toml' }; $$ver=$$m.Groups[1].Value; New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; Write-Host ('Version: '+$$ver); Write-Host 'Building release...'; cargo build --release; $$tmp=Join-Path '$(DIST_DIR)' '_winpkg'; if(Test-Path $$tmp){ Remove-Item -Recurse -Force $$tmp }; New-Item -ItemType Directory -Force -Path $$tmp | Out-Null; Copy-Item ('target\release\$(BIN_NAME).exe') $$tmp; if(Test-Path 'README.md'){ Copy-Item 'README.md' $$tmp }; if(Test-Path 'LICENSE'){ Copy-Item 'LICENSE' $$tmp }; $$out=Join-Path '$(DIST_DIR)' ('$(APP_NAME)-'+$$ver+'-windows-x86_64.zip'); if(Test-Path $$out){ Remove-Item $$out -Force }; Compress-Archive -Path (Join-Path $$tmp '*') -DestinationPath $$out; Remove-Item -Recurse -Force $$tmp; Write-Host ('Built: '+$$out) }
