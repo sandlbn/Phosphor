@@ -79,6 +79,7 @@ pub enum Message {
     // Settings
     ToggleSettings,
     ToggleSkipRsid,
+    ToggleForceStereo2sid,
     DefaultSongLengthChanged(String),
     SonglengthUrlChanged(String),
     DownloadSonglength,
@@ -1003,6 +1004,30 @@ pub fn settings_panel<'a>(
 
     let rsid_section = column![rsid_label, rsid_toggle, rsid_help].spacing(6);
 
+    // ── Force stereo for 2SID tunes ──────────────────────────────
+    let stereo_2sid_label = text("Force stereo for 2SID tunes:")
+        .size(14)
+        .color(Color::from_rgb(0.75, 0.77, 0.82));
+
+    let stereo_2sid_toggle = tool_button(
+        if config.force_stereo_2sid {
+            "✓ Yes — mirror SID1 to both channels"
+        } else {
+            "✗ No — true dual-SID (L=SID1, R=SID2)"
+        },
+        Message::ToggleForceStereo2sid,
+    );
+
+    let stereo_2sid_help = text(
+        "When enabled, 2SID tunes ignore the second SID and mirror SID1 to both speakers \
+         (same as mono). Disable for true stereo separation on dual-SID hardware.",
+    )
+    .size(11)
+    .color(Color::from_rgb(0.45, 0.47, 0.52));
+
+    let stereo_2sid_section =
+        column![stereo_2sid_label, stereo_2sid_toggle, stereo_2sid_help].spacing(6);
+
     // ── Default song length ──────────────────────────────────────
     let length_label = text("Default song length (seconds):")
         .size(14)
@@ -1096,6 +1121,8 @@ pub fn settings_panel<'a>(
         engine_section,
         rule::horizontal(1),
         rsid_section,
+        rule::horizontal(1),
+        stereo_2sid_section,
         rule::horizontal(1),
         length_section,
         rule::horizontal(1),

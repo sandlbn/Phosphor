@@ -612,6 +612,11 @@ impl App {
                 self.config.save();
             }
 
+            Message::ToggleForceStereo2sid => {
+                self.config.force_stereo_2sid = !self.config.force_stereo_2sid;
+                self.config.save();
+            }
+
             Message::DefaultSongLengthChanged(val) => {
                 self.default_length_text = val.clone();
                 // Parse and apply the value
@@ -965,7 +970,8 @@ impl App {
             self.selected = Some(idx);
             self.scroll_to_current = true;
 
-            let force_stereo = std::env::args().any(|a| a == "--stereo");
+            let force_stereo =
+                self.config.force_stereo_2sid || std::env::args().any(|a| a == "--stereo");
             let sid4_addr = parse_sid4_from_args();
 
             let _ = self.cmd_tx.send(PlayerCmd::Play {
