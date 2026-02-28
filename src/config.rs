@@ -31,6 +31,9 @@ pub struct Config {
     pub last_songlength_file: Option<String>,
     /// Last directory used for playlists.
     pub last_playlist_dir: Option<String>,
+    /// Force stereo mirroring for 2SID tunes (duplicate SID1 writes to SID2).
+    /// When enabled, 2SID tunes play in mono-stereo mode instead of true dual-SID.
+    pub force_stereo_2sid: bool,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             last_songlength_dir: None,
             last_songlength_file: None,
             last_playlist_dir: None,
+            force_stereo_2sid: false,
         }
     }
 }
@@ -155,6 +159,9 @@ impl Config {
                 if val != "null" {
                     config.last_playlist_dir = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.force_stereo_2sid = val == "true";
             }
         }
 
@@ -181,7 +188,8 @@ impl Config {
                 "  \"last_sid_dir\": {},\n",
                 "  \"last_songlength_dir\": {},\n",
                 "  \"last_songlength_file\": {},\n",
-                "  \"last_playlist_dir\": {}\n",
+                "  \"last_playlist_dir\": {},\n",
+                "  \"force_stereo_2sid\": {}\n",
                 "}}\n",
             ),
             self.skip_rsid,
@@ -194,6 +202,7 @@ impl Config {
             fmt_opt(&self.last_songlength_dir),
             fmt_opt(&self.last_songlength_file),
             fmt_opt(&self.last_playlist_dir),
+            self.force_stereo_2sid,
         )
     }
 

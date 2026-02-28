@@ -726,7 +726,7 @@ fn setup_playback(
     sid_file: SidFile,
     path: PathBuf,
     song: u16,
-    _force_stereo: bool,
+    force_stereo: bool,
     sid4_addr: u16,
     is_rsid: bool,
     bridge: &mut Option<Box<dyn SidDevice>>,
@@ -749,10 +749,19 @@ fn setup_playback(
     // Always use stereo mode — mono tunes get mirrored to both channels
     // so sound comes from both speakers.
     let use_stereo = true;
-    let mono_mode = !is_multi;
-    let mirror_mono = mono_mode; // always mirror single-SID tunes
+    // force_stereo: treat 2SID tunes as mono (mirror SID1 to both channels,
+    // ignoring the second SID). Only applies to exactly 2-SID tunes;
+    // 3SID/4SID tunes always use their native multi-SID layout.
+    let force_mono_2sid = force_stereo && num_sids == 2;
+    let mono_mode = !is_multi || force_mono_2sid;
+    let mirror_mono = mono_mode; // mirror single-SID tunes (and forced-stereo 2SID)
 
-    let mapper = SidMapper::new(&sid_bases);
+    // When forcing stereo on a 2SID tune, use only the base SID for mapping
+    let mapper = if force_mono_2sid {
+        SidMapper::new(&sid_bases[..1])
+    } else {
+        SidMapper::new(&sid_bases)
+    };
     let frame_us = header.frame_us();
     let cycles_per_frame = if header.is_pal {
         PAL_CYCLES_PER_FRAME
@@ -760,11 +769,15 @@ fn setup_playback(
         NTSC_CYCLES_PER_FRAME
     };
 
-    let sid_type = match num_sids {
-        1 => "Mono".to_string(),
-        2 => "2SID Stereo".to_string(),
-        3 => "3SID".to_string(),
-        n => format!("{}SID", n),
+    let sid_type = if force_mono_2sid {
+        "2SID → Stereo (forced mono)".to_string()
+    } else {
+        match num_sids {
+            1 => "Mono".to_string(),
+            2 => "2SID Stereo".to_string(),
+            3 => "3SID".to_string(),
+            n => format!("{}SID", n),
+        }
     };
 
     let md5 = compute_hvsc_md5(&sid_file);
