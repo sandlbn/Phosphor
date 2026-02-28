@@ -245,12 +245,14 @@ pub struct EmulatedDevice {
     sid1: SendSid,
     sid2: Option<SendSid>,
     sid3: Option<SendSid>,
+    sid4: Option<SendSid>,
 
     // ExternalFilter — one instance per SID chip, matching real C64 hardware.
     // Each filter models the RC output stage on the C64 mainboard (libresidfp port).
     ext1: ExternalFilter,
     ext2: ExternalFilter,
     ext3: ExternalFilter,
+    ext4: ExternalFilter,
 
     clock_freq: u32,
     sample_rate: u32,
@@ -287,9 +289,11 @@ impl EmulatedDevice {
         let mut ext1 = ExternalFilter::new();
         let mut ext2 = ExternalFilter::new();
         let mut ext3 = ExternalFilter::new();
+        let mut ext4 = ExternalFilter::new();
         ext1.set_clock_frequency(clock_freq as f64);
         ext2.set_clock_frequency(clock_freq as f64);
         ext3.set_clock_frequency(clock_freq as f64);
+        ext4.set_clock_frequency(clock_freq as f64);
 
         eprintln!(
             "[emulated] SID opened: MOS6581, clock={}Hz, output={}Hz, ExternalFilter=ON",
@@ -300,9 +304,11 @@ impl EmulatedDevice {
             sid1,
             sid2: None,
             sid3: None,
+            sid4: None,
             ext1,
             ext2,
             ext3,
+            ext4,
             clock_freq,
             sample_rate,
             chip_model,
@@ -357,7 +363,7 @@ impl EmulatedDevice {
     }
 
     /// Route a register write to the correct SID chip.
-    ///   0x00-0x1F -> SID1, 0x20-0x3F -> SID2, 0x40-0x5F -> SID3
+    ///   0x00-0x1F -> SID1, 0x20-0x3F -> SID2, 0x40-0x5F -> SID3, 0x60-0x7F -> SID4
     fn write_to_sid(&mut self, reg: u8, val: u8) {
         let chip = reg / SID_REGS;
         let local = reg % SID_REGS;
@@ -370,6 +376,11 @@ impl EmulatedDevice {
             }
             2 => {
                 if let Some(ref mut s) = self.sid3 {
+                    s.inner().write(local, val);
+                }
+            }
+            3 => {
+                if let Some(ref mut s) = self.sid4 {
                     s.inner().write(local, val);
                 }
             }
@@ -391,6 +402,7 @@ impl EmulatedDevice {
         let mut s1: Vec<i16> = Vec::with_capacity(1024);
         let mut s2: Vec<i16> = Vec::new();
         let mut s3: Vec<i16> = Vec::new();
+        let mut s4: Vec<i16> = Vec::new();
 
         Self::clock_sid(&mut self.sid1, delta, &mut s1);
         if let Some(ref mut sid) = self.sid2 {
@@ -398,6 +410,9 @@ impl EmulatedDevice {
         }
         if let Some(ref mut sid) = self.sid3 {
             Self::clock_sid(sid, delta, &mut s3);
+        }
+        if let Some(ref mut sid) = self.sid4 {
+            Self::clock_sid(sid, delta, &mut s4);
         }
 
         if s1.is_empty() {
@@ -413,6 +428,7 @@ impl EmulatedDevice {
         let filtered1: Vec<i16> = s1.iter().map(|&s| self.ext1.clock(s)).collect();
         let filtered2: Vec<i16> = s2.iter().map(|&s| self.ext2.clock(s)).collect();
         let filtered3: Vec<i16> = s3.iter().map(|&s| self.ext3.clock(s)).collect();
+        let filtered4: Vec<i16> = s4.iter().map(|&s| self.ext4.clock(s)).collect();
 
         // Push to ring buffer as stereo pairs.
         let mut buf = self.audio_buf.lock().unwrap();
@@ -427,9 +443,15 @@ impl EmulatedDevice {
                 left // mono: mirror SID1 (already filtered) to right channel
             };
 
+            // SID3 and SID4: centre-mixed equally into both channels at half volume.
+            let mut centre: i16 = 0;
             if !filtered3.is_empty() {
-                // SID3 centre-mixed equally into both channels at half volume.
-                let centre = *filtered3.get(i).unwrap_or(&0) / 2;
+                centre = centre.saturating_add(*filtered3.get(i).unwrap_or(&0) / 2);
+            }
+            if !filtered4.is_empty() {
+                centre = centre.saturating_add(*filtered4.get(i).unwrap_or(&0) / 2);
+            }
+            if centre != 0 {
                 buf.push_back((left.saturating_add(centre), right.saturating_add(centre)));
             } else {
                 buf.push_back((left, right));
@@ -475,6 +497,13 @@ impl SidDevice for EmulatedDevice {
                 self.sample_rate,
             );
         }
+        if let Some(ref mut s) = self.sid4 {
+            s.inner().set_sampling_parameters(
+                SamplingMethod::Fast,
+                self.clock_freq,
+                self.sample_rate,
+            );
+        }
 
         // Update ExternalFilter coefficients to match the new clock frequency.
         // Cutoff frequencies are physical constants (RC values), so the coefficients
@@ -483,6 +512,7 @@ impl SidDevice for EmulatedDevice {
         self.ext1.set_clock_frequency(freq);
         self.ext2.set_clock_frequency(freq);
         self.ext3.set_clock_frequency(freq);
+        self.ext4.set_clock_frequency(freq);
 
         eprintln!(
             "[emulated] Clock: {} {}Hz, {}/frame, output={}Hz",
@@ -501,10 +531,14 @@ impl SidDevice for EmulatedDevice {
         if let Some(ref mut s) = self.sid3 {
             s.inner().reset();
         }
+        if let Some(ref mut s) = self.sid4 {
+            s.inner().reset();
+        }
         // Reset ExternalFilter state — prevents DC transient after reset.
         self.ext1.reset();
         self.ext2.reset();
         self.ext3.reset();
+        self.ext4.reset();
 
         self.cycles_this_frame = 0;
         if let Ok(mut buf) = self.audio_buf.lock() {
@@ -524,11 +558,18 @@ impl SidDevice for EmulatedDevice {
             self.ext3.reset();
             eprintln!("[emulated] SID3 enabled");
         }
+        if mode >= 3 && self.sid4.is_none() {
+            self.sid4 = Some(self.make_sid());
+            self.ext4.reset();
+            eprintln!("[emulated] SID4 enabled");
+        }
         if mode == 0 {
             self.sid2 = None;
             self.sid3 = None;
+            self.sid4 = None;
             self.ext2.reset();
             self.ext3.reset();
+            self.ext4.reset();
         }
     }
 
@@ -591,10 +632,14 @@ impl SidDevice for EmulatedDevice {
         if let Some(ref mut s) = self.sid3 {
             s.inner().write(0x18, 0x00);
         }
+        if let Some(ref mut s) = self.sid4 {
+            s.inner().write(0x18, 0x00);
+        }
         // Reset filter state to avoid a DC-offset thump after mute.
         self.ext1.reset();
         self.ext2.reset();
         self.ext3.reset();
+        self.ext4.reset();
 
         self.cycles_this_frame = 0;
         if let Ok(mut buf) = self.audio_buf.lock() {

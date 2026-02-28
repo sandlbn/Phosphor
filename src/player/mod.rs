@@ -789,13 +789,15 @@ fn setup_playback(
         br.reset();
         thread::sleep(Duration::from_millis(50));
 
-        if use_stereo {
-            br.set_stereo(1);
+        // Tell the device how many SIDs are active:
+        //   mono tunes in stereo mode → 2 (mirror to both speakers)
+        //   multi-SID tunes → num_sids (2, 3, or 4)
+        let active_sids = if use_stereo && mono_mode { 2 } else { num_sids };
+        if active_sids > 1 {
+            br.set_stereo((active_sids - 1) as i32);
         } else {
             br.set_stereo(0);
         }
-
-        let active_sids = if use_stereo && mono_mode { 2 } else { num_sids };
         for i in 0..active_sids {
             let vol_reg = (i as u8) * SID_REG_SIZE + SID_VOL_REG;
             br.write(vol_reg, 0x0F);
