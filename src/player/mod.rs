@@ -278,10 +278,26 @@ fn player_loop(
                                     );
                                 }
                             }
-                            PlayEngine::Native => {
+                            PlayEngine::Native { shadow } => {
                                 // ── U64 native — real hardware plays the SID ─
-                                // Nothing to do here; the U64 handles playback.
-                                // We just pace frames for elapsed time tracking.
+                                // Run a shadow CPU locally for visualization only.
+                                // Writes are NOT sent to the device.
+                                match shadow {
+                                    NativeShadow::Psid {
+                                        cpu,
+                                        trampoline,
+                                        halt_pc,
+                                    } => {
+                                        cpu.memory.clear_writes();
+                                        cpu.registers.program_counter = *trampoline;
+                                        cpu.registers.stack_pointer = StackPointer(0xFD);
+                                        run_until(cpu, *halt_pc, 200_000);
+                                    }
+                                    NativeShadow::Rsid { cpu, prev_nmi } => {
+                                        cpu.memory.clear_writes();
+                                        run_rsid_sub_emu(cpu, ctx.cycles_per_frame, prev_nmi);
+                                    }
+                                }
                             }
                         }
 
@@ -457,7 +473,9 @@ fn handle_cmd(
             };
 
             if native {
-                // Build a lightweight context — only for time tracking.
+                // Build context with shadow CPU for visualization.
+                // The U64 handles actual SID output — the shadow CPU runs
+                // locally so we can show voice levels in the visualizer.
                 let header = &sid_file.header;
                 let num_sids = 1
                     + (header.extra_sid_addrs[0] != 0) as usize
@@ -476,7 +494,7 @@ fn handle_cmd(
                     NTSC_CYCLES_PER_FRAME
                 };
                 let track_info = TrackInfo {
-                    path,
+                    path: path.clone(),
                     name: header.name.clone(),
                     author: header.author.clone(),
                     released: header.released.clone(),
@@ -488,10 +506,64 @@ fn handle_cmd(
                     sid_type,
                     md5,
                 };
+
+                // Build a shadow emulation engine (same as normal setup,
+                // but we never send its writes to the device).
+                let mut sid_bases: Vec<u16> = vec![0xD400];
+                if header.extra_sid_addrs[0] != 0 {
+                    sid_bases.push(header.extra_sid_addrs[0]);
+                }
+                if header.extra_sid_addrs[1] != 0 {
+                    sid_bases.push(header.extra_sid_addrs[1]);
+                }
+                let mapper = SidMapper::new(&sid_bases);
+                let mono_mode = num_sids <= 1;
+                let trampoline: u16 = 0x0300;
+                let halt_pc = trampoline + 3;
+
+                let shadow = if is_rsid {
+                    let engine = setup_rsid_engine(
+                        &sid_file,
+                        song,
+                        &mapper,
+                        mono_mode,
+                        cycles_per_frame,
+                        trampoline,
+                        halt_pc,
+                    );
+                    match engine {
+                        PlayEngine::Rsid { mut cpu, prev_nmi } => {
+                            cpu.memory.clear_writes();
+                            NativeShadow::Rsid { cpu, prev_nmi }
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    let engine =
+                        setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc);
+                    match engine {
+                        PlayEngine::Psid(mut cpu) => {
+                            cpu.memory.clear_writes();
+                            if header.play_address != 0 {
+                                cpu.memory
+                                    .install_trampoline(trampoline, header.play_address);
+                            }
+                            NativeShadow::Psid {
+                                cpu,
+                                trampoline,
+                                halt_pc,
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+
+                eprintln!("[phosphor] Native + shadow CPU for visualization");
+
                 *play_ctx = Some(PlayContext {
-                    engine: PlayEngine::Native,
-                    trampoline: 0,
-                    halt_pc: 0,
+                    engine: PlayEngine::Native { shadow },
+                    trampoline,
+                    halt_pc,
                     frame_us,
                     cycles_per_frame,
                     elapsed: Duration::ZERO,
@@ -543,7 +615,8 @@ fn handle_cmd(
                 stop_playback(play_ctx, bridge);
 
                 if was_native {
-                    // For native playback, re-send the SID file with new song number.
+                    // For native playback, re-send the SID file with new song number
+                    // and rebuild the shadow CPU for visualization.
                     if let Ok(data) = std::fs::read(&path) {
                         if let Some(ref mut br) = bridge {
                             match br.play_sid_native(&data, song) {
@@ -567,7 +640,7 @@ fn handle_cmd(
                                             NTSC_CYCLES_PER_FRAME
                                         };
                                         let track_info = TrackInfo {
-                                            path,
+                                            path: path.clone(),
                                             name: header.name.clone(),
                                             author: header.author.clone(),
                                             released: header.released.clone(),
@@ -579,10 +652,65 @@ fn handle_cmd(
                                             sid_type,
                                             md5,
                                         };
+
+                                        // Build shadow CPU for visualization
+                                        let mut sid_bases: Vec<u16> = vec![0xD400];
+                                        if header.extra_sid_addrs[0] != 0 {
+                                            sid_bases.push(header.extra_sid_addrs[0]);
+                                        }
+                                        if header.extra_sid_addrs[1] != 0 {
+                                            sid_bases.push(header.extra_sid_addrs[1]);
+                                        }
+                                        let mapper = SidMapper::new(&sid_bases);
+                                        let mono_mode = num_sids <= 1;
+                                        let trampoline: u16 = 0x0300;
+                                        let halt_pc = trampoline + 3;
+
+                                        let shadow = if is_rsid {
+                                            let engine = setup_rsid_engine(
+                                                &sid_file,
+                                                song,
+                                                &mapper,
+                                                mono_mode,
+                                                cycles_per_frame,
+                                                trampoline,
+                                                halt_pc,
+                                            );
+                                            match engine {
+                                                PlayEngine::Rsid { mut cpu, prev_nmi } => {
+                                                    cpu.memory.clear_writes();
+                                                    NativeShadow::Rsid { cpu, prev_nmi }
+                                                }
+                                                _ => unreachable!(),
+                                            }
+                                        } else {
+                                            let engine = setup_psid_engine(
+                                                &sid_file, song, &mapper, mono_mode, trampoline,
+                                                halt_pc,
+                                            );
+                                            match engine {
+                                                PlayEngine::Psid(mut cpu) => {
+                                                    cpu.memory.clear_writes();
+                                                    if header.play_address != 0 {
+                                                        cpu.memory.install_trampoline(
+                                                            trampoline,
+                                                            header.play_address,
+                                                        );
+                                                    }
+                                                    NativeShadow::Psid {
+                                                        cpu,
+                                                        trampoline,
+                                                        halt_pc,
+                                                    }
+                                                }
+                                                _ => unreachable!(),
+                                            }
+                                        };
+
                                         *play_ctx = Some(PlayContext {
-                                            engine: PlayEngine::Native,
-                                            trampoline: 0,
-                                            halt_pc: 0,
+                                            engine: PlayEngine::Native { shadow },
+                                            trampoline,
+                                            halt_pc,
                                             frame_us,
                                             cycles_per_frame,
                                             elapsed: Duration::ZERO,
@@ -684,8 +812,24 @@ enum PlayEngine {
         prev_nmi: bool,
     },
     /// U64 native playback — the real C64 handles SID output.
-    /// We only track time; no CPU emulation or register writes.
-    Native,
+    /// A shadow CPU runs locally (no output to device) for visualization.
+    Native {
+        shadow: NativeShadow,
+    },
+}
+
+/// Shadow CPU for native playback visualization.
+/// Runs the same emulation as PSID/RSID but never sends writes to hardware.
+enum NativeShadow {
+    Psid {
+        cpu: CPU<C64Memory, Nmos6502>,
+        trampoline: u16,
+        halt_pc: u16,
+    },
+    Rsid {
+        cpu: CPU<RsidBus, Nmos6502>,
+        prev_nmi: bool,
+    },
 }
 #[allow(dead_code)]
 impl PlayContext {
@@ -694,14 +838,17 @@ impl PlayContext {
     }
 
     fn is_native(&self) -> bool {
-        matches!(self.engine, PlayEngine::Native)
+        matches!(self.engine, PlayEngine::Native { .. })
     }
 
     fn sid_writes(&self) -> &[SidWrite] {
         match &self.engine {
             PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
             PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
-            PlayEngine::Native => &[],
+            PlayEngine::Native { shadow } => match shadow {
+                NativeShadow::Psid { cpu, .. } => &cpu.memory.sid_writes,
+                NativeShadow::Rsid { cpu, .. } => &cpu.memory.sid_writes,
+            },
         }
     }
 
@@ -709,7 +856,10 @@ impl PlayContext {
         match &self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.voice_levels(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.voice_levels(),
-            PlayEngine::Native => vec![],
+            PlayEngine::Native { shadow } => match shadow {
+                NativeShadow::Psid { cpu, .. } => cpu.memory.voice_levels(),
+                NativeShadow::Rsid { cpu, .. } => cpu.memory.voice_levels(),
+            },
         }
     }
 
@@ -717,7 +867,10 @@ impl PlayContext {
         match &mut self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.clear_writes(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.clear_writes(),
-            PlayEngine::Native => {}
+            PlayEngine::Native { shadow } => match shadow {
+                NativeShadow::Psid { cpu, .. } => cpu.memory.clear_writes(),
+                NativeShadow::Rsid { cpu, .. } => cpu.memory.clear_writes(),
+            },
         }
     }
 }
@@ -850,7 +1003,7 @@ fn setup_playback(
     let init_writes = match &engine {
         PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
         PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
-        PlayEngine::Native => &empty_writes,
+        PlayEngine::Native { .. } => &empty_writes,
     };
 
     if let Some(ref mut br) = bridge {
@@ -877,7 +1030,7 @@ fn setup_playback(
             cpu.memory.clear_writes();
             PlayEngine::Rsid { cpu, prev_nmi }
         }
-        PlayEngine::Native => PlayEngine::Native,
+        n @ PlayEngine::Native { .. } => n,
     };
 
     PlayContext {
