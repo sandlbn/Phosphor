@@ -289,11 +289,9 @@ impl EmulatedDevice {
         let mut ext1 = ExternalFilter::new();
         let mut ext2 = ExternalFilter::new();
         let mut ext3 = ExternalFilter::new();
-        let mut ext4 = ExternalFilter::new();
         ext1.set_clock_frequency(clock_freq as f64);
         ext2.set_clock_frequency(clock_freq as f64);
         ext3.set_clock_frequency(clock_freq as f64);
-        ext4.set_clock_frequency(clock_freq as f64);
 
         eprintln!(
             "[emulated] SID opened: MOS6581, clock={}Hz, output={}Hz, ExternalFilter=ON",
@@ -308,7 +306,7 @@ impl EmulatedDevice {
             ext1,
             ext2,
             ext3,
-            ext4,
+            ext4: ExternalFilter::new(),
             clock_freq,
             sample_rate,
             chip_model,
@@ -419,12 +417,6 @@ impl EmulatedDevice {
             return;
         }
 
-        // Apply ExternalFilter to each SID's samples before mixing.
-        // Done here (before locking audio_buf) to keep the borrow checker happy.
-        //
-        // Each ExternalFilter::clock() call is 4 multiplies + 4 adds — negligible cost.
-        // The LP stage rolls off content above ~15.9kHz.
-        // The HP stage removes DC, eliminating the "thump" on SID mute/silence.
         let filtered1: Vec<i16> = s1.iter().map(|&s| self.ext1.clock(s)).collect();
         let filtered2: Vec<i16> = s2.iter().map(|&s| self.ext2.clock(s)).collect();
         let filtered3: Vec<i16> = s3.iter().map(|&s| self.ext3.clock(s)).collect();
@@ -440,10 +432,10 @@ impl EmulatedDevice {
             let right = if !filtered2.is_empty() {
                 *filtered2.get(i).unwrap_or(&0)
             } else {
-                left // mono: mirror SID1 (already filtered) to right channel
+                left // mono: mirror SID1 to right channel
             };
 
-            // SID3 and SID4: centre-mixed equally into both channels at half volume.
+            // SID3/SID4 centre-mixed at half volume
             let mut centre: i16 = 0;
             if !filtered3.is_empty() {
                 centre = centre.saturating_add(*filtered3.get(i).unwrap_or(&0) / 2);
@@ -451,6 +443,7 @@ impl EmulatedDevice {
             if !filtered4.is_empty() {
                 centre = centre.saturating_add(*filtered4.get(i).unwrap_or(&0) / 2);
             }
+
             if centre != 0 {
                 buf.push_back((left.saturating_add(centre), right.saturating_add(centre)));
             } else {
@@ -505,9 +498,6 @@ impl SidDevice for EmulatedDevice {
             );
         }
 
-        // Update ExternalFilter coefficients to match the new clock frequency.
-        // Cutoff frequencies are physical constants (RC values), so the coefficients
-        // change slightly between PAL (~985kHz) and NTSC (~1023kHz).
         let freq = self.clock_freq as f64;
         self.ext1.set_clock_frequency(freq);
         self.ext2.set_clock_frequency(freq);
@@ -523,6 +513,16 @@ impl SidDevice for EmulatedDevice {
         );
     }
 
+    fn set_cycles_per_frame(&mut self, cycles: u32) {
+        if cycles != self.cycles_per_frame {
+            eprintln!(
+                "[emulated] cycles_per_frame: {} → {}",
+                self.cycles_per_frame, cycles,
+            );
+            self.cycles_per_frame = cycles;
+        }
+    }
+
     fn reset(&mut self) {
         self.sid1.inner().reset();
         if let Some(ref mut s) = self.sid2 {
@@ -534,7 +534,6 @@ impl SidDevice for EmulatedDevice {
         if let Some(ref mut s) = self.sid4 {
             s.inner().reset();
         }
-        // Reset ExternalFilter state — prevents DC transient after reset.
         self.ext1.reset();
         self.ext2.reset();
         self.ext3.reset();
@@ -549,7 +548,6 @@ impl SidDevice for EmulatedDevice {
     fn set_stereo(&mut self, mode: i32) {
         if mode >= 1 && self.sid2.is_none() {
             self.sid2 = Some(self.make_sid());
-            // ext2 already created and configured; just reset state.
             self.ext2.reset();
             eprintln!("[emulated] SID2 enabled");
         }
@@ -639,7 +637,6 @@ impl SidDevice for EmulatedDevice {
         self.ext1.reset();
         self.ext2.reset();
         self.ext3.reset();
-        self.ext4.reset();
 
         self.cycles_this_frame = 0;
         if let Ok(mut buf) = self.audio_buf.lock() {
