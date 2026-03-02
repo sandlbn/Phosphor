@@ -22,6 +22,10 @@ pub trait SidDevice: Send {
     fn close(&mut self);
     fn shutdown(&mut self);
 
+    /// Override cycles-per-frame for flush() audio generation.
+    /// Only meaningful for emulated engine; hardware devices ignore this.
+    fn set_cycles_per_frame(&mut self, _cycles: u32) {}
+
     /// Send a complete SID file for native playback on real hardware.
     ///
     /// Returns `Ok(true)` if the engine handles playback natively

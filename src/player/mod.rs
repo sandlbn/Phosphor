@@ -171,6 +171,7 @@ pub fn spawn_player(
 
     thread::Builder::new()
         .name("sid-player".into())
+        .stack_size(4 * 1024 * 1024) // 4MB — shadow CPU needs space for C64 memory
         .spawn(move || {
             player_loop(cmd_rx, status_tx, engine_name, u64_address, u64_password);
         })
@@ -279,9 +280,7 @@ fn player_loop(
                                 }
                             }
                             PlayEngine::Native { shadow } => {
-                                // ── U64 native — real hardware plays the SID ─
-                                // Run a shadow CPU locally for visualization only.
-                                // Writes are NOT sent to the device.
+                                // Run shadow CPU for visualization only.
                                 match shadow {
                                     NativeShadow::Psid {
                                         cpu,
@@ -310,15 +309,20 @@ fn player_loop(
                         }
 
                         // ── Absolute-timeline frame pacing ───────────────────
-                        // Advance deadline by exactly one frame period.
-                        // This prevents inter-frame overhead from accumulating
-                        // as drift (was ~8% slow with per-frame Instant::now).
                         ctx.next_frame += frame_dur;
 
-                        // If we've fallen behind (e.g. after a pause or load),
-                        // snap the deadline to now rather than fast-forwarding.
                         let now = Instant::now();
                         if ctx.next_frame < now {
+                            // Frame overrun — log it periodically
+                            let overrun = now - ctx.next_frame;
+                            if ctx.frame_count % 250 == 0 {
+                                eprintln!(
+                                    "[phosphor] frame {} overrun by {}µs (sids={})",
+                                    ctx.frame_count,
+                                    overrun.as_micros(),
+                                    ctx.track_info.num_sids,
+                                );
+                            }
                             ctx.next_frame = now;
                         }
 
@@ -474,8 +478,6 @@ fn handle_cmd(
 
             if native {
                 // Build context with shadow CPU for visualization.
-                // The U64 handles actual SID output — the shadow CPU runs
-                // locally so we can show voice levels in the visualizer.
                 let header = &sid_file.header;
                 let num_sids = 1
                     + (header.extra_sid_addrs[0] != 0) as usize
@@ -507,8 +509,7 @@ fn handle_cmd(
                     md5,
                 };
 
-                // Build a shadow emulation engine (same as normal setup,
-                // but we never send its writes to the device).
+                // Build shadow emulation for visualization
                 let mut sid_bases: Vec<u16> = vec![0xD400];
                 if header.extra_sid_addrs[0] != 0 {
                     sid_bases.push(header.extra_sid_addrs[0]);
@@ -557,8 +558,6 @@ fn handle_cmd(
                         _ => unreachable!(),
                     }
                 };
-
-                eprintln!("[phosphor] Native + shadow CPU for visualization");
 
                 *play_ctx = Some(PlayContext {
                     engine: PlayEngine::Native { shadow },
@@ -615,8 +614,6 @@ fn handle_cmd(
                 stop_playback(play_ctx, bridge);
 
                 if was_native {
-                    // For native playback, re-send the SID file with new song number
-                    // and rebuild the shadow CPU for visualization.
                     if let Ok(data) = std::fs::read(&path) {
                         if let Some(ref mut br) = bridge {
                             match br.play_sid_native(&data, song) {
@@ -811,15 +808,14 @@ enum PlayEngine {
         cpu: CPU<RsidBus, Nmos6502>,
         prev_nmi: bool,
     },
-    /// U64 native playback — the real C64 handles SID output.
-    /// A shadow CPU runs locally (no output to device) for visualization.
+    /// U64 native playback — real C64 handles SID output.
+    /// Shadow CPU runs locally for visualization only.
     Native {
         shadow: NativeShadow,
     },
 }
 
 /// Shadow CPU for native playback visualization.
-/// Runs the same emulation as PSID/RSID but never sends writes to hardware.
 enum NativeShadow {
     Psid {
         cpu: CPU<C64Memory, Nmos6502>,
@@ -899,15 +895,12 @@ fn setup_playback(
 
     let num_sids = sid_bases.len();
     let is_multi = num_sids > 1;
-    // Always use stereo mode — mono tunes get mirrored to both channels
-    // so sound comes from both speakers.
     let use_stereo = true;
-    // force_stereo: treat 2SID tunes as mono (mirror SID1 to both channels,
-    // ignoring the second SID). Only applies to exactly 2-SID tunes;
-    // 3SID/4SID tunes always use their native multi-SID layout.
+    // force_stereo: treat 2SID tunes as mono (mirror SID1 to both channels).
+    // Only applies to exactly 2-SID tunes.
     let force_mono_2sid = force_stereo && num_sids == 2;
     let mono_mode = !is_multi || force_mono_2sid;
-    let mirror_mono = mono_mode; // mirror single-SID tunes (and forced-stereo 2SID)
+    let mirror_mono = mono_mode;
 
     // When forcing stereo on a 2SID tune, use only the base SID for mapping
     let mapper = if force_mono_2sid {
@@ -915,8 +908,8 @@ fn setup_playback(
     } else {
         SidMapper::new(&sid_bases)
     };
-    let frame_us = header.frame_us();
-    let cycles_per_frame = if header.is_pal {
+    let mut frame_us = header.frame_us();
+    let mut cycles_per_frame = if header.is_pal {
         PAL_CYCLES_PER_FRAME
     } else {
         NTSC_CYCLES_PER_FRAME
@@ -955,15 +948,17 @@ fn setup_playback(
         br.reset();
         thread::sleep(Duration::from_millis(50));
 
-        // Tell the device how many SIDs are active:
-        //   mono tunes in stereo mode → 2 (mirror to both speakers)
-        //   multi-SID tunes → num_sids (2, 3, or 4)
-        let active_sids = if use_stereo && mono_mode { 2 } else { num_sids };
-        if active_sids > 1 {
+        if use_stereo {
+            // Tell the device how many SIDs are active:
+            //   mono tunes in stereo mode → set_stereo(1) for mirror
+            //   multi-SID tunes → set_stereo(num_sids - 1)
+            let active_sids = if mono_mode { 2 } else { num_sids };
             br.set_stereo((active_sids - 1) as i32);
         } else {
             br.set_stereo(0);
         }
+
+        let active_sids = if use_stereo && mono_mode { 2 } else { num_sids };
         for i in 0..active_sids {
             let vol_reg = (i as u8) * SID_REG_SIZE + SID_VOL_REG;
             br.write(vol_reg, 0x0F);
@@ -1017,8 +1012,42 @@ fn setup_playback(
     }
 
     // Clear writes and install play trampoline for PSID
+    //
+    // For PSID with speed bit set (CIA timing), read the CIA1 Timer A latch
+    // that the tune programmed during INIT. This tells us the intended
+    // play call rate. Many 2SID tunes use ~100Hz (2× frame rate).
     let engine = match engine {
         PlayEngine::Psid(mut cpu) => {
+            // Check if this song uses CIA timing
+            let song_idx = song.saturating_sub(1) as u32;
+            let speed_bit = if song_idx < 32 {
+                (header.speed >> song_idx) & 1
+            } else {
+                (header.speed >> 31) & 1
+            };
+
+            if speed_bit == 1 && !header.is_rsid {
+                let cia_latch = cpu.memory.cia1.timer_a.latch as u64;
+                if cia_latch > 0 && cia_latch < 0xFFFF {
+                    let clock = if header.is_pal { 985248u64 } else { 1022727u64 };
+                    let cia_us = (cia_latch * 1_000_000) / clock;
+                    let cia_hz = clock as f64 / cia_latch as f64;
+                    eprintln!(
+                        "[phosphor] CIA timing: latch={} cycles = {}µs ({:.1}Hz)",
+                        cia_latch, cia_us, cia_hz,
+                    );
+                    // Override frame timing to match CIA rate
+                    if cia_us > 0 && cia_us < frame_us {
+                        frame_us = cia_us;
+                        cycles_per_frame = cia_latch as u32;
+                        eprintln!(
+                            "[phosphor] Frame rate adjusted to {}µs ({:.1}Hz) from CIA timer",
+                            frame_us, cia_hz,
+                        );
+                    }
+                }
+            }
+
             cpu.memory.clear_writes();
             if header.play_address != 0 {
                 cpu.memory
@@ -1032,6 +1061,12 @@ fn setup_playback(
         }
         n @ PlayEngine::Native { .. } => n,
     };
+
+    // If CIA timing adjusted cycles_per_frame, tell the device
+    // so flush() generates the correct amount of audio.
+    if let Some(ref mut br) = bridge {
+        br.set_cycles_per_frame(cycles_per_frame);
+    }
 
     PlayContext {
         engine,
