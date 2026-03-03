@@ -115,7 +115,7 @@ impl SidDevice for BridgeDevice {
             return;
         }
 
-        let mut buf = Vec::with_capacity(writes.len() * 5 + 1);
+        let mut buf = Vec::with_capacity(writes.len() * 5);
         for &(cycles, reg, val) in writes {
             buf.push(CMD_RING);
             buf.push(reg);
@@ -123,7 +123,7 @@ impl SidDevice for BridgeDevice {
             buf.push((cycles >> 8) as u8);
             buf.push((cycles & 0xFF) as u8);
         }
-        buf.push(CMD_FLUSH);
+        // No CMD_FLUSH here — the player loop calls flush() after this.
 
         let _ = self.stream.write_all(&buf);
         let _ = self.stream.flush();

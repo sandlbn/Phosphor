@@ -97,6 +97,9 @@ pub enum Message {
     // File drag & drop
     FileDropped(PathBuf),
 
+    // Window
+    WindowResized(f32, f32),
+
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,
@@ -115,7 +118,15 @@ pub fn track_info_bar<'a>(
     visualizer: &'a Visualizer,
     is_now_playing_favorite: bool,
     has_track: bool,
+    window_width: f32,
 ) -> Element<'a, Message> {
+    let compact = window_width < 760.0;
+    let title_size: f32 = if compact { 15.0 } else { 18.0 };
+    let author_size: f32 = if compact { 12.0 } else { 14.0 };
+    let extra_size: f32 = if compact { 10.0 } else { 12.0 };
+    let vis_width: f32 = if compact { 200.0 } else { 300.0 };
+    let vis_height: f32 = if compact { 48.0 } else { 60.0 };
+
     let (title, author, extra) = match &status.track_info {
         Some(info) => (
             info.name.as_str(),
@@ -140,9 +151,13 @@ pub fn track_info_bar<'a>(
     };
 
     let mut info_col = column![
-        text(format!("{state_icon}  {title}")).size(18),
-        text(author).size(14).color(Color::from_rgb(0.6, 0.7, 0.8)),
-        text(extra).size(12).color(Color::from_rgb(0.5, 0.5, 0.6)),
+        text(format!("{state_icon}  {title}")).size(title_size),
+        text(author)
+            .size(author_size)
+            .color(Color::from_rgb(0.6, 0.7, 0.8)),
+        text(extra)
+            .size(extra_size)
+            .color(Color::from_rgb(0.5, 0.5, 0.6)),
     ]
     .spacing(2)
     .width(Length::Fill);
@@ -200,8 +215,8 @@ pub fn track_info_bar<'a>(
         info_col,
         now_playing_buttons,
         container(vis)
-            .width(Length::Fixed(300.0))
-            .height(Length::Fixed(60.0)),
+            .width(Length::Fixed(vis_width))
+            .height(Length::Fixed(vis_height)),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -285,32 +300,70 @@ pub fn progress_bar<'a>(
 }
 
 /// Build the transport controls bar.
+/// Wraps to two rows when `window_width` is below the compact threshold.
 pub fn controls_bar<'a>(
     status: &PlayerStatus,
     playlist: &Playlist,
     new_version: Option<&crate::version_check::NewVersionInfo>,
+    window_width: f32,
 ) -> Element<'a, Message> {
+    let compact = window_width < 760.0;
+    let btn_size: f32 = if compact { 11.0 } else { 12.0 };
+    let btn_pad: u16 = if compact { 3 } else { 4 };
+    let bar_pad: u16 = if compact { 4 } else { 6 };
+
     let play_label = match status.state {
         PlayState::Playing => "❚❚",
         _ => "▶",
     };
 
+    let small_button = |label: &'a str, msg: Message| -> Element<'a, Message> {
+        button(text(label).size(btn_size))
+            .on_press(msg)
+            .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+            .style(|_theme: &Theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                    button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                    _ => Color::from_rgb(0.18, 0.19, 0.22),
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: Color::from_rgb(0.8, 0.82, 0.88),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.25, 0.27, 0.30),
+                    },
+                    ..Default::default()
+                }
+            })
+            .into()
+    };
+
+    let sep = || -> Element<'a, Message> {
+        text(" │ ")
+            .size(btn_size)
+            .color(Color::from_rgb(0.3, 0.3, 0.35))
+            .into()
+    };
+
     let transport = row![
-        tool_button("◄◄", Message::PrevTrack),
-        tool_button(play_label, Message::PlayPause),
-        tool_button("■", Message::Stop),
-        tool_button("►►", Message::NextTrack),
+        small_button("◄◄", Message::PrevTrack),
+        small_button(play_label, Message::PlayPause),
+        small_button("■", Message::Stop),
+        small_button("►►", Message::NextTrack),
     ]
     .spacing(4);
 
     let subtune_controls = row![
-        tool_button("◄ tune", Message::PrevSubtune),
-        tool_button("tune ►", Message::NextSubtune),
+        small_button("◄ tune", Message::PrevSubtune),
+        small_button("tune ►", Message::NextSubtune),
     ]
     .spacing(4);
 
     let mode_controls = row![
-        tool_button(
+        small_button(
             if playlist.shuffle {
                 "🔀 On"
             } else {
@@ -318,54 +371,105 @@ pub fn controls_bar<'a>(
             },
             Message::ToggleShuffle,
         ),
-        tool_button(playlist.repeat.label(), Message::CycleRepeat,),
+        small_button(playlist.repeat.label(), Message::CycleRepeat),
     ]
     .spacing(4);
 
-    let playlist_controls = row![
-        tool_button("+ Files", Message::AddFiles),
-        tool_button("+ Folder", Message::AddFolder),
-        tool_button("📂 Open", Message::LoadPlaylist),
-        tool_button("💾 Save", Message::SavePlaylist),
-        tool_button("🗑 Clear", Message::ClearPlaylist),
-        tool_button("⚙", Message::ToggleSettings),
-    ]
-    .spacing(4);
+    let playlist_controls = if compact {
+        row![
+            small_button("+Files", Message::AddFiles),
+            small_button("+Dir", Message::AddFolder),
+            small_button("📂", Message::LoadPlaylist),
+            small_button("💾", Message::SavePlaylist),
+            small_button("🗑", Message::ClearPlaylist),
+            small_button("⚙", Message::ToggleSettings),
+        ]
+        .spacing(3)
+    } else {
+        row![
+            small_button("+ Files", Message::AddFiles),
+            small_button("+ Folder", Message::AddFolder),
+            small_button("📂 Open", Message::LoadPlaylist),
+            small_button("💾 Save", Message::SavePlaylist),
+            small_button("🗑 Clear", Message::ClearPlaylist),
+            small_button("⚙", Message::ToggleSettings),
+        ]
+        .spacing(4)
+    };
 
-    let mut bar = row![
-        transport,
-        text(" │ ").color(Color::from_rgb(0.3, 0.3, 0.35)),
-        subtune_controls,
-        text(" │ ").color(Color::from_rgb(0.3, 0.3, 0.35)),
-        mode_controls,
-        Space::new().width(Length::Fill),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .padding(Padding::from([6, 16]));
+    let bar: Element<'a, Message> = if compact {
+        // Two-row layout for narrow windows
+        let top_row = row![transport, sep(), subtune_controls, sep(), mode_controls,]
+            .spacing(6)
+            .align_y(Alignment::Center);
 
-    // Show update badge if new version is available
-    if let Some(info) = new_version {
-        let badge = button(
-            text(format!("⬆ {}", info.version))
-                .size(12)
-                .color(Color::from_rgb(0.1, 0.1, 0.12)),
-        )
-        .on_press(Message::OpenUpdateUrl)
-        .padding(Padding::from([3, 8]))
-        .style(|_theme: &Theme, _status| button::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
-            text_color: Color::from_rgb(0.1, 0.1, 0.12),
-            border: iced::Border {
-                radius: 4.0.into(),
+        let mut bottom_row = row![Space::new().width(Length::Fill),]
+            .spacing(4)
+            .align_y(Alignment::Center);
+
+        if let Some(info) = new_version {
+            let badge = button(
+                text(format!("⬆ {}", info.version))
+                    .size(11)
+                    .color(Color::from_rgb(0.1, 0.1, 0.12)),
+            )
+            .on_press(Message::OpenUpdateUrl)
+            .padding(Padding::from([2, 6]))
+            .style(|_theme: &Theme, _status| button::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
+                text_color: Color::from_rgb(0.1, 0.1, 0.12),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        });
-        bar = bar.push(badge);
-    }
+            });
+            bottom_row = bottom_row.push(badge);
+        }
 
-    bar = bar.push(playlist_controls);
+        bottom_row = bottom_row.push(playlist_controls);
+
+        column![top_row, bottom_row]
+            .spacing(4)
+            .padding(Padding::from([bar_pad, 12]))
+            .into()
+    } else {
+        // Single-row layout for wide windows
+        let mut bar_row = row![
+            transport,
+            sep(),
+            subtune_controls,
+            sep(),
+            mode_controls,
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        if let Some(info) = new_version {
+            let badge = button(
+                text(format!("⬆ {}", info.version))
+                    .size(12)
+                    .color(Color::from_rgb(0.1, 0.1, 0.12)),
+            )
+            .on_press(Message::OpenUpdateUrl)
+            .padding(Padding::from([3, 8]))
+            .style(|_theme: &Theme, _status| button::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
+                text_color: Color::from_rgb(0.1, 0.1, 0.12),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            bar_row = bar_row.push(badge);
+        }
+
+        bar_row = bar_row.push(playlist_controls);
+
+        bar_row.padding(Padding::from([bar_pad, 16])).into()
+    };
 
     container(bar)
         .width(Length::Fill)
