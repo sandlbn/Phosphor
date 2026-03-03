@@ -85,6 +85,8 @@ struct App {
     favorites: FavoritesDb,
     /// Whether to show only favorite tunes.
     favorites_only: bool,
+    /// Current window width for responsive layout.
+    window_width: f32,
 }
 
 impl App {
@@ -214,6 +216,7 @@ impl App {
             new_version: None,
             favorites,
             favorites_only: false,
+            window_width: 900.0,
         };
 
         // Fire a background version check
@@ -828,6 +831,10 @@ impl App {
                 }
             }
 
+            Message::WindowResized(w, _h) => {
+                self.window_width = w;
+            }
+
             Message::None => {}
         }
 
@@ -847,8 +854,14 @@ impl App {
             &self.visualizer,
             is_now_playing_fav,
             has_track,
+            self.window_width,
         );
-        let controls = ui::controls_bar(&self.status, &self.playlist, self.new_version.as_ref());
+        let controls = ui::controls_bar(
+            &self.status,
+            &self.playlist,
+            self.new_version.as_ref(),
+            self.window_width,
+        );
 
         // Progress bar: get current track duration
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
@@ -928,16 +941,18 @@ impl App {
         // Tick at ~30 Hz for smooth visualisation + status polling.
         let tick = time::every(Duration::from_millis(33)).map(|_| Message::Tick);
 
-        // Listen for file-drop events from the OS.
-        let file_drop = event::listen_with(|event, _status, _id| {
-            if let iced::Event::Window(iced::window::Event::FileDropped(path)) = event {
+        // Listen for file-drop and window-resize events from the OS.
+        let window_events = event::listen_with(|event, _status, _id| match event {
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
-            } else {
-                None
             }
+            iced::Event::Window(iced::window::Event::Resized(size)) => {
+                Some(Message::WindowResized(size.width, size.height))
+            }
+            _ => None,
         });
 
-        Subscription::batch([tick, file_drop])
+        Subscription::batch([tick, window_events])
     }
 
     fn theme(&self) -> Theme {
