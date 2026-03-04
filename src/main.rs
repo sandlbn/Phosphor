@@ -5,6 +5,7 @@ mod c64_emu;
 mod config;
 mod player;
 mod playlist;
+mod recently_played;
 mod sid_device;
 mod ui;
 mod version_check;
@@ -31,6 +32,7 @@ use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 use config::{Config, FavoritesDb};
 use player::{PlayState, PlayerCmd, PlayerStatus};
 use playlist::{Playlist, SonglengthDb};
+use recently_played::RecentlyPlayed;
 use ui::visualizer::Visualizer;
 use ui::{Message, SortColumn, SortDirection};
 
@@ -92,6 +94,11 @@ struct App {
     favorites_only: bool,
     /// Current window width for responsive layout.
     window_width: f32,
+
+    /// Recently played history.
+    recently_played: RecentlyPlayed,
+    /// Whether the recently played panel is visible instead of the playlist.
+    show_recently_played: bool,
 }
 
 impl App {
@@ -193,6 +200,7 @@ impl App {
         };
 
         let favorites = FavoritesDb::load();
+        let recently_played = RecentlyPlayed::load();
 
         let app = Self {
             cmd_tx,
@@ -224,6 +232,8 @@ impl App {
             favorites,
             favorites_only: false,
             window_width: 900.0,
+            recently_played,
+            show_recently_played: false,
         };
 
         // Fire a background version check
@@ -632,9 +642,62 @@ impl App {
                 self.rebuild_filter();
             }
 
+            // ── Recently played ───────────────────────────────────────────
+            Message::ShowRecentlyPlayed => {
+                // Toggle the panel; close settings if open
+                self.show_recently_played = !self.show_recently_played;
+                if self.show_recently_played {
+                    self.show_settings = false;
+                }
+            }
+
+            Message::PlayRecentEntry(i) => {
+                // Find the entry in the current playlist by MD5 and play it,
+                // or if not present just load it directly from its path.
+                if let Some(recent_entry) = self.recently_played.entries.get(i).cloned() {
+                    // Try to find in current playlist first
+                    let playlist_idx = self
+                        .playlist
+                        .entries
+                        .iter()
+                        .position(|e| e.md5.as_deref() == Some(recent_entry.md5.as_str()));
+
+                    if let Some(idx) = playlist_idx {
+                        // Found in playlist — play it normally
+                        self.show_recently_played = false;
+                        self.play_track(idx);
+                    } else {
+                        // Not in current playlist — add it then play
+                        if recent_entry.path.exists() {
+                            let paths = vec![recent_entry.path.clone()];
+                            let pg = self.loading_progress.clone();
+                            self.show_recently_played = false;
+                            return Task::perform(
+                                async move { playlist::parse_files(paths, pg) },
+                                Message::FilesLoaded,
+                            );
+                        } else {
+                            eprintln!(
+                                "[phosphor] Recent entry path no longer exists: {}",
+                                recent_entry.path.display()
+                            );
+                        }
+                    }
+                }
+            }
+
+            Message::ClearRecentlyPlayed => {
+                self.recently_played = RecentlyPlayed::default();
+                self.recently_played.save();
+                eprintln!("[phosphor] Recently played history cleared");
+            }
+
             // ── Settings ─────────────────────────────────────────────────
             Message::ToggleSettings => {
                 self.show_settings = !self.show_settings;
+                if self.show_settings {
+                    self.show_recently_played = false;
+                }
             }
 
             Message::ToggleSkipRsid => {
@@ -888,6 +951,7 @@ impl App {
             &self.playlist,
             self.new_version.as_ref(),
             self.window_width,
+            self.show_recently_played,
         );
 
         // Progress bar: get current track duration
@@ -909,6 +973,29 @@ impl App {
                 controls,
                 rule::horizontal(1),
                 settings,
+            ];
+
+            container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+                    ..Default::default()
+                })
+                .into()
+        } else if self.show_recently_played {
+            // Recently played panel
+            let current_md5 = self.playlist.current_entry().and_then(|e| e.md5.as_deref());
+
+            let recent_panel = ui::recently_played_view(&self.recently_played, current_md5);
+
+            let content = column![
+                info_bar,
+                progress,
+                rule::horizontal(1),
+                controls,
+                rule::horizontal(1),
+                recent_panel,
             ];
 
             container(content)
@@ -1008,6 +1095,18 @@ impl App {
                     let _ = self.cmd_tx.send(PlayerCmd::Stop);
                 }
                 return;
+            }
+
+            // Record in recently played history before playing
+            if let Some(ref md5) = entry.md5 {
+                self.recently_played.record(
+                    md5,
+                    &entry.title,
+                    &entry.author,
+                    &entry.released,
+                    &entry.path,
+                );
+                self.recently_played.save();
             }
 
             self.playlist.current = Some(idx);
