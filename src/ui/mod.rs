@@ -19,6 +19,46 @@ pub fn playlist_scrollable_id() -> iced::widget::Id {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Sort state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which column the playlist is currently sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+    Index, // original load order (#)
+    Title,
+    Author,
+    Released,
+    Duration,
+    SidType, // PSID / RSID
+    NumSids,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub fn flip(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+
+    /// Arrow indicator shown in the header.
+    pub fn arrow(self) -> &'static str {
+        match self {
+            Self::Ascending => " ▲",
+            Self::Descending => " ▼",
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Messages
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -56,6 +96,9 @@ pub enum Message {
     // Search / filter
     SearchChanged(String),
     ClearSearch,
+
+    // Sort
+    SortBy(SortColumn),
 
     // Player status tick
     Tick,
@@ -607,22 +650,70 @@ pub fn playlist_view<'a>(
     selected: Option<usize>,
     filtered_indices: &[usize],
     favorites: &FavoritesDb,
+    sort_col: SortColumn,
+    sort_dir: SortDirection,
 ) -> Element<'a, Message> {
-    // Column headers
-    let header = playlist_row_view(
-        "♥".into(),
-        "#".into(),
-        "Title".into(),
-        "Author".into(),
-        "Released".into(),
-        "Time".into(),
-        "Type".into(),
-        "SIDs".into(),
-        true,
-        false,
-        false,
-        false,
-    );
+    // Helper: clickable column header button.
+    // Highlights the active sort column and shows a ▲/▼ arrow.
+    let header_btn = move |label: &'static str, col: SortColumn| -> Element<'a, Message> {
+        let is_active = sort_col == col;
+        let display: String = if is_active {
+            format!("{}{}", label, sort_dir.arrow())
+        } else {
+            label.to_string()
+        };
+        let text_color = if is_active {
+            Color::from_rgb(0.75, 0.88, 1.0)
+        } else {
+            Color::from_rgb(0.5, 0.5, 0.6)
+        };
+        button(text(display).size(11).color(text_color))
+            .on_press(Message::SortBy(col))
+            .padding(Padding::from([2, 4]))
+            .style(|_theme: &Theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
+                        1.0, 1.0, 1.0, 0.06,
+                    ))),
+                    _ => None,
+                };
+                button::Style {
+                    background: bg,
+                    text_color: Color::WHITE,
+                    border: iced::Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .into()
+    };
+
+    // Header row — widths must mirror playlist_row_content exactly
+    let header_row = row![
+        text("♥")
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .width(Length::Fixed(22.0)),
+        container(header_btn("#", SortColumn::Index)).width(Length::Fixed(50.0)),
+        container(header_btn("Title", SortColumn::Title)).width(Length::FillPortion(4)),
+        container(header_btn("Author", SortColumn::Author)).width(Length::FillPortion(3)),
+        container(header_btn("Released", SortColumn::Released)).width(Length::FillPortion(2)),
+        container(header_btn("Time", SortColumn::Duration)).width(Length::Fixed(55.0)),
+        container(header_btn("Type", SortColumn::SidType)).width(Length::Fixed(42.0)),
+        container(header_btn("SIDs", SortColumn::NumSids)).width(Length::Fixed(45.0)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([4, 16]));
+
+    let header = container(header_row)
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.15))),
+            ..Default::default()
+        });
 
     let mut rows = Column::new()
         .spacing(0)
@@ -641,7 +732,7 @@ pub fn playlist_view<'a>(
                 .center_x(Length::Fill),
         );
     } else {
-        for &actual_idx in filtered_indices {
+        for (display_pos, &actual_idx) in filtered_indices.iter().enumerate() {
             if let Some(entry) = playlist.entries.get(actual_idx) {
                 let is_current = playlist.current == Some(actual_idx);
                 let is_selected = selected == Some(actual_idx);
@@ -650,7 +741,15 @@ pub fn playlist_view<'a>(
                     .as_ref()
                     .map(|m| favorites.is_favorite(m))
                     .unwrap_or(false);
-                let row_el = playlist_entry_row(actual_idx, entry, is_current, is_selected, is_fav);
+                // display_pos+1 so row numbers follow sorted order, not original index
+                let row_el = playlist_entry_row(
+                    actual_idx,
+                    display_pos + 1,
+                    entry,
+                    is_current,
+                    is_selected,
+                    is_fav,
+                );
                 rows = rows.push(row_el);
             }
         }
@@ -665,6 +764,7 @@ pub fn playlist_view<'a>(
 
 fn playlist_entry_row<'a>(
     idx: usize,
+    display_pos: usize,
     entry: &crate::playlist::PlaylistEntry,
     is_current: bool,
     is_selected: bool,
@@ -726,7 +826,7 @@ fn playlist_entry_row<'a>(
         });
 
     let row_content = playlist_row_content(
-        format!("{}", idx + 1),
+        format!("{}", display_pos),
         song_title,
         entry.author.clone(),
         entry.released.clone(),
@@ -821,102 +921,6 @@ fn playlist_row_content<'a>(
     .align_y(Alignment::Center)
     .padding(Padding::from([4, 4]))
     .into()
-}
-
-fn playlist_row_view<'a>(
-    heart: String,
-    num: String,
-    title: String,
-    author: String,
-    released: String,
-    time: String,
-    sid_type: String,
-    sids: String,
-    is_header: bool,
-    is_current: bool,
-    is_selected: bool,
-    _is_favorite: bool,
-) -> Element<'a, Message> {
-    let size = if is_header { 11 } else { 13 };
-    let color = if is_header {
-        Color::from_rgb(0.5, 0.5, 0.6)
-    } else if is_current {
-        Color::from_rgb(0.35, 0.85, 0.55)
-    } else {
-        Color::from_rgb(0.78, 0.80, 0.84)
-    };
-
-    let type_color = if is_header {
-        color
-    } else if sid_type == "RSID" {
-        Color::from_rgb(0.9, 0.65, 0.35)
-    } else {
-        Color::from_rgb(0.5, 0.75, 0.9)
-    };
-
-    let bg = if is_selected {
-        Some(iced::Background::Color(Color::from_rgba(
-            0.3, 0.5, 0.8, 0.2,
-        )))
-    } else if is_current {
-        Some(iced::Background::Color(Color::from_rgba(
-            0.2, 0.6, 0.4, 0.1,
-        )))
-    } else {
-        None
-    };
-
-    let indicator = if is_current && !is_header {
-        "▶ "
-    } else {
-        "  "
-    };
-
-    let r = row![
-        text(heart)
-            .size(size)
-            .color(color)
-            .width(Length::Fixed(22.0)),
-        text(format!("{indicator}{num:>3}"))
-            .size(size)
-            .color(color)
-            .width(Length::Fixed(50.0)),
-        text(title)
-            .size(size)
-            .color(color)
-            .width(Length::FillPortion(4)),
-        text(author)
-            .size(size)
-            .color(color)
-            .width(Length::FillPortion(3)),
-        text(released)
-            .size(size)
-            .color(color)
-            .width(Length::FillPortion(2)),
-        text(time)
-            .size(size)
-            .color(color)
-            .width(Length::Fixed(55.0)),
-        text(sid_type)
-            .size(size)
-            .color(type_color)
-            .width(Length::Fixed(42.0)),
-        text(sids)
-            .size(size)
-            .color(color)
-            .width(Length::Fixed(45.0)),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .padding(Padding::from([4, 16]));
-
-    container(r)
-        .width(Length::Fill)
-        .style(move |_theme: &Theme| container::Style {
-            background: bg,
-            ..Default::default()
-        })
-        .into()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
