@@ -32,7 +32,7 @@ use config::{Config, FavoritesDb};
 use player::{PlayState, PlayerCmd, PlayerStatus};
 use playlist::{Playlist, SonglengthDb};
 use ui::visualizer::Visualizer;
-use ui::Message;
+use ui::{Message, SortColumn, SortDirection};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Application state
@@ -59,6 +59,11 @@ struct App {
     search_text: String,
     /// Indices into playlist.entries that match the current search.
     filtered_indices: Vec<usize>,
+
+    /// Active sort column.
+    sort_column: SortColumn,
+    /// Active sort direction.
+    sort_direction: SortDirection,
 
     /// Persistent configuration.
     config: Config,
@@ -206,6 +211,8 @@ impl App {
             songlength_db,
             search_text: String::new(),
             filtered_indices,
+            sort_column: SortColumn::Index,
+            sort_direction: SortDirection::Ascending,
             config,
             show_settings: false,
             default_length_text,
@@ -592,16 +599,36 @@ impl App {
             // ── Search / filter ───────────────────────────────────────
             Message::SearchChanged(query) => {
                 self.search_text = query;
-                self.filtered_indices = ui::filter_playlist(
+                let mut indices = ui::filter_playlist(
                     &self.playlist,
                     &self.search_text,
                     self.favorites_only,
                     &self.favorites,
                 );
+                sort_indices(
+                    &self.playlist,
+                    &mut indices,
+                    self.sort_column,
+                    self.sort_direction,
+                );
+                self.filtered_indices = indices;
             }
 
             Message::ClearSearch => {
                 self.search_text.clear();
+                self.rebuild_filter();
+            }
+
+            // ── Sort ─────────────────────────────────────────────────────
+            Message::SortBy(col) => {
+                if self.sort_column == col {
+                    // Same column — flip direction
+                    self.sort_direction = self.sort_direction.flip();
+                } else {
+                    // New column — reset to ascending
+                    self.sort_column = col;
+                    self.sort_direction = SortDirection::Ascending;
+                }
                 self.rebuild_filter();
             }
 
@@ -908,11 +935,13 @@ impl App {
                 &loading_status,
             );
 
-            let playlist = ui::playlist_view(
+            let playlist_widget = ui::playlist_view(
                 &self.playlist,
                 self.selected,
                 &self.filtered_indices,
                 &self.favorites,
+                self.sort_column,
+                self.sort_direction,
             );
 
             let content = column![
@@ -923,7 +952,7 @@ impl App {
                 rule::horizontal(1),
                 search,
                 rule::horizontal(1),
-                playlist,
+                playlist_widget,
             ];
 
             container(content)
@@ -1095,14 +1124,72 @@ impl App {
     }
 
     fn rebuild_filter(&mut self) {
-        self.filtered_indices = ui::filter_playlist(
+        let mut indices = ui::filter_playlist(
             &self.playlist,
             &self.search_text,
             self.favorites_only,
             &self.favorites,
         );
+        sort_indices(
+            &self.playlist,
+            &mut indices,
+            self.sort_column,
+            self.sort_direction,
+        );
+        self.filtered_indices = indices;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Sort helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn sort_indices(
+    playlist: &Playlist,
+    indices: &mut Vec<usize>,
+    col: SortColumn,
+    dir: SortDirection,
+) {
+    indices.sort_by(|&a, &b| {
+        let ea = &playlist.entries[a];
+        let eb = &playlist.entries[b];
+
+        let ord = match col {
+            SortColumn::Index => a.cmp(&b),
+
+            SortColumn::Title => ea.title.to_lowercase().cmp(&eb.title.to_lowercase()),
+
+            SortColumn::Author => ea.author.to_lowercase().cmp(&eb.author.to_lowercase()),
+
+            SortColumn::Released => ea.released.to_lowercase().cmp(&eb.released.to_lowercase()),
+
+            SortColumn::Duration => match (ea.duration_secs, eb.duration_secs) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater, // unknowns sort last
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(da), Some(db)) => da.cmp(&db),
+            },
+
+            SortColumn::SidType =>
+            // false (PSID) < true (RSID), so ascending puts PSID first
+            {
+                ea.is_rsid.cmp(&eb.is_rsid)
+            }
+
+            SortColumn::NumSids => ea.num_sids.cmp(&eb.num_sids),
+        };
+
+        if dir == SortDirection::Descending {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Playlist helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Apply a default song length to all playlist entries that have no duration.
 fn apply_default_length(playlist: &mut Playlist, default_secs: u32) {
