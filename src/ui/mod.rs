@@ -11,11 +11,17 @@ use iced::{Alignment, Color, Element, Length, Padding, Theme};
 use crate::config::{Config, FavoritesDb};
 use crate::player::{PlayState, PlayerStatus};
 use crate::playlist::Playlist;
+use crate::recently_played::{format_played_at, RecentlyPlayed};
 use visualizer::Visualizer;
 
 /// Fixed scrollable ID for the playlist widget.
 pub fn playlist_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-playlist")
+}
+
+/// Fixed scrollable ID for the recently played widget.
+pub fn recent_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("phosphor-recent")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +105,11 @@ pub enum Message {
 
     // Sort
     SortBy(SortColumn),
+
+    // Recently played
+    ShowRecentlyPlayed,
+    PlayRecentEntry(usize),
+    ClearRecentlyPlayed,
 
     // Player status tick
     Tick,
@@ -349,6 +360,7 @@ pub fn controls_bar<'a>(
     playlist: &Playlist,
     new_version: Option<&crate::version_check::NewVersionInfo>,
     window_width: f32,
+    show_recently_played: bool,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let btn_size: f32 = if compact { 11.0 } else { 12.0 };
@@ -418,6 +430,46 @@ pub fn controls_bar<'a>(
     ]
     .spacing(4);
 
+    // Recently played tab button — highlighted when active
+    let recent_btn: Element<'a, Message> =
+        button(text(if compact { "🕐" } else { "🕐 Recent" }).size(btn_size))
+            .on_press(Message::ShowRecentlyPlayed)
+            .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+            .style(move |_theme: &Theme, status| {
+                let bg = if show_recently_played {
+                    match status {
+                        button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
+                        button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
+                        _ => Color::from_rgb(0.16, 0.25, 0.40),
+                    }
+                } else {
+                    match status {
+                        button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                        button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                        _ => Color::from_rgb(0.18, 0.19, 0.22),
+                    }
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: if show_recently_played {
+                        Color::from_rgb(0.55, 0.80, 1.0)
+                    } else {
+                        Color::from_rgb(0.8, 0.82, 0.88)
+                    },
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: if show_recently_played {
+                            Color::from_rgb(0.3, 0.45, 0.7)
+                        } else {
+                            Color::from_rgb(0.25, 0.27, 0.30)
+                        },
+                    },
+                    ..Default::default()
+                }
+            })
+            .into();
+
     let playlist_controls = if compact {
         row![
             small_button("+Files", Message::AddFiles),
@@ -425,6 +477,7 @@ pub fn controls_bar<'a>(
             small_button("📂", Message::LoadPlaylist),
             small_button("💾", Message::SavePlaylist),
             small_button("🗑", Message::ClearPlaylist),
+            recent_btn,
             small_button("⚙", Message::ToggleSettings),
         ]
         .spacing(3)
@@ -435,6 +488,7 @@ pub fn controls_bar<'a>(
             small_button("📂 Open", Message::LoadPlaylist),
             small_button("💾 Save", Message::SavePlaylist),
             small_button("🗑 Clear", Message::ClearPlaylist),
+            recent_btn,
             small_button("⚙", Message::ToggleSettings),
         ]
         .spacing(4)
@@ -757,6 +811,162 @@ pub fn playlist_view<'a>(
 
     scrollable(rows)
         .id(playlist_scrollable_id())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Build the recently played panel.
+pub fn recently_played_view<'a>(
+    recent: &'a RecentlyPlayed,
+    current_md5: Option<&'a str>,
+) -> Element<'a, Message> {
+    // Header row
+    let header_row = row![
+        text("#")
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .width(Length::Fixed(40.0)),
+        text("Title")
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .width(Length::FillPortion(4)),
+        text("Author")
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .width(Length::FillPortion(3)),
+        text("Released")
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .width(Length::FillPortion(2)),
+        text("Played")
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .width(Length::Fixed(110.0)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([4, 16]));
+
+    let header = container(header_row)
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.15))),
+            ..Default::default()
+        });
+
+    // Toolbar: count + clear button
+    let toolbar = {
+        let count_label = text(format!("🕐  {} recently played tracks", recent.len()))
+            .size(12)
+            .color(Color::from_rgb(0.55, 0.80, 1.0));
+
+        let clear_btn = tool_button("🗑 Clear history", Message::ClearRecentlyPlayed);
+
+        container(
+            row![count_label, Space::new().width(Length::Fill), clear_btn,]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding(Padding::from([6, 16])),
+        )
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
+            ..Default::default()
+        })
+    };
+
+    let mut rows = Column::new()
+        .spacing(0)
+        .push(toolbar)
+        .push(header)
+        .push(rule::horizontal(1));
+
+    if recent.is_empty() {
+        rows = rows.push(
+            container(
+                text("No recently played tracks yet — start listening!")
+                    .size(14)
+                    .color(Color::from_rgb(0.4, 0.4, 0.5)),
+            )
+            .padding(40)
+            .center_x(Length::Fill),
+        );
+    } else {
+        for (i, entry) in recent.entries.iter().enumerate() {
+            let is_current = current_md5 == Some(entry.md5.as_str());
+
+            let color = if is_current {
+                Color::from_rgb(0.35, 0.85, 0.55)
+            } else {
+                Color::from_rgb(0.78, 0.80, 0.84)
+            };
+
+            let indicator = if is_current { "▶ " } else { "  " };
+            let played_str = format_played_at(entry.played_at);
+
+            let row_content = row![
+                text(format!("{}{}", indicator, i + 1))
+                    .size(13)
+                    .color(color)
+                    .width(Length::Fixed(40.0)),
+                text(entry.title.clone())
+                    .size(13)
+                    .color(color)
+                    .width(Length::FillPortion(4)),
+                text(entry.author.clone())
+                    .size(13)
+                    .color(color)
+                    .width(Length::FillPortion(3)),
+                text(entry.released.clone())
+                    .size(13)
+                    .color(color)
+                    .width(Length::FillPortion(2)),
+                text(played_str)
+                    .size(12)
+                    .color(Color::from_rgb(0.5, 0.55, 0.65))
+                    .width(Length::Fixed(110.0)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .padding(Padding::from([4, 4]));
+
+            let row_btn = button(row_content)
+                .on_press(Message::PlayRecentEntry(i))
+                .padding(0)
+                .style(move |_theme: &Theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
+                            1.0, 1.0, 1.0, 0.04,
+                        ))),
+                        _ => {
+                            if is_current {
+                                Some(iced::Background::Color(Color::from_rgba(
+                                    0.2, 0.6, 0.4, 0.1,
+                                )))
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    button::Style {
+                        background: bg,
+                        text_color: Color::WHITE,
+                        ..Default::default()
+                    }
+                })
+                .width(Length::Fill);
+
+            rows = rows.push(
+                container(row_btn)
+                    .width(Length::Fill)
+                    .padding(Padding::from([0, 12])),
+            );
+        }
+    }
+
+    scrollable(rows)
+        .id(recent_scrollable_id())
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

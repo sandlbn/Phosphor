@@ -379,7 +379,7 @@ impl FavoritesDb {
 }
 
 /// Get the application config directory.
-fn config_dir() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     // macOS:   ~/Library/Application Support/phosphor/
     // Linux:   ~/.config/phosphor/
     // Windows: %APPDATA%/phosphor/
