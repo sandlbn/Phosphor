@@ -37,68 +37,85 @@ use ui::visualizer::Visualizer;
 use ui::{Message, SortColumn, SortDirection};
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Context menu state
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    /// The playlist index of the right-clicked row.
+    track_idx: usize,
+    /// Absolute pixel position where the menu should appear.
+    x: f32,
+    y: f32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Application state
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct App {
     /// Channel to send commands to the player thread.
     cmd_tx: Sender<PlayerCmd>,
-    /// Channel to receive status from the player thread.
+    /// Channel to receive status updates from the player thread.
     status_rx: Receiver<PlayerStatus>,
-    /// Last known player status.
+    /// Last known player status (state, elapsed time, voice levels, …).
     status: PlayerStatus,
 
-    /// Playlist model.
+    /// Playlist model — entries, current index, shuffle/repeat state.
     playlist: Playlist,
-    /// Selected row in playlist (not necessarily playing).
+    /// Row highlighted by keyboard / single-click (not necessarily playing).
     selected: Option<usize>,
-    /// Visualiser state.
+    /// Oscilloscope / bar visualiser driven by voice-level data.
     visualizer: Visualizer,
-    /// Songlength database (loaded on demand).
+    /// HVSC Songlength database, loaded on demand.
     songlength_db: Option<SonglengthDb>,
 
-    /// Current search / filter query.
+    /// Current text in the search box.
     search_text: String,
-    /// Indices into playlist.entries that match the current search.
+    /// Indices into `playlist.entries` that pass the current search + sort.
     filtered_indices: Vec<usize>,
 
-    /// Active sort column.
+    /// Which column the playlist is currently sorted by.
     sort_column: SortColumn,
-    /// Active sort direction.
+    /// Ascending or descending sort direction.
     sort_direction: SortDirection,
 
-    /// Persistent configuration.
+    /// Persistent application configuration (saved to disk on every change).
     config: Config,
-    /// Whether the settings panel is visible.
+    /// Whether the settings panel is currently visible.
     show_settings: bool,
-    /// Text in the default song length input field.
+    /// Raw text from the default-song-length input field (may be mid-edit).
     default_length_text: String,
-    /// Status message for songlength download.
+    /// Status message shown below the Songlength download button.
     download_status: String,
 
-    /// Shared progress string for background file loading tasks.
+    /// Shared progress string updated by background file-loading tasks.
     loading_progress: playlist::LoadingProgress,
-
     /// Entries waiting to be processed (chained message pipeline).
     pending_entries: Option<Vec<playlist::PlaylistEntry>>,
 
-    /// Scroll playlist to current track on next tick.
+    /// Scroll playlist to current track on next tick (set when playback starts).
     scroll_to_current: bool,
 
-    /// Available update info (if any).
+    /// Available update info (if any), shown as a badge in the controls bar.
     new_version: Option<version_check::NewVersionInfo>,
 
-    /// Favorites database (MD5 hashes).
+    /// Favorites database (MD5 hashes), persisted to favorites.txt.
     favorites: FavoritesDb,
-    /// Whether to show only favorite tunes.
+    /// Whether to show only favorite tunes in the playlist view.
     favorites_only: bool,
-    /// Current window width for responsive layout.
+    /// Current window width — used for responsive compact/normal layout.
     window_width: f32,
+    /// Current window height — used for context-menu flip-to-fit logic.
+    window_height: f32,
 
-    /// Recently played history.
+    /// Recently played history (last 100 unique tracks).
     recently_played: RecentlyPlayed,
     /// Whether the recently played panel is visible instead of the playlist.
     show_recently_played: bool,
+
+    /// Some(_) when the right-click context menu is visible.
+    context_menu: Option<ContextMenu>,
 }
 
 impl App {
@@ -109,9 +126,6 @@ impl App {
             config.skip_rsid, config.default_song_length_secs, config.output_engine,
         );
 
-        // macOS: if the daemon plist points to a stale binary (e.g. app was
-        // moved or updated), proactively reinstall so the user doesn't hit
-        // a confusing error later when they try to play a tune.
         #[cfg(all(feature = "usb", target_os = "macos"))]
         {
             let eng = config.output_engine.as_str();
@@ -131,7 +145,6 @@ impl App {
 
         let mut playlist = Playlist::new();
 
-        // Load files from CLI args
         let args: Vec<String> = std::env::args().collect();
         for arg in args.iter().skip(1) {
             if arg.starts_with("--") {
@@ -154,13 +167,12 @@ impl App {
                         Err(e) => eprintln!("[phosphor] Failed to load playlist: {e}"),
                     },
                     _ => {
-                        let _ = playlist.add_file(&path); // try anyway
+                        let _ = playlist.add_file(&path);
                     }
                 }
             }
         }
 
-        // Auto-load Songlength.md5 — try remembered path, then config dir, then auto-detect
         let songlength_db = config
             .last_songlength_file
             .as_ref()
@@ -186,8 +198,6 @@ impl App {
         if let Some(ref db) = songlength_db {
             db.apply_to_playlist(&mut playlist);
         }
-
-        // Apply default song length for entries that still have no duration
         if config.default_song_length_secs > 0 {
             apply_default_length(&mut playlist, config.default_song_length_secs);
         }
@@ -202,6 +212,7 @@ impl App {
         let favorites = FavoritesDb::load();
         let recently_played = RecentlyPlayed::load();
         let window_width = config.window_width_saved;
+        let window_height = config.window_height_saved;
 
         let app = Self {
             cmd_tx,
@@ -233,11 +244,12 @@ impl App {
             favorites,
             favorites_only: false,
             window_width,
+            window_height,
             recently_played,
             show_recently_played: false,
+            context_menu: None,
         };
 
-        // Fire a background version check
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let version_task = Task::perform(
             async move { version_check::check_github_release(&current_version).await },
@@ -249,10 +261,103 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            // ── Any interaction dismisses the context menu ────────────────
+            // (handled per-message below where needed; explicit dismiss too)
+            Message::DismissContextMenu => {
+                self.context_menu = None;
+            }
+
+            // ── Context menu actions ──────────────────────────────────────
+            Message::ShowContextMenu(idx, x, y) => {
+                self.context_menu = Some(ContextMenu {
+                    track_idx: idx,
+                    x,
+                    y,
+                });
+                // Also select the row so keyboard actions target the same track
+                self.selected = Some(idx);
+            }
+
+            Message::ContextMenuPlay => {
+                if let Some(cm) = self.context_menu.take() {
+                    self.play_track(cm.track_idx);
+                }
+            }
+
+            Message::ContextMenuRemove => {
+                if let Some(cm) = self.context_menu.take() {
+                    let idx = cm.track_idx;
+                    if self.playlist.current == Some(idx) {
+                        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                    }
+                    self.playlist.remove(idx);
+                    self.selected = if self.playlist.is_empty() {
+                        None
+                    } else {
+                        Some(idx.min(self.playlist.len() - 1))
+                    };
+                    self.rebuild_filter();
+                }
+            }
+
+            Message::ContextMenuMoveToTop => {
+                if let Some(cm) = self.context_menu.take() {
+                    let idx = cm.track_idx;
+                    if idx > 0 && idx < self.playlist.entries.len() {
+                        let entry = self.playlist.entries.remove(idx);
+                        self.playlist.entries.insert(0, entry);
+                        // Fix up current index if it moved
+                        if let Some(cur) = self.playlist.current {
+                            self.playlist.current = Some(if cur == idx {
+                                0
+                            } else if cur < idx {
+                                cur + 1
+                            } else {
+                                cur
+                            });
+                        }
+                        self.selected = Some(0);
+                        self.rebuild_filter();
+                    }
+                }
+            }
+
+            Message::ContextMenuToggleFavorite => {
+                if let Some(cm) = self.context_menu.take() {
+                    if let Some(entry) = self.playlist.entries.get(cm.track_idx) {
+                        if let Some(ref md5) = entry.md5 {
+                            let is_fav = self.favorites.toggle(md5);
+                            self.favorites.save();
+                            eprintln!(
+                                "[phosphor] {} \"{}\" via context menu",
+                                if is_fav {
+                                    "♥ Favorited"
+                                } else {
+                                    "♡ Unfavorited"
+                                },
+                                entry.title,
+                            );
+                            if self.favorites_only {
+                                self.rebuild_filter();
+                            }
+                        }
+                    }
+                }
+            }
+
+            Message::ContextMenuCopyTitle => {
+                if let Some(cm) = self.context_menu.take() {
+                    if let Some(entry) = self.playlist.entries.get(cm.track_idx) {
+                        let title = entry.title.clone();
+                        return iced::clipboard::write(title);
+                    }
+                }
+            }
+
             // ── Transport ────────────────────────────────────────────────
             Message::PlayPause => {
+                self.context_menu = None;
                 if self.status.state == PlayState::Stopped {
-                    // Start playing selected or first track
                     let idx = self.selected.or(Some(0));
                     if let Some(i) = idx {
                         self.play_track(i);
@@ -263,18 +368,20 @@ impl App {
             }
 
             Message::Stop => {
+                self.context_menu = None;
                 let _ = self.cmd_tx.send(PlayerCmd::Stop);
                 self.visualizer.reset();
             }
 
             Message::NextTrack => {
+                self.context_menu = None;
                 if let Some(idx) = self.playlist.next() {
                     self.play_track(idx);
                 }
             }
 
             Message::PrevTrack => {
-                // If more than 3 seconds in, restart. Otherwise prev track.
+                self.context_menu = None;
                 if self.status.elapsed.as_secs() > 3 {
                     if let Some(idx) = self.playlist.current {
                         self.play_track(idx);
@@ -305,8 +412,8 @@ impl App {
 
             // ── Playlist interaction ─────────────────────────────────────
             Message::PlaylistSelect(idx) => {
+                self.context_menu = None;
                 if self.selected == Some(idx) {
-                    // Double-click behaviour: play the selected track
                     self.play_track(idx);
                 } else {
                     self.selected = Some(idx);
@@ -314,20 +421,24 @@ impl App {
             }
 
             Message::PlaylistDoubleClick(idx) => {
+                self.context_menu = None;
                 self.play_track(idx);
             }
 
             Message::AddFiles => {
+                self.context_menu = None;
                 let start_dir = self.config.last_sid_dir.clone();
                 return Task::perform(pick_files(start_dir), Message::FilesChosen);
             }
 
             Message::AddFolder => {
+                self.context_menu = None;
                 let start_dir = self.config.last_sid_dir.clone();
                 return Task::perform(pick_folder(start_dir), Message::FolderChosen);
             }
 
             Message::ClearPlaylist => {
+                self.context_menu = None;
                 let _ = self.cmd_tx.send(PlayerCmd::Stop);
                 self.playlist.clear();
                 self.selected = None;
@@ -336,8 +447,8 @@ impl App {
             }
 
             Message::RemoveSelected => {
+                self.context_menu = None;
                 if let Some(idx) = self.selected {
-                    // If removing currently playing track, stop
                     if self.playlist.current == Some(idx) {
                         let _ = self.cmd_tx.send(PlayerCmd::Stop);
                     }
@@ -353,15 +464,19 @@ impl App {
 
             // ── Modes ────────────────────────────────────────────────────
             Message::ToggleShuffle => {
+                self.context_menu = None;
                 self.playlist.toggle_shuffle();
             }
-
             Message::CycleRepeat => {
+                self.context_menu = None;
                 self.playlist.cycle_repeat();
             }
 
+            // ── Sub-tunes ────────────────────────────────────────────────
+
             // ── Songlength ───────────────────────────────────────────────
             Message::LoadSonglength => {
+                self.context_menu = None;
                 let start_dir = self.config.last_songlength_dir.clone();
                 return Task::perform(
                     pick_songlength_file(start_dir),
@@ -371,10 +486,11 @@ impl App {
 
             // ── Playlist save / load ─────────────────────────────────────
             Message::SavePlaylist => {
+                self.context_menu = None;
                 if self.playlist.is_empty() {
                     return Task::none();
                 }
-                let entries: Vec<(std::path::PathBuf, String, String, Option<u32>)> = self
+                let entries: Vec<(PathBuf, String, String, Option<u32>)> = self
                     .playlist
                     .entries
                     .iter()
@@ -395,6 +511,7 @@ impl App {
             }
 
             Message::LoadPlaylist => {
+                self.context_menu = None;
                 let start_dir = self.config.last_playlist_dir.clone();
                 return Task::perform(pick_playlist_file(start_dir), Message::PlaylistFileChosen);
             }
@@ -404,11 +521,9 @@ impl App {
                 if paths.is_empty() {
                     return Task::none();
                 }
-                // Remember the directory for next time.
                 if let Some(first) = paths.first() {
                     self.config.remember_sid_dir(first);
                 }
-                // Parse SID headers off the UI thread
                 let pg = self.loading_progress.clone();
                 return Task::perform(
                     async move { playlist::parse_files(paths, pg) },
@@ -418,7 +533,6 @@ impl App {
 
             Message::FolderChosen(Some(path)) => {
                 self.config.remember_sid_dir(&path);
-                // Walk + parse off the UI thread
                 let pg = self.loading_progress.clone();
                 return Task::perform(
                     async move { playlist::parse_directory(path, pg) },
@@ -438,7 +552,6 @@ impl App {
                     if let Ok(mut pg) = self.loading_progress.lock() {
                         *pg = format!("⏳ Adding {} tracks…", n);
                     }
-                    // Yield to iced so it can redraw, then continue processing
                     return Task::perform(flush_frame(), |_| Message::ProcessPendingEntries);
                 }
             }
@@ -458,16 +571,14 @@ impl App {
                 }
             }
 
-            // ── Drag & drop ──────────────────────────────────────────────
             Message::FileDropped(path) => {
+                self.context_menu = None;
                 let ext = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-
                 match ext.as_str() {
-                    // SID file → add to playlist
                     "sid" => {
                         self.config.remember_sid_dir(&path);
                         let paths = vec![path];
@@ -477,7 +588,6 @@ impl App {
                             Message::FilesLoaded,
                         );
                     }
-                    // Songlength database
                     "md5" | "txt" => {
                         self.config.remember_songlength_path(&path);
                         match SonglengthDb::load(&path) {
@@ -493,17 +603,10 @@ impl App {
                                 self.songlength_db = Some(db);
                                 self.download_status =
                                     format!("Loaded {} entries from dropped file", count);
-                                eprintln!(
-                                    "[phosphor] Songlength DB loaded via drop: {count} entries"
-                                );
                             }
-                            Err(e) => {
-                                eprintln!("[phosphor] Dropped file failed to load: {e}");
-                                // Not a songlength file — might be a playlist
-                            }
+                            Err(e) => eprintln!("[phosphor] Dropped file failed to load: {e}"),
                         }
                     }
-                    // Playlist files
                     "m3u" | "m3u8" | "pls" => {
                         self.config.remember_playlist_dir(&path);
                         let pg = self.loading_progress.clone();
@@ -513,13 +616,11 @@ impl App {
                         );
                     }
                     _ => {
-                        // Try as a directory (folder drop)
                         if path.is_dir() {
                             self.config.remember_sid_dir(&path);
-                            let dir = path;
                             let pg = self.loading_progress.clone();
                             return Task::perform(
-                                async move { playlist::parse_directory(dir, pg) },
+                                async move { playlist::parse_directory(path, pg) },
                                 Message::FolderLoaded,
                             );
                         }
@@ -533,12 +634,8 @@ impl App {
                     Ok(db) => {
                         db.apply_to_playlist(&mut self.playlist);
                         self.songlength_db = Some(db);
-                        log::info!(
-                            "Songlength DB loaded: {} entries",
-                            self.songlength_db.as_ref().unwrap().entries.len()
-                        );
                     }
-                    Err(e) => log::error!("Failed to load Songlength DB: {e}"),
+                    Err(e) => eprintln!("[phosphor] Failed to load Songlength DB: {e}"),
                 }
             }
             Message::SonglengthFileChosen(None) => {}
@@ -547,13 +644,10 @@ impl App {
                 self.config.remember_playlist_dir(&path);
                 eprintln!("[phosphor] Playlist saved to {}", path.display());
             }
-            Message::PlaylistSaved(Err(e)) => {
-                eprintln!("[phosphor] Save failed: {e}");
-            }
+            Message::PlaylistSaved(Err(e)) => eprintln!("[phosphor] Save failed: {e}"),
 
             Message::PlaylistFileChosen(Some(path)) => {
                 self.config.remember_playlist_dir(&path);
-                // Parse playlist + SID headers off the UI thread
                 let pg = self.loading_progress.clone();
                 return Task::perform(
                     async move { playlist::parse_playlist_file(path, pg) },
@@ -584,7 +678,6 @@ impl App {
                 }
             }
 
-            // ── Chained post-processing (yields between steps for UI redraws) ──
             Message::ProcessPendingEntries => {
                 if let Some(entries) = self.pending_entries.take() {
                     let n = entries.len();
@@ -609,34 +702,23 @@ impl App {
 
             // ── Search / filter ───────────────────────────────────────────
             Message::SearchChanged(query) => {
+                self.context_menu = None;
                 self.search_text = query;
-                let mut indices = ui::filter_playlist(
-                    &self.playlist,
-                    &self.search_text,
-                    self.favorites_only,
-                    &self.favorites,
-                );
-                sort_indices(
-                    &self.playlist,
-                    &mut indices,
-                    self.sort_column,
-                    self.sort_direction,
-                );
-                self.filtered_indices = indices;
+                self.rebuild_filter();
             }
 
             Message::ClearSearch => {
+                self.context_menu = None;
                 self.search_text.clear();
                 self.rebuild_filter();
             }
 
             // ── Sort ──────────────────────────────────────────────────────
             Message::SortBy(col) => {
+                self.context_menu = None;
                 if self.sort_column == col {
-                    // Same column — flip direction
                     self.sort_direction = self.sort_direction.flip();
                 } else {
-                    // New column — reset to ascending
                     self.sort_column = col;
                     self.sort_direction = SortDirection::Ascending;
                 }
@@ -645,60 +727,59 @@ impl App {
 
             // ── Keyboard navigation ───────────────────────────────────────
             Message::SelectNext => {
+                self.context_menu = None;
                 if self.filtered_indices.is_empty() {
                     return Task::none();
                 }
-                // Find position of current selection in filtered list, move down one
-                let current_pos = self
+                let cur = self
                     .selected
-                    .and_then(|sel| self.filtered_indices.iter().position(|&i| i == sel))
+                    .and_then(|s| self.filtered_indices.iter().position(|&i| i == s))
                     .unwrap_or(0);
-                let next_pos = (current_pos + 1).min(self.filtered_indices.len() - 1);
-                self.selected = Some(self.filtered_indices[next_pos]);
-                // Scroll to keep selection visible
+                let next = (cur + 1).min(self.filtered_indices.len() - 1);
+                self.selected = Some(self.filtered_indices[next]);
                 let total = self.filtered_indices.len();
                 if total > 1 {
-                    let fraction = next_pos as f32 / (total - 1) as f32;
                     return iced::widget::operation::snap_to(
                         ui::playlist_scrollable_id(),
                         iced::widget::scrollable::RelativeOffset {
                             x: 0.0,
-                            y: fraction,
+                            y: next as f32 / (total - 1) as f32,
                         },
                     );
                 }
             }
 
             Message::SelectPrev => {
+                self.context_menu = None;
                 if self.filtered_indices.is_empty() {
                     return Task::none();
                 }
-                let current_pos = self
+                let cur = self
                     .selected
-                    .and_then(|sel| self.filtered_indices.iter().position(|&i| i == sel))
+                    .and_then(|s| self.filtered_indices.iter().position(|&i| i == s))
                     .unwrap_or(0);
-                let prev_pos = current_pos.saturating_sub(1);
-                self.selected = Some(self.filtered_indices[prev_pos]);
+                let prev = cur.saturating_sub(1);
+                self.selected = Some(self.filtered_indices[prev]);
                 let total = self.filtered_indices.len();
                 if total > 1 {
-                    let fraction = prev_pos as f32 / (total - 1) as f32;
                     return iced::widget::operation::snap_to(
                         ui::playlist_scrollable_id(),
                         iced::widget::scrollable::RelativeOffset {
                             x: 0.0,
-                            y: fraction,
+                            y: prev as f32 / (total - 1) as f32,
                         },
                     );
                 }
             }
 
             Message::FocusSearch => {
+                self.context_menu = None;
                 return iced::widget::operation::focus(ui::search_input_id());
             }
 
             // ── Recently played ───────────────────────────────────────────
             Message::ShowRecentlyPlayed => {
-                // Toggle the panel; close settings if open
+                self.context_menu = None;
                 self.show_recently_played = !self.show_recently_played;
                 if self.show_recently_played {
                     self.show_settings = false;
@@ -706,22 +787,17 @@ impl App {
             }
 
             Message::PlayRecentEntry(i) => {
-                // Find the entry in the current playlist by MD5 and play it,
-                // or if not present just load it directly from its path.
+                self.context_menu = None;
                 if let Some(recent_entry) = self.recently_played.entries.get(i).cloned() {
-                    // Try to find in current playlist first
                     let playlist_idx = self
                         .playlist
                         .entries
                         .iter()
                         .position(|e| e.md5.as_deref() == Some(recent_entry.md5.as_str()));
-
                     if let Some(idx) = playlist_idx {
-                        // Found in playlist — play it normally
                         self.show_recently_played = false;
                         self.play_track(idx);
                     } else if recent_entry.path.exists() {
-                        // Not in current playlist — add it then play
                         let paths = vec![recent_entry.path.clone()];
                         let pg = self.loading_progress.clone();
                         self.show_recently_played = false;
@@ -741,11 +817,11 @@ impl App {
             Message::ClearRecentlyPlayed => {
                 self.recently_played = RecentlyPlayed::default();
                 self.recently_played.save();
-                eprintln!("[phosphor] Recently played history cleared");
             }
 
             // ── Settings ──────────────────────────────────────────────────
             Message::ToggleSettings => {
+                self.context_menu = None;
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
                     self.show_recently_played = false;
@@ -756,7 +832,6 @@ impl App {
                 self.config.skip_rsid = !self.config.skip_rsid;
                 self.config.save();
             }
-
             Message::ToggleForceStereo2sid => {
                 self.config.force_stereo_2sid = !self.config.force_stereo_2sid;
                 self.config.save();
@@ -764,16 +839,13 @@ impl App {
 
             Message::DefaultSongLengthChanged(val) => {
                 self.default_length_text = val.clone();
-                // Parse and apply the value
                 let new_val = val.trim().parse::<u32>().unwrap_or(0);
                 if new_val != self.config.default_song_length_secs {
                     self.config.default_song_length_secs = new_val;
                     self.config.save();
-                    // Re-apply default lengths to playlist
                     if new_val > 0 {
                         apply_default_length(&mut self.playlist, new_val);
                     } else {
-                        // Remove default lengths (re-apply only songlength DB)
                         clear_default_lengths(&mut self.playlist);
                         self.apply_songlengths();
                     }
@@ -787,10 +859,8 @@ impl App {
 
             Message::SetOutputEngine(engine) => {
                 if engine != self.config.output_engine {
-                    eprintln!("[phosphor] Output engine → '{engine}'");
                     self.config.output_engine = engine.clone();
                     self.config.save();
-                    // Tell the player thread to switch engines (include U64 config).
                     let _ = self.cmd_tx.try_send(PlayerCmd::SetEngine(
                         engine,
                         self.config.u64_address.clone(),
@@ -802,7 +872,6 @@ impl App {
             Message::SetU64Address(addr) => {
                 self.config.u64_address = addr;
                 self.config.save();
-                // Update player thread config without stopping playback.
                 let _ = self.cmd_tx.try_send(PlayerCmd::UpdateU64Config(
                     self.config.u64_address.clone(),
                     self.config.u64_password.clone(),
@@ -841,15 +910,11 @@ impl App {
                     self.download_status = format!(
                         "Download success! Loaded {} entries from {}",
                         count,
-                        path.display(),
+                        path.display()
                     );
-                    eprintln!("[phosphor] Songlength DB refreshed: {count} entries");
                 }
-                Err(e) => {
-                    self.download_status = format!("Error loading DB: {e}");
-                }
+                Err(e) => self.download_status = format!("Error loading DB: {e}"),
             },
-
             Message::SonglengthDownloaded(Err(e)) => {
                 self.download_status = format!("Error: {e}");
                 eprintln!("[phosphor] Songlength download failed: {e}");
@@ -869,9 +934,8 @@ impl App {
                                 "♡ Unfavorited"
                             },
                             entry.title,
-                            md5,
+                            md5
                         );
-                        // Rebuild filter in case favorites_only is active
                         if self.favorites_only {
                             self.rebuild_filter();
                         }
@@ -880,6 +944,7 @@ impl App {
             }
 
             Message::ToggleFavoritesFilter => {
+                self.context_menu = None;
                 self.favorites_only = !self.favorites_only;
                 self.rebuild_filter();
             }
@@ -891,14 +956,9 @@ impl App {
                             let is_fav = self.favorites.toggle(md5);
                             self.favorites.save();
                             eprintln!(
-                                "[phosphor] {} \"{}\" ({})",
-                                if is_fav {
-                                    "♥ Favorited"
-                                } else {
-                                    "♡ Unfavorited"
-                                },
-                                entry.title,
-                                md5,
+                                "[phosphor] {} \"{}\"",
+                                if is_fav { "♥" } else { "♡" },
+                                entry.title
                             );
                             if self.favorites_only {
                                 self.rebuild_filter();
@@ -910,16 +970,14 @@ impl App {
 
             Message::ScrollToNowPlaying => {
                 if let Some(cur_idx) = self.playlist.current {
-                    // Find position of current track in the filtered list
                     if let Some(pos) = self.filtered_indices.iter().position(|&i| i == cur_idx) {
                         let total = self.filtered_indices.len();
                         if total > 1 {
-                            let fraction = pos as f32 / (total - 1) as f32;
                             return iced::widget::operation::snap_to(
                                 ui::playlist_scrollable_id(),
                                 iced::widget::scrollable::RelativeOffset {
                                     x: 0.0,
-                                    y: fraction,
+                                    y: pos as f32 / (total - 1) as f32,
                                 },
                             );
                         }
@@ -930,7 +988,6 @@ impl App {
             // ── Tick ──────────────────────────────────────────────────────
             Message::Tick => {
                 self.poll_status();
-                // Auto-scroll playlist to current track
                 if self.scroll_to_current {
                     self.scroll_to_current = false;
                     if let Some(cur_idx) = self.playlist.current {
@@ -938,12 +995,11 @@ impl App {
                         {
                             let total = self.filtered_indices.len();
                             if total > 1 {
-                                let fraction = pos as f32 / (total - 1) as f32;
                                 return iced::widget::operation::snap_to(
                                     ui::playlist_scrollable_id(),
                                     iced::widget::scrollable::RelativeOffset {
                                         x: 0.0,
-                                        y: fraction,
+                                        y: pos as f32 / (total - 1) as f32,
                                     },
                                 );
                             }
@@ -960,12 +1016,8 @@ impl App {
                 );
                 self.new_version = Some(info);
             }
-            Message::VersionCheckDone(Ok(None)) => {
-                eprintln!("[phosphor] Version is up to date");
-            }
-            Message::VersionCheckDone(Err(e)) => {
-                eprintln!("[phosphor] Version check failed: {e}");
-            }
+            Message::VersionCheckDone(Ok(None)) => eprintln!("[phosphor] Version is up to date"),
+            Message::VersionCheckDone(Err(e)) => eprintln!("[phosphor] Version check failed: {e}"),
 
             Message::OpenUpdateUrl => {
                 if let Some(ref info) = self.new_version {
@@ -976,6 +1028,7 @@ impl App {
             // ── Window ────────────────────────────────────────────────────
             Message::WindowResized(w, h) => {
                 self.window_width = w;
+                self.window_height = h;
                 self.config.window_width_saved = w;
                 self.config.window_height_saved = h;
                 self.config.save();
@@ -1000,12 +1053,12 @@ impl App {
             .and_then(|e| e.md5.as_ref())
             .map(|m| self.favorites.is_favorite(m))
             .unwrap_or(false);
-        let has_track = self.status.track_info.is_some();
+
         let info_bar = ui::track_info_bar(
             &self.status,
             &self.visualizer,
             is_now_playing_fav,
-            has_track,
+            self.status.track_info.is_some(),
             self.window_width,
         );
         let controls = ui::controls_bar(
@@ -1015,57 +1068,38 @@ impl App {
             self.window_width,
             self.show_recently_played,
         );
-
-        // Progress bar: get current track duration
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
         let progress = ui::progress_bar(&self.status, current_duration);
 
-        if self.show_settings {
-            // Settings view: replace search + playlist with settings panel
+        // Build the main content area
+        let main_content: Element<'_, Message> = if self.show_settings {
             let settings = ui::settings_panel(
                 &self.config,
                 &self.default_length_text,
                 &self.download_status,
             );
-
-            container(column![
+            column![
                 info_bar,
                 progress,
                 rule::horizontal(1),
                 controls,
                 rule::horizontal(1),
-                settings,
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
-                ..Default::default()
-            })
+                settings
+            ]
             .into()
         } else if self.show_recently_played {
-            // Recently played panel
             let current_md5 = self.playlist.current_entry().and_then(|e| e.md5.as_deref());
-
             let recent_panel = ui::recently_played_view(&self.recently_played, current_md5);
-
-            container(column![
+            column![
                 info_bar,
                 progress,
                 rule::horizontal(1),
                 controls,
                 rule::horizontal(1),
-                recent_panel,
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
-                ..Default::default()
-            })
+                recent_panel
+            ]
             .into()
         } else {
-            // Normal view: search + playlist
             let loading_status = self
                 .loading_progress
                 .lock()
@@ -1079,7 +1113,6 @@ impl App {
                 self.favorites.count(),
                 &loading_status,
             );
-
             let playlist_widget = ui::playlist_view(
                 &self.playlist,
                 self.selected,
@@ -1088,8 +1121,7 @@ impl App {
                 self.sort_column,
                 self.sort_direction,
             );
-
-            container(column![
+            column![
                 info_bar,
                 progress,
                 rule::horizontal(1),
@@ -1097,23 +1129,42 @@ impl App {
                 rule::horizontal(1),
                 search,
                 rule::horizontal(1),
-                playlist_widget,
-            ])
+                playlist_widget
+            ]
+            .into()
+        };
+
+        let base = container(main_content)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|_theme: &Theme| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
                 ..Default::default()
-            })
-            .into()
+            });
+
+        // If context menu is open, layer it over the base using stack
+        if let Some(ref cm) = self.context_menu {
+            let overlay = ui::context_menu_overlay(
+                cm.x,
+                cm.y,
+                cm.track_idx,
+                &self.playlist,
+                &self.favorites,
+                self.window_width,
+                self.window_height,
+            );
+            iced::widget::stack![base, overlay]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            base.into()
         }
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        // Tick at ~30 Hz for smooth visualisation + status polling.
         let tick = time::every(Duration::from_millis(33)).map(|_| Message::Tick);
 
-        // Listen for OS window events and keyboard shortcuts.
         let window_events = event::listen_with(|event, _status, _id| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
@@ -1124,22 +1175,17 @@ impl App {
             iced::Event::Window(iced::window::Event::Moved(point)) => {
                 Some(Message::WindowMoved(point.x as i32, point.y as i32))
             }
-            // ── Keyboard shortcuts ────────────────────────────────────────
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 use iced::keyboard::key::Named;
                 use iced::keyboard::Key;
                 match key {
-                    // Space — play / pause
                     Key::Named(Named::Space) => Some(Message::PlayPause),
-                    // Left / Right — previous / next track
                     Key::Named(Named::ArrowLeft) => Some(Message::PrevTrack),
                     Key::Named(Named::ArrowRight) => Some(Message::NextTrack),
-                    // Up / Down — navigate playlist selection
                     Key::Named(Named::ArrowUp) => Some(Message::SelectPrev),
                     Key::Named(Named::ArrowDown) => Some(Message::SelectNext),
-                    // Delete — remove selected track
                     Key::Named(Named::Delete) => Some(Message::RemoveSelected),
-                    // Ctrl+F — focus search input
+                    Key::Named(Named::Escape) => Some(Message::DismissContextMenu),
                     Key::Character(ref c) if c.as_str() == "f" && modifiers.control() => {
                         Some(Message::FocusSearch)
                     }
@@ -1156,20 +1202,17 @@ impl App {
         Theme::Dark
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────
+    // ── Internal helpers ──────────────────────────────────────────────────
 
     fn play_track(&mut self, idx: usize) {
         if let Some(entry) = self.playlist.entries.get(idx) {
-            // Skip RSID tunes if configured
             if self.config.skip_rsid && entry.is_rsid {
                 eprintln!("[phosphor] Skipping RSID tune: \"{}\"", entry.title);
                 self.playlist.current = Some(idx);
-                // Try next track (avoid infinite loop by tracking visited)
                 if let Some(next_idx) = self.playlist.next() {
                     if next_idx != idx {
                         self.play_track(next_idx);
                     } else {
-                        // Only RSID tunes left, stop
                         let _ = self.cmd_tx.send(PlayerCmd::Stop);
                     }
                 } else {
@@ -1178,7 +1221,6 @@ impl App {
                 return;
             }
 
-            // Record in recently played history before playing
             if let Some(ref md5) = entry.md5 {
                 self.recently_played.record(
                     md5,
@@ -1208,25 +1250,17 @@ impl App {
     }
 
     fn poll_status(&mut self) {
-        // Drain all pending status messages, keep latest
         while let Ok(status) = self.status_rx.try_recv() {
             self.status = status;
         }
 
-        // Tell the visualiser how many SIDs this tune uses
         if let Some(ref info) = self.status.track_info {
             self.visualizer.set_num_sids(info.num_sids);
         }
-
-        // Update visualiser
         self.visualizer.update(&self.status.voice_levels);
 
-        // Auto-advance: SID tunes loop forever, so we must check elapsed time
-        // against the Songlength duration while playing and force-advance to
-        // the next track or sub-tune.
         if self.status.state == PlayState::Playing {
             if let Some(cur_idx) = self.playlist.current {
-                // Extract what we need from the entry before mutating
                 let advance_info = self.playlist.entries.get(cur_idx).and_then(|entry| {
                     let dur = entry.duration_secs?;
                     if self.status.elapsed.as_secs() >= dur as u64 {
@@ -1238,7 +1272,6 @@ impl App {
 
                 if let Some((cur_song, total_songs, md5)) = advance_info {
                     if cur_song < total_songs {
-                        // Advance to next sub-tune
                         let next_song = cur_song + 1;
                         let subtune_idx = (next_song - 1) as usize;
                         let next_dur = md5
@@ -1249,30 +1282,28 @@ impl App {
                                     .and_then(|db| db.lookup(m, subtune_idx))
                             })
                             .or_else(|| {
-                                let def = self.config.default_song_length_secs;
-                                if def > 0 {
-                                    Some(def)
+                                let d = self.config.default_song_length_secs;
+                                if d > 0 {
+                                    Some(d)
                                 } else {
                                     None
                                 }
                             });
                         let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next_song));
-
                         if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
                             e.selected_song = next_song;
                             e.duration_secs = next_dur;
                         }
                     } else {
-                        // All sub-tunes played — reset to first subtune
                         let first_dur = md5
                             .as_ref()
                             .and_then(|m| {
                                 self.songlength_db.as_ref().and_then(|db| db.lookup(m, 0))
                             })
                             .or_else(|| {
-                                let def = self.config.default_song_length_secs;
-                                if def > 0 {
-                                    Some(def)
+                                let d = self.config.default_song_length_secs;
+                                if d > 0 {
+                                    Some(d)
                                 } else {
                                     None
                                 }
@@ -1296,7 +1327,6 @@ impl App {
         if let Some(ref db) = self.songlength_db {
             db.apply_to_playlist(&mut self.playlist);
         }
-        // Also apply default length for any remaining entries without duration
         if self.config.default_song_length_secs > 0 {
             apply_default_length(&mut self.playlist, self.config.default_song_length_secs);
         }
@@ -1332,32 +1362,20 @@ fn sort_indices(
     indices.sort_by(|&a, &b| {
         let ea = &playlist.entries[a];
         let eb = &playlist.entries[b];
-
         let ord = match col {
             SortColumn::Index => a.cmp(&b),
-
             SortColumn::Title => ea.title.to_lowercase().cmp(&eb.title.to_lowercase()),
-
             SortColumn::Author => ea.author.to_lowercase().cmp(&eb.author.to_lowercase()),
-
             SortColumn::Released => ea.released.to_lowercase().cmp(&eb.released.to_lowercase()),
-
             SortColumn::Duration => match (ea.duration_secs, eb.duration_secs) {
                 (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Greater, // unknowns sort last
+                (None, Some(_)) => std::cmp::Ordering::Greater,
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (Some(da), Some(db)) => da.cmp(&db),
             },
-
-            SortColumn::SidType =>
-            // false (PSID) < true (RSID) — ascending puts PSID first
-            {
-                ea.is_rsid.cmp(&eb.is_rsid)
-            }
-
+            SortColumn::SidType => ea.is_rsid.cmp(&eb.is_rsid),
             SortColumn::NumSids => ea.num_sids.cmp(&eb.num_sids),
         };
-
         if dir == SortDirection::Descending {
             ord.reverse()
         } else {
@@ -1370,7 +1388,6 @@ fn sort_indices(
 //  Playlist helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Apply a default song length to all playlist entries that have no duration.
 fn apply_default_length(playlist: &mut Playlist, default_secs: u32) {
     let mut count = 0;
     for entry in &mut playlist.entries {
@@ -1384,114 +1401,98 @@ fn apply_default_length(playlist: &mut Playlist, default_secs: u32) {
     }
 }
 
-/// Clear durations that were set by default (reset entries with no DB match).
 fn clear_default_lengths(playlist: &mut Playlist) {
     for entry in &mut playlist.entries {
-        // We can't distinguish DB-set from default-set, so clear all
-        // and let the caller re-apply songlength DB afterwards.
         entry.duration_secs = None;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Cleanup on exit
+//  Drop
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl Drop for App {
     fn drop(&mut self) {
         eprintln!("[phosphor] App closing, stopping playback...");
         let _ = self.cmd_tx.send(PlayerCmd::Stop);
-        // Give the player thread time to mute + reset the hardware
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = self.cmd_tx.send(PlayerCmd::Quit);
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Async file dialogs (using rfd via iced Task)
+//  File dialogs
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn pick_files(start_dir: Option<String>) -> Vec<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new()
+    let mut d = rfd::AsyncFileDialog::new()
         .set_title("Add SID files")
         .add_filter("SID files", &["sid", "SID"]);
-
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {
-            dialog = dialog.set_directory(&p);
+            d = d.set_directory(&p);
         }
     }
-
-    rfd::AsyncFileDialog::pick_files(dialog)
+    rfd::AsyncFileDialog::pick_files(d)
         .await
-        .map(|handles| handles.iter().map(|h| h.path().to_path_buf()).collect())
+        .map(|h| h.iter().map(|f| f.path().to_path_buf()).collect())
         .unwrap_or_default()
 }
 
 async fn pick_folder(start_dir: Option<String>) -> Option<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new().set_title("Add folder of SID files");
-
+    let mut d = rfd::AsyncFileDialog::new().set_title("Add folder of SID files");
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {
-            dialog = dialog.set_directory(&p);
+            d = d.set_directory(&p);
         }
     }
-
-    dialog.pick_folder().await.map(|h| h.path().to_path_buf())
+    d.pick_folder().await.map(|h| h.path().to_path_buf())
 }
 
 async fn pick_songlength_file(start_dir: Option<String>) -> Option<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new()
+    let mut d = rfd::AsyncFileDialog::new()
         .set_title("Load HVSC Songlength.md5")
         .add_filter("Songlength", &["md5", "txt"]);
-
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {
-            dialog = dialog.set_directory(&p);
+            d = d.set_directory(&p);
         }
     }
-
-    dialog.pick_file().await.map(|h| h.path().to_path_buf())
+    d.pick_file().await.map(|h| h.path().to_path_buf())
 }
 
 async fn pick_playlist_file(start_dir: Option<String>) -> Option<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new()
+    let mut d = rfd::AsyncFileDialog::new()
         .set_title("Open Playlist")
         .add_filter("Playlists", &["m3u", "m3u8", "pls"])
         .add_filter("All files", &["*"]);
-
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {
-            dialog = dialog.set_directory(&p);
+            d = d.set_directory(&p);
         }
     }
-
-    dialog.pick_file().await.map(|h| h.path().to_path_buf())
+    d.pick_file().await.map(|h| h.path().to_path_buf())
 }
 
-/// Show save dialog, then write M3U. The entries are passed in so
-/// we don't need to Send the full Playlist across the async boundary.
 async fn save_playlist_dialog(
     entries: Vec<(PathBuf, String, String, Option<u32>)>,
     start_dir: Option<String>,
 ) -> Result<PathBuf, String> {
-    let mut dialog = rfd::AsyncFileDialog::new()
+    let mut d = rfd::AsyncFileDialog::new()
         .set_title("Save Playlist")
         .add_filter("M3U Playlist", &["m3u"])
         .set_file_name("playlist.m3u");
-
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {
-            dialog = dialog.set_directory(&p);
+            d = d.set_directory(&p);
         }
     }
-
-    match dialog.save_file().await {
+    match d.save_file().await {
         Some(h) => {
             let path = h.path().to_path_buf();
             write_m3u(&path, &entries)?;
@@ -1501,7 +1502,6 @@ async fn save_playlist_dialog(
     }
 }
 
-/// Write entries as extended M3U (called from async context).
 fn write_m3u(
     path: &std::path::Path,
     entries: &[(PathBuf, String, String, Option<u32>)],
@@ -1509,9 +1509,7 @@ fn write_m3u(
     use std::io::Write;
     let mut f = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
-
     writeln!(f, "#EXTM3U").map_err(|e| format!("{e}"))?;
-
     for (file_path, author, title, duration) in entries {
         let dur = duration.unwrap_or(0) as i64;
         let display = if author.is_empty() {
@@ -1522,12 +1520,11 @@ fn write_m3u(
         writeln!(f, "#EXTINF:{dur},{display}").map_err(|e| format!("{e}"))?;
         writeln!(f, "{}", file_path.display()).map_err(|e| format!("{e}"))?;
     }
-
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CLI argument helpers
+//  CLI helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn parse_sid4_from_args() -> u16 {
@@ -1540,35 +1537,25 @@ fn parse_sid4_from_args() -> u16 {
 
 fn parse_hex_addr(s: &str) -> Option<u16> {
     let s = s.trim();
-    let hex = if let Some(h) = s.strip_prefix('$') {
-        h
-    } else if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        h
-    } else {
-        s
-    };
+    let hex = s
+        .strip_prefix('$')
+        .or_else(|| s.strip_prefix("0x"))
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u16::from_str_radix(hex, 16).ok()
+}
+
+async fn flush_frame() {
+    tokio::time::sleep(Duration::from_millis(5)).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Yield to the iced runtime so it can redraw before processing the next message.
-///
-/// In iced 0.14, `async {}` and `Task::done` resolve synchronously within the
-/// same "batch" — the UI never gets a chance to redraw. A real `tokio::time::sleep`
-/// forces the future to resolve in a *later* event-loop tick, guaranteeing iced
-/// calls `view()` → draw before dispatching the next chained message.
-async fn flush_frame() {
-    tokio::time::sleep(Duration::from_millis(5)).await;
-}
-
 fn main() -> iced::Result {
     env_logger::init();
 
-    // Load config here to restore window geometry before iced initialises the window.
-    // App::boot() loads it again independently for the rest of the app state.
     let config_for_window = Config::load();
 
     let icon = {
@@ -1590,7 +1577,6 @@ fn main() -> iced::Result {
         ))
         .window(iced::window::Settings {
             icon: Some(icon),
-            // Restore last window position if we have one, otherwise let the OS decide.
             position: match (config_for_window.window_x, config_for_window.window_y) {
                 (Some(x), Some(y)) => {
                     iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))

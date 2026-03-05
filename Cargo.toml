@@ -10,7 +10,7 @@ usb = []
 
 [dependencies]
 # GUI
-iced = { version = "0.14", features = ["canvas", "tokio", "image"] }
+iced = { version = "0.14", features = ["advanced","canvas", "tokio", "image"] }
 rfd = "0.15"
 
 # 6502 emulation + USBSID hardware
