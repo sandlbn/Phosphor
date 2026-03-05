@@ -1,3 +1,4 @@
+pub mod right_click;
 pub mod visualizer;
 
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use crate::config::{Config, FavoritesDb};
 use crate::player::{PlayState, PlayerStatus};
 use crate::playlist::Playlist;
 use crate::recently_played::{format_played_at, RecentlyPlayed};
+use right_click::RightClickArea;
 use visualizer::Visualizer;
 
 /// Fixed scrollable ID for the playlist widget.
@@ -19,10 +21,12 @@ pub fn playlist_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-playlist")
 }
 
+/// Fixed scrollable ID for the recently played widget.
 pub fn recent_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-recent")
 }
 
+/// ID for the search text input — used by Ctrl+F focus shortcut.
 pub fn search_input_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-search")
 }
@@ -31,19 +35,21 @@ pub fn search_input_id() -> iced::widget::Id {
 //  Sort state
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Which column the playlist is currently sorted by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
-    Index, // original load order (#)
+    /// Original load order (#).
+    Index,
     Title,
     Author,
     Released,
     Duration,
-    SidType, // PSID / RSID
+    /// PSID / RSID type column.
+    SidType,
+    /// Number of SID chips (1SID / 2SID / 3SID).
     NumSids,
 }
 
-/// Sort direction.
+/// Sort direction — toggled when the user clicks the same column header twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
     Ascending,
@@ -51,6 +57,7 @@ pub enum SortDirection {
 }
 
 impl SortDirection {
+    /// Flip to the opposite direction.
     pub fn flip(self) -> Self {
         match self {
             Self::Ascending => Self::Descending,
@@ -58,7 +65,7 @@ impl SortDirection {
         }
     }
 
-    /// Arrow indicator shown in the header.
+    /// Arrow indicator shown next to the active column header.
     pub fn arrow(self) -> &'static str {
         match self {
             Self::Ascending => " ▲",
@@ -114,6 +121,15 @@ pub enum Message {
     SelectNext,
     FocusSearch,
 
+    // Context menu
+    ShowContextMenu(usize, f32, f32), // track_idx, abs_x, abs_y
+    DismissContextMenu,
+    ContextMenuPlay,
+    ContextMenuRemove,
+    ContextMenuMoveToTop,
+    ContextMenuToggleFavorite,
+    ContextMenuCopyTitle,
+
     // Recently played
     ShowRecentlyPlayed,
     PlayRecentEntry(usize),
@@ -129,12 +145,12 @@ pub enum Message {
     PlaylistSaved(Result<PathBuf, String>),
     PlaylistFileChosen(Option<PathBuf>),
 
-    // Background loading results (parsed off the UI thread)
+    // Background loading
     FilesLoaded(Vec<crate::playlist::PlaylistEntry>),
     FolderLoaded(Vec<crate::playlist::PlaylistEntry>),
     PlaylistLoaded(Result<Vec<crate::playlist::PlaylistEntry>, String>),
 
-    // Chained post-processing (allows UI redraws between steps)
+    // Chained post-processing
     ProcessPendingEntries,
     FinalizePendingEntries,
 
@@ -176,6 +192,7 @@ pub enum Message {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build the track info + visualiser panel (top section).
+/// Switches to a compact layout when `window_width` is below 760 px.
 pub fn track_info_bar<'a>(
     status: &'a PlayerStatus,
     visualizer: &'a Visualizer,
@@ -184,11 +201,11 @@ pub fn track_info_bar<'a>(
     window_width: f32,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
-    let title_size: f32 = if compact { 15.0 } else { 18.0 };
-    let author_size: f32 = if compact { 12.0 } else { 14.0 };
-    let extra_size: f32 = if compact { 10.0 } else { 12.0 };
-    let vis_width: f32 = if compact { 200.0 } else { 300.0 };
-    let vis_height: f32 = if compact { 48.0 } else { 60.0 };
+    let title_size = if compact { 15.0_f32 } else { 18.0 };
+    let author_size = if compact { 12.0_f32 } else { 14.0 };
+    let extra_size = if compact { 10.0_f32 } else { 12.0 };
+    let vis_width = if compact { 200.0_f32 } else { 300.0 };
+    let vis_height = if compact { 48.0_f32 } else { 60.0 };
 
     let (title, author, extra) = match &status.track_info {
         Some(info) => (
@@ -225,7 +242,6 @@ pub fn track_info_bar<'a>(
     .spacing(2)
     .width(Length::Fill);
 
-    // Show error message in red if present
     if let Some(ref err) = status.error {
         info_col = info_col.push(
             text(format!("⚠ {err}"))
@@ -234,9 +250,6 @@ pub fn track_info_bar<'a>(
         );
     }
 
-    let vis = visualizer.view();
-
-    // Heart button + scroll-to-current button for currently playing track
     let now_playing_buttons: Element<'_, Message> = if has_track {
         let heart_label = if is_now_playing_favorite {
             "♥"
@@ -256,7 +269,6 @@ pub fn track_info_bar<'a>(
                 text_color: Color::WHITE,
                 ..Default::default()
             });
-
         let scroll_btn = button(text("⌖").size(16).color(Color::from_rgb(0.5, 0.5, 0.6)))
             .on_press(Message::ScrollToNowPlaying)
             .padding(Padding::from([4, 6]))
@@ -265,7 +277,6 @@ pub fn track_info_bar<'a>(
                 text_color: Color::WHITE,
                 ..Default::default()
             });
-
         column![heart_btn, scroll_btn]
             .spacing(0)
             .align_x(Alignment::Center)
@@ -277,7 +288,7 @@ pub fn track_info_bar<'a>(
     let content = row![
         info_col,
         now_playing_buttons,
-        container(vis)
+        container(visualizer.view())
             .width(Length::Fixed(vis_width))
             .height(Length::Fixed(vis_height)),
     ]
@@ -294,14 +305,13 @@ pub fn track_info_bar<'a>(
         .into()
 }
 
-/// Build the progress bar showing elapsed / total time.
+/// Build the thin progress bar showing elapsed / total time below the track info.
 pub fn progress_bar<'a>(
     status: &PlayerStatus,
     current_duration: Option<u32>,
 ) -> Element<'a, Message> {
     let elapsed_secs = status.elapsed.as_secs();
     let total_secs = current_duration.unwrap_or(0) as u64;
-
     let fraction = if total_secs > 0 {
         (elapsed_secs as f32 / total_secs as f32).min(1.0)
     } else {
@@ -314,16 +324,13 @@ pub fn progress_bar<'a>(
     } else {
         "—:——".to_string()
     };
-
     let time_label = text(format!("  {elapsed_str} / {total_str}"))
         .size(11)
         .color(Color::from_rgb(0.6, 0.65, 0.7));
-
-    // Build a two-layer progress bar using containers
-    let bar_width_pct = (fraction * 100.0) as u16;
+    let bar_pct = (fraction * 100.0) as u16;
 
     let filled = container(Space::new().height(Length::Fixed(4.0)))
-        .width(Length::FillPortion(bar_width_pct.max(1)))
+        .width(Length::FillPortion(bar_pct.max(1)))
         .style(|_theme: &Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgb(0.30, 0.70, 0.50))),
             border: iced::Border {
@@ -332,11 +339,8 @@ pub fn progress_bar<'a>(
             },
             ..Default::default()
         });
-
     let remaining = container(Space::new().height(Length::Fixed(4.0)))
-        .width(Length::FillPortion(
-            100u16.saturating_sub(bar_width_pct).max(1),
-        ))
+        .width(Length::FillPortion(100u16.saturating_sub(bar_pct).max(1)))
         .style(|_theme: &Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.19, 0.22))),
             border: iced::Border {
@@ -346,24 +350,25 @@ pub fn progress_bar<'a>(
             ..Default::default()
         });
 
-    let bar_row = row![filled, remaining].spacing(0).width(Length::Fill);
-
-    let content = row![bar_row, time_label,]
+    container(
+        row![
+            row![filled, remaining].spacing(0).width(Length::Fill),
+            time_label
+        ]
         .spacing(8)
-        .align_y(Alignment::Center);
-
-    container(content)
-        .padding(Padding::from([4, 16]))
-        .width(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
-            ..Default::default()
-        })
-        .into()
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([4, 16]))
+    .width(Length::Fill)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+        ..Default::default()
+    })
+    .into()
 }
 
-/// Build the transport controls bar.
-/// Wraps to two rows when `window_width` is below the compact threshold.
+/// Build the transport controls bar (play/pause, prev/next, shuffle, repeat,
+/// playlist management buttons). Wraps to two rows in compact mode.
 pub fn controls_bar<'a>(
     status: &PlayerStatus,
     playlist: &Playlist,
@@ -372,9 +377,9 @@ pub fn controls_bar<'a>(
     show_recently_played: bool,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
-    let btn_size: f32 = if compact { 11.0 } else { 12.0 };
-    let btn_pad: u16 = if compact { 3 } else { 4 };
-    let bar_pad: u16 = if compact { 4 } else { 6 };
+    let btn_size = if compact { 11.0_f32 } else { 12.0 };
+    let btn_pad = if compact { 3_u16 } else { 4 };
+    let bar_pad = if compact { 4_u16 } else { 6 };
 
     let play_label = match status.state {
         PlayState::Playing => "❚❚",
@@ -385,8 +390,8 @@ pub fn controls_bar<'a>(
         button(text(label).size(btn_size))
             .on_press(msg)
             .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
-            .style(|_theme: &Theme, status| {
-                let bg = match status {
+            .style(|_theme: &Theme, st| {
+                let bg = match st {
                     button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
                     button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
                     _ => Color::from_rgb(0.18, 0.19, 0.22),
@@ -433,26 +438,25 @@ pub fn controls_bar<'a>(
             } else {
                 "🔀 Off"
             },
-            Message::ToggleShuffle,
+            Message::ToggleShuffle
         ),
         small_button(playlist.repeat.label(), Message::CycleRepeat),
     ]
     .spacing(4);
 
-    // Recently played tab button — highlighted when active
     let recent_btn: Element<'a, Message> =
         button(text(if compact { "🕐" } else { "🕐 Recent" }).size(btn_size))
             .on_press(Message::ShowRecentlyPlayed)
             .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
-            .style(move |_theme: &Theme, status| {
+            .style(move |_theme: &Theme, st| {
                 let bg = if show_recently_played {
-                    match status {
+                    match st {
                         button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
                         button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
                         _ => Color::from_rgb(0.16, 0.25, 0.40),
                     }
                 } else {
-                    match status {
+                    match st {
                         button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
                         button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
                         _ => Color::from_rgb(0.18, 0.19, 0.22),
@@ -503,77 +507,59 @@ pub fn controls_bar<'a>(
         .spacing(4)
     };
 
+    let update_badge = |version: &str| -> Element<'a, Message> {
+        button(
+            text(format!("⬆ {version}"))
+                .size(if compact { 11.0 } else { 12.0 })
+                .color(Color::from_rgb(0.1, 0.1, 0.12)),
+        )
+        .on_press(Message::OpenUpdateUrl)
+        .padding(Padding::from([
+            if compact { 2 } else { 3 },
+            if compact { 6 } else { 8 },
+        ]))
+        .style(|_theme: &Theme, _st| button::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
+            text_color: Color::from_rgb(0.1, 0.1, 0.12),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+    };
+
     let bar: Element<'a, Message> = if compact {
-        // Two-row layout for narrow windows
-        let top_row = row![transport, sep(), subtune_controls, sep(), mode_controls,]
+        let top_row = row![transport, sep(), subtune_controls, sep(), mode_controls]
             .spacing(6)
             .align_y(Alignment::Center);
-
-        let mut bottom_row = row![Space::new().width(Length::Fill),]
+        let mut bottom_row = row![Space::new().width(Length::Fill)]
             .spacing(4)
             .align_y(Alignment::Center);
-
         if let Some(info) = new_version {
-            let badge = button(
-                text(format!("⬆ {}", info.version))
-                    .size(11)
-                    .color(Color::from_rgb(0.1, 0.1, 0.12)),
-            )
-            .on_press(Message::OpenUpdateUrl)
-            .padding(Padding::from([2, 6]))
-            .style(|_theme: &Theme, _status| button::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
-                text_color: Color::from_rgb(0.1, 0.1, 0.12),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            bottom_row = bottom_row.push(badge);
+            bottom_row = bottom_row.push(update_badge(&info.version));
         }
-
         bottom_row = bottom_row.push(playlist_controls);
-
         column![top_row, bottom_row]
             .spacing(4)
             .padding(Padding::from([bar_pad, 12]))
             .into()
     } else {
-        // Single-row layout for wide windows
         let mut bar_row = row![
             transport,
             sep(),
             subtune_controls,
             sep(),
             mode_controls,
-            Space::new().width(Length::Fill),
+            Space::new().width(Length::Fill)
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-
         if let Some(info) = new_version {
-            let badge = button(
-                text(format!("⬆ {}", info.version))
-                    .size(12)
-                    .color(Color::from_rgb(0.1, 0.1, 0.12)),
-            )
-            .on_press(Message::OpenUpdateUrl)
-            .padding(Padding::from([3, 8]))
-            .style(|_theme: &Theme, _status| button::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.35, 0.85, 0.55))),
-                text_color: Color::from_rgb(0.1, 0.1, 0.12),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            bar_row = bar_row.push(badge);
+            bar_row = bar_row.push(update_badge(&info.version));
         }
-
         bar_row = bar_row.push(playlist_controls);
-
         bar_row.padding(Padding::from([bar_pad, 16])).into()
     };
 
@@ -586,7 +572,7 @@ pub fn controls_bar<'a>(
         .into()
 }
 
-/// Build the search bar with filter input and track count.
+/// Build the search / filter bar with track count and favorites toggle.
 pub fn search_bar<'a>(
     search_text: &str,
     visible_count: usize,
@@ -596,7 +582,7 @@ pub fn search_bar<'a>(
     loading_status: &str,
 ) -> Element<'a, Message> {
     let search_input = text_input("Search playlist...", search_text)
-        .id(search_input_id()) // wired up so Ctrl+F can focus it
+        .id(search_input_id())
         .on_input(Message::SearchChanged)
         .size(13)
         .padding(Padding::from([4, 8]))
@@ -625,44 +611,40 @@ pub fn search_bar<'a>(
     };
 
     let count_color = if !loading_status.is_empty() {
-        Color::from_rgb(0.4, 0.75, 0.9) // blue-ish for loading
+        Color::from_rgb(0.4, 0.75, 0.9)
     } else {
         Color::from_rgb(0.5, 0.5, 0.6)
     };
-
-    let count_label = text(count_text).size(12).color(count_color);
-
     let fav_label = if favorites_only {
-        format!("♥ {}", favorites_count)
+        format!("♥ {favorites_count}")
     } else {
-        format!("♡ {}", favorites_count)
+        format!("♡ {favorites_count}")
     };
 
     let fav_btn = button(text(fav_label).size(12))
         .on_press(Message::ToggleFavoritesFilter)
         .padding(Padding::from([4, 10]))
-        .style(move |_theme: &Theme, status| {
+        .style(move |_theme: &Theme, st| {
             let bg = if favorites_only {
-                match status {
+                match st {
                     button::Status::Hovered => Color::from_rgb(0.35, 0.18, 0.20),
                     button::Status::Pressed => Color::from_rgb(0.28, 0.14, 0.16),
                     _ => Color::from_rgb(0.30, 0.15, 0.18),
                 }
             } else {
-                match status {
+                match st {
                     button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
                     button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
                     _ => Color::from_rgb(0.18, 0.19, 0.22),
                 }
             };
-            let text_color = if favorites_only {
-                Color::from_rgb(1.0, 0.4, 0.5)
-            } else {
-                Color::from_rgb(0.8, 0.82, 0.88)
-            };
             button::Style {
                 background: Some(iced::Background::Color(bg)),
-                text_color,
+                text_color: if favorites_only {
+                    Color::from_rgb(1.0, 0.4, 0.5)
+                } else {
+                    Color::from_rgb(0.8, 0.82, 0.88)
+                },
                 border: iced::Border {
                     radius: 3.0.into(),
                     width: 1.0,
@@ -687,28 +669,28 @@ pub fn search_bar<'a>(
         search_row = search_row.push(tool_button("✕", Message::ClearSearch));
     }
 
-    let bar = row![
-        search_row,
-        Space::new().width(Length::Fixed(8.0)),
-        fav_btn,
-        Space::new().width(Length::Fixed(8.0)),
-        count_label,
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center)
-    .padding(Padding::from([4, 16]));
-
-    container(bar)
-        .width(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.14))),
-            ..Default::default()
-        })
-        .into()
+    container(
+        row![
+            search_row,
+            Space::new().width(Length::Fixed(8.0)),
+            fav_btn,
+            Space::new().width(Length::Fixed(8.0)),
+            text(count_text).size(12).color(count_color)
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([4, 16])),
+    )
+    .width(Length::Fill)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.14))),
+        ..Default::default()
+    })
+    .into()
 }
 
-/// Build the playlist table.
-/// `filtered_indices` maps visible row number → actual playlist index.
+/// Build the scrollable playlist table with sortable column headers.
+/// `filtered_indices` maps visible row position → actual `playlist.entries` index.
 pub fn playlist_view<'a>(
     playlist: &Playlist,
     selected: Option<usize>,
@@ -717,11 +699,9 @@ pub fn playlist_view<'a>(
     sort_col: SortColumn,
     sort_dir: SortDirection,
 ) -> Element<'a, Message> {
-    // Helper: clickable column header button.
-    // Highlights the active sort column and shows a ▲/▼ arrow.
     let header_btn = move |label: &'static str, col: SortColumn| -> Element<'a, Message> {
         let is_active = sort_col == col;
-        let display: String = if is_active {
+        let display = if is_active {
             format!("{}{}", label, sort_dir.arrow())
         } else {
             label.to_string()
@@ -734,27 +714,23 @@ pub fn playlist_view<'a>(
         button(text(display).size(11).color(text_color))
             .on_press(Message::SortBy(col))
             .padding(Padding::from([2, 4]))
-            .style(|_theme: &Theme, status| {
-                let bg = match status {
+            .style(|_theme: &Theme, st| button::Style {
+                background: match st {
                     button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
                         1.0, 1.0, 1.0, 0.06,
                     ))),
                     _ => None,
-                };
-                button::Style {
-                    background: bg,
-                    text_color: Color::WHITE,
-                    border: iced::Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
+                },
+                text_color: Color::WHITE,
+                border: iced::Border {
+                    radius: 2.0.into(),
                     ..Default::default()
-                }
+                },
+                ..Default::default()
             })
             .into()
     };
 
-    // Header row — widths must mirror playlist_row_content exactly
     let header_row = row![
         text("♥")
             .size(11)
@@ -805,16 +781,14 @@ pub fn playlist_view<'a>(
                     .as_ref()
                     .map(|m| favorites.is_favorite(m))
                     .unwrap_or(false);
-                // display_pos+1 so row numbers follow sorted order, not original index
-                let row_el = playlist_entry_row(
+                rows = rows.push(playlist_entry_row(
                     actual_idx,
                     display_pos + 1,
                     entry,
                     is_current,
                     is_selected,
                     is_fav,
-                );
-                rows = rows.push(row_el);
+                ));
             }
         }
     }
@@ -826,12 +800,132 @@ pub fn playlist_view<'a>(
         .into()
 }
 
-/// Build the recently played panel.
+/// Build the floating context menu overlay.
+/// Layer this over the main content using `iced::widget::stack![]` when
+/// `context_menu` is `Some(_)`. The menu is flipped horizontally or vertically
+/// if it would extend beyond the window edges.
+pub fn context_menu_overlay<'a>(
+    x: f32,
+    y: f32,
+    track_idx: usize,
+    playlist: &Playlist,
+    favorites: &FavoritesDb,
+    window_width: f32,
+    window_height: f32,
+) -> Element<'a, Message> {
+    let is_fav = playlist
+        .entries
+        .get(track_idx)
+        .and_then(|e| e.md5.as_ref())
+        .map(|m| favorites.is_favorite(m))
+        .unwrap_or(false);
+
+    let fav_label = if is_fav {
+        "♥  Remove from favorites"
+    } else {
+        "♡  Add to favorites"
+    };
+
+    let menu_width = 210.0_f32;
+    let item_height = 32.0_f32;
+    let menu_height = item_height * 5.0 + 8.0;
+
+    // Flip so menu never goes off-screen
+    let menu_x = if x + menu_width > window_width {
+        (x - menu_width).max(0.0)
+    } else {
+        x
+    };
+    let menu_y = if y + menu_height > window_height {
+        (y - menu_height).max(0.0)
+    } else {
+        y
+    };
+
+    let item = |icon_label: &'a str, msg: Message| -> Element<'a, Message> {
+        button(text(icon_label).size(13))
+            .on_press(msg)
+            .width(Length::Fill)
+            .padding(Padding::from([7, 14]))
+            .style(|_theme: &Theme, st| button::Style {
+                background: Some(iced::Background::Color(match st {
+                    button::Status::Hovered => Color::from_rgb(0.25, 0.40, 0.65),
+                    button::Status::Pressed => Color::from_rgb(0.20, 0.33, 0.55),
+                    _ => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+                })),
+                text_color: Color::from_rgb(0.88, 0.90, 0.94),
+                border: iced::Border::default(),
+                ..Default::default()
+            })
+            .into()
+    };
+
+    let menu_box = container(
+        column![
+            item("▶   Play", Message::ContextMenuPlay),
+            item("⤒   Move to top", Message::ContextMenuMoveToTop),
+            item(fav_label, Message::ContextMenuToggleFavorite),
+            item("⎘   Copy title", Message::ContextMenuCopyTitle),
+            item("✕   Remove from playlist", Message::ContextMenuRemove),
+        ]
+        .spacing(0)
+        .width(Length::Fixed(menu_width)),
+    )
+    .padding(Padding::from([4, 0]))
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.16, 0.20))),
+        border: iced::Border {
+            radius: 5.0.into(),
+            width: 1.0,
+            color: Color::from_rgb(0.28, 0.30, 0.36),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: iced::Vector::new(2.0, 4.0),
+            blur_radius: 8.0,
+        },
+        ..Default::default()
+    });
+
+    // Transparent full-screen dismiss button sits below the menu popup
+    let dismiss = button(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::DismissContextMenu)
+        .padding(0)
+        .style(|_theme: &Theme, _st| button::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(
+                0.0, 0.0, 0.0, 0.0,
+            ))),
+            ..Default::default()
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    // Position the menu by padding a fill container from top-left
+    let positioned = container(menu_box)
+        .padding(Padding {
+            top: menu_y,
+            left: menu_x,
+            right: 0.0,
+            bottom: 0.0,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: None,
+            ..Default::default()
+        });
+
+    iced::widget::stack![dismiss, positioned]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Build the recently played panel (shown instead of the playlist when active).
 pub fn recently_played_view<'a>(
     recent: &'a RecentlyPlayed,
     current_md5: Option<&'a str>,
 ) -> Element<'a, Message> {
-    // Header row
     let header_row = row![
         text("#")
             .size(11)
@@ -865,26 +959,23 @@ pub fn recently_played_view<'a>(
             ..Default::default()
         });
 
-    // Toolbar: count + clear button
-    let toolbar = {
-        let count_label = text(format!("🕐  {} recently played tracks", recent.len()))
-            .size(12)
-            .color(Color::from_rgb(0.55, 0.80, 1.0));
-
-        let clear_btn = tool_button("🗑 Clear history", Message::ClearRecentlyPlayed);
-
-        container(
-            row![count_label, Space::new().width(Length::Fill), clear_btn,]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .padding(Padding::from([6, 16])),
-        )
-        .width(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
-            ..Default::default()
-        })
-    };
+    let toolbar = container(
+        row![
+            text(format!("🕐  {} recently played tracks", recent.len()))
+                .size(12)
+                .color(Color::from_rgb(0.55, 0.80, 1.0)),
+            Space::new().width(Length::Fill),
+            tool_button("🗑 Clear history", Message::ClearRecentlyPlayed),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([6, 16])),
+    )
+    .width(Length::Fill)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
+        ..Default::default()
+    });
 
     let mut rows = Column::new()
         .spacing(0)
@@ -905,15 +996,12 @@ pub fn recently_played_view<'a>(
     } else {
         for (i, entry) in recent.entries.iter().enumerate() {
             let is_current = current_md5 == Some(entry.md5.as_str());
-
             let color = if is_current {
                 Color::from_rgb(0.35, 0.85, 0.55)
             } else {
                 Color::from_rgb(0.78, 0.80, 0.84)
             };
-
             let indicator = if is_current { "▶ " } else { "  " };
-            let played_str = format_played_at(entry.played_at);
 
             let row_content = row![
                 text(format!("{}{}", indicator, i + 1))
@@ -932,7 +1020,7 @@ pub fn recently_played_view<'a>(
                     .size(13)
                     .color(color)
                     .width(Length::FillPortion(2)),
-                text(played_str)
+                text(format_played_at(entry.played_at))
                     .size(12)
                     .color(Color::from_rgb(0.5, 0.55, 0.65))
                     .width(Length::Fixed(110.0)),
@@ -944,8 +1032,8 @@ pub fn recently_played_view<'a>(
             let row_btn = button(row_content)
                 .on_press(Message::PlayRecentEntry(i))
                 .padding(0)
-                .style(move |_theme: &Theme, status| {
-                    let bg = match status {
+                .style(move |_theme: &Theme, st| button::Style {
+                    background: match st {
                         button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
                             1.0, 1.0, 1.0, 0.04,
                         ))),
@@ -958,12 +1046,9 @@ pub fn recently_played_view<'a>(
                                 None
                             }
                         }
-                    };
-                    button::Style {
-                        background: bg,
-                        text_color: Color::WHITE,
-                        ..Default::default()
-                    }
+                    },
+                    text_color: Color::WHITE,
+                    ..Default::default()
                 })
                 .width(Length::Fill);
 
@@ -982,6 +1067,8 @@ pub fn recently_played_view<'a>(
         .into()
 }
 
+/// Build a single playlist row, including the heart button and right-click wrapper.
+/// `display_pos` is the 1-based row number shown in the # column (sorted order).
 fn playlist_entry_row<'a>(
     idx: usize,
     display_pos: usize,
@@ -995,9 +1082,7 @@ fn playlist_entry_row<'a>(
     } else {
         "1".to_string()
     };
-
     let type_label = if entry.is_rsid { "RSID" } else { "PSID" }.to_string();
-
     let song_title = if entry.songs > 1 {
         format!("{} [{}/{}]", entry.title, entry.selected_song, entry.songs)
     } else {
@@ -1016,7 +1101,6 @@ fn playlist_entry_row<'a>(
         None
     };
 
-    // Heart button (separate from row button so it's independently clickable)
     let heart_label = if is_favorite { "♥" } else { "♡" };
     let heart_color = if is_favorite {
         Color::from_rgb(1.0, 0.35, 0.45)
@@ -1027,26 +1111,23 @@ fn playlist_entry_row<'a>(
     let heart_btn = button(text(heart_label).size(13).color(heart_color))
         .on_press(Message::ToggleFavorite(idx))
         .padding(Padding::from([4, 4]))
-        .style(|_theme: &Theme, status| {
-            let bg = match status {
+        .style(|_theme: &Theme, st| button::Style {
+            background: match st {
                 button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
                     1.0, 0.3, 0.4, 0.15,
                 ))),
                 _ => None,
-            };
-            button::Style {
-                background: bg,
-                text_color: Color::WHITE,
-                border: iced::Border {
-                    radius: 2.0.into(),
-                    ..Default::default()
-                },
+            },
+            text_color: Color::WHITE,
+            border: iced::Border {
+                radius: 2.0.into(),
                 ..Default::default()
-            }
+            },
+            ..Default::default()
         });
 
     let row_content = playlist_row_content(
-        format!("{}", display_pos),
+        format!("{display_pos}"),
         song_title,
         entry.author.clone(),
         entry.released.clone(),
@@ -1056,32 +1137,37 @@ fn playlist_entry_row<'a>(
         is_current,
     );
 
-    // Row button (for selection/double-click)
+    // Left-click: select / play
     let row_btn = button(row_content)
         .on_press(Message::PlaylistSelect(idx))
         .padding(0)
-        .style(|_theme: &Theme, _status| button::Style {
+        .style(|_theme: &Theme, _st| button::Style {
             background: None,
             text_color: Color::WHITE,
             ..Default::default()
         })
         .width(Length::Fill);
 
-    let full_row = row![heart_btn, row_btn]
-        .spacing(0)
-        .align_y(Alignment::Center)
-        .padding(Padding::from([0, 4]));
+    // Right-click: open context menu at cursor position
+    let row_with_rclick: Element<'a, Message> =
+        RightClickArea::new(row_btn, move |x, y| Message::ShowContextMenu(idx, x, y)).into();
 
-    container(full_row)
-        .width(Length::Fill)
-        .style(move |_theme: &Theme| container::Style {
-            background: bg,
-            ..Default::default()
-        })
-        .into()
+    container(
+        row![heart_btn, row_with_rclick]
+            .spacing(0)
+            .align_y(Alignment::Center)
+            .padding(Padding::from([0, 4])),
+    )
+    .width(Length::Fill)
+    .style(move |_theme: &Theme| container::Style {
+        background: bg,
+        ..Default::default()
+    })
+    .into()
 }
 
-/// Row content (without heart — used inside the row button).
+/// Build the inner row content (without the heart button).
+/// Used as the child of the left-click button inside each playlist row.
 fn playlist_row_content<'a>(
     num: String,
     title: String,
@@ -1098,13 +1184,11 @@ fn playlist_row_content<'a>(
     } else {
         Color::from_rgb(0.78, 0.80, 0.84)
     };
-
     let type_color = if sid_type == "RSID" {
         Color::from_rgb(0.9, 0.65, 0.35)
     } else {
         Color::from_rgb(0.5, 0.75, 0.9)
     };
-
     let indicator = if is_current { "▶ " } else { "  " };
 
     row![
@@ -1147,239 +1231,131 @@ fn playlist_row_content<'a>(
 //  Settings panel
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the settings panel overlay.
+/// Build the settings panel (shown instead of the playlist when ⚙ is toggled).
 pub fn settings_panel<'a>(
     config: &Config,
     default_length_text: &'a str,
     download_status: &'a str,
 ) -> Element<'a, Message> {
-    let title = text("Settings")
-        .size(18)
-        .color(Color::from_rgb(0.85, 0.87, 0.9));
+    let header = row![
+        text("Settings")
+            .size(18)
+            .color(Color::from_rgb(0.85, 0.87, 0.9)),
+        Space::new().width(Length::Fill),
+        tool_button("✕ Close", Message::ToggleSettings),
+    ]
+    .align_y(Alignment::Center);
 
-    let close_btn = tool_button("✕ Close", Message::ToggleSettings);
-
-    let header =
-        row![title, Space::new().width(Length::Fill), close_btn,].align_y(Alignment::Center);
-
-    // ── Output Engine ──────────────────────────────────────────
-    let engine_label = text("Audio output engine:")
-        .size(14)
-        .color(Color::from_rgb(0.75, 0.77, 0.82));
-
+    // ── Output Engine ────────────────────────────────────────────
     let engines = crate::sid_device::available_engines();
     let current_engine = &config.output_engine;
 
-    let engine_buttons: Vec<Element<'a, Message>> = engines
-        .iter()
-        .map(|&name| {
-            let display = match name {
-                "usb" => "🔌 USB Hardware (USBSID-Pico)",
-                "emulated" => "🎵 Software Emulation (reSID)",
-                "u64" => "🌐 Ultimate 64 (Network)",
-                other => other,
-            };
-            let is_active = current_engine == name
-                || (current_engine == "auto" && engines.first() == Some(&name));
-            let label = if current_engine == name {
-                format!("● {display}")
+    let mut engine_col = column![text("Audio output engine:")
+        .size(14)
+        .color(Color::from_rgb(0.75, 0.77, 0.82)),]
+    .spacing(6);
+
+    let auto_active = current_engine == "auto";
+    engine_col = engine_col.push(
+        button(
+            text(if auto_active {
+                "● Auto (try USB, fall back to emulation)"
             } else {
-                format!("○ {display}")
-            };
+                "○ Auto (try USB, fall back to emulation)"
+            })
+            .size(12),
+        )
+        .on_press(Message::SetOutputEngine("auto".to_string()))
+        .padding(Padding::from([4, 10]))
+        .width(Length::Fill)
+        .style(move |_theme: &Theme, st| engine_btn_style(auto_active, st)),
+    );
+
+    for &name in &engines {
+        let display = match name {
+            "usb" => "🔌 USB Hardware (USBSID-Pico)",
+            "emulated" => "🎵 Software Emulation (reSID)",
+            "u64" => "🌐 Ultimate 64 (Network)",
+            other => other,
+        };
+        let is_active = current_engine == name;
+        let label = if is_active {
+            format!("● {display}")
+        } else {
+            format!("○ {display}")
+        };
+        engine_col = engine_col.push(
             button(text(label).size(12))
                 .on_press(Message::SetOutputEngine(name.to_string()))
                 .padding(Padding::from([4, 10]))
                 .width(Length::Fill)
-                .style(move |_theme: &Theme, status| {
-                    let bg = if is_active {
-                        match status {
-                            button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
-                            button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
-                            _ => Color::from_rgb(0.16, 0.25, 0.40),
-                        }
-                    } else {
-                        match status {
-                            button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
-                            button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
-                            _ => Color::from_rgb(0.18, 0.19, 0.22),
-                        }
-                    };
-                    button::Style {
-                        background: Some(iced::Background::Color(bg)),
-                        text_color: if is_active {
-                            Color::from_rgb(0.9, 0.92, 0.96)
-                        } else {
-                            Color::from_rgb(0.8, 0.82, 0.88)
-                        },
-                        border: iced::Border {
-                            radius: 3.0.into(),
-                            width: 1.0,
-                            color: if is_active {
-                                Color::from_rgb(0.3, 0.45, 0.7)
-                            } else {
-                                Color::from_rgb(0.25, 0.27, 0.30)
-                            },
-                        },
-                        ..Default::default()
-                    }
-                })
-                .into()
-        })
-        .collect();
-
-    // Auto button
-    let auto_active = current_engine == "auto";
-    let auto_btn = button(
-        text(if auto_active {
-            "● Auto (try USB, fall back to emulation)"
-        } else {
-            "○ Auto (try USB, fall back to emulation)"
-        })
-        .size(12),
-    )
-    .on_press(Message::SetOutputEngine("auto".to_string()))
-    .padding(Padding::from([4, 10]))
-    .width(Length::Fill)
-    .style(move |_theme: &Theme, status| {
-        let bg = if auto_active {
-            match status {
-                button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
-                button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
-                _ => Color::from_rgb(0.16, 0.25, 0.40),
-            }
-        } else {
-            match status {
-                button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
-                button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
-                _ => Color::from_rgb(0.18, 0.19, 0.22),
-            }
-        };
-        button::Style {
-            background: Some(iced::Background::Color(bg)),
-            text_color: if auto_active {
-                Color::from_rgb(0.9, 0.92, 0.96)
-            } else {
-                Color::from_rgb(0.8, 0.82, 0.88)
-            },
-            border: iced::Border {
-                radius: 3.0.into(),
-                width: 1.0,
-                color: if auto_active {
-                    Color::from_rgb(0.3, 0.45, 0.7)
-                } else {
-                    Color::from_rgb(0.25, 0.27, 0.30)
-                },
-            },
-            ..Default::default()
-        }
-    });
-
-    let mut engine_col = column![engine_label, auto_btn].spacing(6);
-    for btn in engine_buttons {
-        engine_col = engine_col.push(btn);
+                .style(move |_theme: &Theme, st| engine_btn_style(is_active, st)),
+        );
     }
 
-    let engine_help = text("Changes take effect when next song starts playing.")
-        .size(11)
-        .color(Color::from_rgb(0.45, 0.47, 0.52));
-    let engine_col = engine_col.push(engine_help);
-
-    // ── U64 connection settings (always visible so user can pre-configure) ──
-    let u64_label = text("Ultimate 64 connection:")
-        .size(12)
-        .color(Color::from_rgb(0.65, 0.67, 0.72));
-
-    let u64_addr_input = text_input("IP address (e.g. 192.168.1.64)", &config.u64_address)
-        .on_input(Message::SetU64Address)
-        .size(12)
-        .padding(Padding::from([4, 8]))
-        .width(Length::Fill);
-
-    let u64_pass_input = text_input("Password (leave empty if none)", &config.u64_password)
-        .on_input(Message::SetU64Password)
-        .size(12)
-        .padding(Padding::from([4, 8]))
-        .width(Length::Fill);
-
-    let u64_help = text("Set IP/hostname of your Ultimate 64 or Ultimate-II+ device.")
-        .size(11)
-        .color(Color::from_rgb(0.45, 0.47, 0.52));
-
-    let engine_section = engine_col
+    engine_col = engine_col
+        .push(
+            text("Changes take effect when next song starts playing.")
+                .size(11)
+                .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        )
         .push(rule::horizontal(1))
-        .push(u64_label)
-        .push(u64_addr_input)
-        .push(u64_pass_input)
-        .push(u64_help);
+        .push(
+            text("Ultimate 64 connection:")
+                .size(12)
+                .color(Color::from_rgb(0.65, 0.67, 0.72)),
+        )
+        .push(
+            text_input("IP address (e.g. 192.168.1.64)", &config.u64_address)
+                .on_input(Message::SetU64Address)
+                .size(12)
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fill),
+        )
+        .push(
+            text_input("Password (leave empty if none)", &config.u64_password)
+                .on_input(Message::SetU64Password)
+                .size(12)
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fill),
+        )
+        .push(
+            text("Set IP/hostname of your Ultimate 64 or Ultimate-II+ device.")
+                .size(11)
+                .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        );
 
     // ── Skip RSID ────────────────────────────────────────────────
-    let rsid_label = text("Skip RSID tunes:")
-        .size(14)
-        .color(Color::from_rgb(0.75, 0.77, 0.82));
+    let rsid_section = column![
+        text("Skip RSID tunes:")
+            .size(14)
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        tool_button(
+            if config.skip_rsid {
+                "✓ Yes — skip RSID"
+            } else {
+                "✗ No — play all tunes"
+            },
+            Message::ToggleSkipRsid
+        ),
+        text("When enabled, RSID tunes are automatically skipped during playback.")
+            .size(11)
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
 
-    let rsid_toggle = tool_button(
-        if config.skip_rsid {
-            "✓ Yes — skip RSID"
-        } else {
-            "✗ No — play all tunes"
-        },
-        Message::ToggleSkipRsid,
-    );
-
-    let rsid_help = text("When enabled, RSID tunes are automatically skipped during playback.")
-        .size(11)
-        .color(Color::from_rgb(0.45, 0.47, 0.52));
-
-    let rsid_section = column![rsid_label, rsid_toggle, rsid_help].spacing(6);
-
-    // ── Force stereo for 2SID tunes ──────────────────────────────
-    let stereo_2sid_label = text("Force stereo for 2SID tunes:")
-        .size(14)
-        .color(Color::from_rgb(0.75, 0.77, 0.82));
-
-    let stereo_2sid_toggle = tool_button(
-        if config.force_stereo_2sid {
-            "✓ Yes — mirror SID1 to both channels"
-        } else {
-            "✗ No — true dual-SID (L=SID1, R=SID2)"
-        },
-        Message::ToggleForceStereo2sid,
-    );
-
-    let stereo_2sid_help = text(
-        "When enabled, 2SID tunes ignore the second SID and mirror SID1 to both speakers \
-         (same as mono). Disable for true stereo separation on dual-SID hardware.",
-    )
-    .size(11)
-    .color(Color::from_rgb(0.45, 0.47, 0.52));
-
-    let stereo_2sid_section =
-        column![stereo_2sid_label, stereo_2sid_toggle, stereo_2sid_help].spacing(6);
+    // ── Force stereo ─────────────────────────────────────────────
+    let stereo_section = column![
+        text("Force stereo for 2SID tunes:").size(14).color(Color::from_rgb(0.75, 0.77, 0.82)),
+        tool_button(
+            if config.force_stereo_2sid { "✓ Yes — mirror SID1 to both channels" } else { "✗ No — true dual-SID (L=SID1, R=SID2)" },
+            Message::ToggleForceStereo2sid,
+        ),
+        text("When enabled, 2SID tunes ignore the second SID and mirror SID1 to both speakers (same as mono).").size(11).color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ].spacing(6);
 
     // ── Default song length ──────────────────────────────────────
-    let length_label = text("Default song length (seconds):")
-        .size(14)
-        .color(Color::from_rgb(0.75, 0.77, 0.82));
-
-    let length_input = text_input("0 = disabled", default_length_text)
-        .on_input(Message::DefaultSongLengthChanged)
-        .size(14)
-        .padding(Padding::from([6, 10]))
-        .width(Length::Fixed(180.0))
-        .style(|_theme: &Theme, _status| text_input::Style {
-            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
-            border: iced::Border {
-                radius: 3.0.into(),
-                width: 1.0,
-                color: Color::from_rgb(0.25, 0.27, 0.30),
-            },
-            icon: Color::from_rgb(0.5, 0.5, 0.6),
-            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
-            value: Color::from_rgb(0.85, 0.87, 0.9),
-            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
-        });
-
-    let current_val = if config.default_song_length_secs > 0 {
+    let cur_len = if config.default_song_length_secs > 0 {
         let m = config.default_song_length_secs / 60;
         let s = config.default_song_length_secs % 60;
         format!(
@@ -1390,47 +1366,38 @@ pub fn settings_panel<'a>(
         "Disabled (0) — unknown songs won't auto-advance".to_string()
     };
 
-    let length_info = text(current_val)
-        .size(11)
-        .color(Color::from_rgb(0.45, 0.47, 0.52));
-
-    let length_help =
+    let length_section = column![
+        text("Default song length (seconds):")
+            .size(14)
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text_input("0 = disabled", default_length_text)
+            .on_input(Message::DefaultSongLengthChanged)
+            .size(14)
+            .padding(Padding::from([6, 10]))
+            .width(Length::Fixed(180.0))
+            .style(|_theme: &Theme, _st| text_input::Style {
+                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30)
+                },
+                icon: Color::from_rgb(0.5, 0.5, 0.6),
+                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+                value: Color::from_rgb(0.85, 0.87, 0.9),
+                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+            }),
+        text(cur_len)
+            .size(11)
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
         text("Fallback duration for songs not found in Songlength DB. Set to 0 to disable.")
             .size(11)
-            .color(Color::from_rgb(0.45, 0.47, 0.52));
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
 
-    let length_section = column![length_label, length_input, length_info, length_help].spacing(6);
-
-    // ── Songlength DB download ───────────────────────────────────
-    let dl_label = text("HVSC Songlength database:")
-        .size(14)
-        .color(Color::from_rgb(0.75, 0.77, 0.82));
-
-    let dl_url_input = text_input("Songlength.md5 URL", &config.songlength_url)
-        .on_input(Message::SonglengthUrlChanged)
-        .size(12)
-        .padding(Padding::from([6, 10]))
-        .width(Length::Fill)
-        .style(|_theme: &Theme, _status| text_input::Style {
-            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
-            border: iced::Border {
-                radius: 3.0.into(),
-                width: 1.0,
-                color: Color::from_rgb(0.25, 0.27, 0.30),
-            },
-            icon: Color::from_rgb(0.5, 0.5, 0.6),
-            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
-            value: Color::from_rgb(0.85, 0.87, 0.9),
-            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
-        });
-
-    let dl_btn = tool_button(
-        "⬇ Download / Refresh Songlength.md5",
-        Message::DownloadSonglength,
-    );
-    let load_btn = tool_button("📂 Load Songlength.md5 from file…", Message::LoadSonglength);
-
-    let dl_status_color = if download_status.contains("Error") || download_status.contains("fail") {
+    // ── Songlength DB ────────────────────────────────────────────
+    let dl_color = if download_status.contains("Error") || download_status.contains("fail") {
         Color::from_rgb(1.0, 0.4, 0.4)
     } else if download_status.contains("success") || download_status.contains("Loaded") {
         Color::from_rgb(0.4, 0.9, 0.5)
@@ -1438,48 +1405,68 @@ pub fn settings_panel<'a>(
         Color::from_rgb(0.5, 0.5, 0.6)
     };
 
-    let dl_status = text(download_status).size(12).color(dl_status_color);
+    let dl_section = column![
+        text("HVSC Songlength database:")
+            .size(14)
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text_input("Songlength.md5 URL", &config.songlength_url)
+            .on_input(Message::SonglengthUrlChanged)
+            .size(12)
+            .padding(Padding::from([6, 10]))
+            .width(Length::Fill)
+            .style(|_theme: &Theme, _st| text_input::Style {
+                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30)
+                },
+                icon: Color::from_rgb(0.5, 0.5, 0.6),
+                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+                value: Color::from_rgb(0.85, 0.87, 0.9),
+                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+            }),
+        tool_button(
+            "⬇ Download / Refresh Songlength.md5",
+            Message::DownloadSonglength
+        ),
+        tool_button("📂 Load Songlength.md5 from file…", Message::LoadSonglength),
+        text(download_status).size(12).color(dl_color),
+    ]
+    .spacing(6);
 
-    let dl_section = column![dl_label, dl_url_input, dl_btn, load_btn, dl_status].spacing(6);
-
-    // ── Keyboard shortcuts reference ─────────────────────────────
-    let kb_label = text("Keyboard shortcuts:")
+    // ── Keyboard shortcuts ───────────────────────────────────────
+    let mut kb_col = column![text("Keyboard shortcuts:")
         .size(14)
-        .color(Color::from_rgb(0.75, 0.77, 0.82));
-
-    let shortcuts = [
+        .color(Color::from_rgb(0.75, 0.77, 0.82))]
+    .spacing(4);
+    for (key, desc) in [
         ("Space", "Play / Pause"),
         ("← →", "Previous / Next track"),
-        ("↑ ↓", "Navigate playlist selection"),
-        ("Delete", "Remove selected track"),
-        ("Ctrl + F", "Focus search"),
-    ];
-
-    let mut kb_col = column![kb_label].spacing(4);
-    for (key, desc) in &shortcuts {
+        ("↑ ↓", "Navigate playlist"),
+        ("Delete", "Remove selected"),
+        ("Ctrl+F", "Focus search"),
+    ] {
         kb_col = kb_col.push(
             row![
-                text(*key)
+                text(key)
                     .size(12)
                     .color(Color::from_rgb(0.75, 0.88, 1.0))
                     .width(Length::Fixed(100.0)),
-                text(*desc)
-                    .size(12)
-                    .color(Color::from_rgb(0.65, 0.67, 0.72)),
+                text(desc).size(12).color(Color::from_rgb(0.65, 0.67, 0.72)),
             ]
             .spacing(8),
         );
     }
 
-    // ── Assemble ─────────────────────────────────────────────────
     let content = column![
         header,
         rule::horizontal(1),
-        engine_section,
+        engine_col,
         rule::horizontal(1),
         rsid_section,
         rule::horizontal(1),
-        stereo_2sid_section,
+        stereo_section,
         rule::horizontal(1),
         length_section,
         rule::horizontal(1),
@@ -1501,42 +1488,77 @@ pub fn settings_panel<'a>(
         .into()
 }
 
+/// Shared style function for output-engine selector buttons.
+/// `is_active` highlights the currently selected engine.
+fn engine_btn_style(is_active: bool, st: button::Status) -> button::Style {
+    let bg = if is_active {
+        match st {
+            button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
+            button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
+            _ => Color::from_rgb(0.16, 0.25, 0.40),
+        }
+    } else {
+        match st {
+            button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+            button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+            _ => Color::from_rgb(0.18, 0.19, 0.22),
+        }
+    };
+    button::Style {
+        background: Some(iced::Background::Color(bg)),
+        text_color: if is_active {
+            Color::from_rgb(0.9, 0.92, 0.96)
+        } else {
+            Color::from_rgb(0.8, 0.82, 0.88)
+        },
+        border: iced::Border {
+            radius: 3.0.into(),
+            width: 1.0,
+            color: if is_active {
+                Color::from_rgb(0.3, 0.45, 0.7)
+            } else {
+                Color::from_rgb(0.25, 0.27, 0.30)
+            },
+        },
+        ..Default::default()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Small utility button used throughout the settings panel and toolbars.
 fn tool_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
     button(text(label).size(12))
         .on_press(msg)
         .padding(Padding::from([4, 10]))
-        .style(|_theme: &Theme, status| {
-            let bg = match status {
+        .style(|_theme: &Theme, st| button::Style {
+            background: Some(iced::Background::Color(match st {
                 button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
                 button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
                 _ => Color::from_rgb(0.18, 0.19, 0.22),
-            };
-            button::Style {
-                background: Some(iced::Background::Color(bg)),
-                text_color: Color::from_rgb(0.8, 0.82, 0.88),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: Color::from_rgb(0.25, 0.27, 0.30),
-                },
-                ..Default::default()
-            }
+            })),
+            text_color: Color::from_rgb(0.8, 0.82, 0.88),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.27, 0.30),
+            },
+            ..Default::default()
         })
         .into()
 }
 
+/// Format a `Duration` as `m:ss` (e.g. `3:07`).
 pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// Filter playlist entries by search query and optional favorites-only mode.
-/// Returns indices of entries that match (case-insensitive substring
-/// against title, author, released, and file path).
+/// Returns indices of matching entries (case-insensitive substring match against
+/// title, author, released year, file path, and PSID/RSID type string).
 pub fn filter_playlist(
     playlist: &Playlist,
     query: &str,
@@ -1544,29 +1566,24 @@ pub fn filter_playlist(
     favorites: &FavoritesDb,
 ) -> Vec<usize> {
     let q = query.to_lowercase();
-
     playlist
         .entries
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
-            // Favorites filter
             if favorites_only {
-                let is_fav = entry
+                if !entry
                     .md5
                     .as_ref()
                     .map(|m| favorites.is_favorite(m))
-                    .unwrap_or(false);
-                if !is_fav {
+                    .unwrap_or(false)
+                {
                     return false;
                 }
             }
-
-            // Text search filter
             if q.is_empty() {
                 return true;
             }
-
             let type_str = if entry.is_rsid { "rsid" } else { "psid" };
             entry.title.to_lowercase().contains(&q)
                 || entry.author.to_lowercase().contains(&q)
