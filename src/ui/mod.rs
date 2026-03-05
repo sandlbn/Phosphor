@@ -19,9 +19,12 @@ pub fn playlist_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-playlist")
 }
 
-/// Fixed scrollable ID for the recently played widget.
 pub fn recent_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-recent")
+}
+
+pub fn search_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("phosphor-search")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +109,11 @@ pub enum Message {
     // Sort
     SortBy(SortColumn),
 
+    // Keyboard navigation
+    SelectPrev,
+    SelectNext,
+    FocusSearch,
+
     // Recently played
     ShowRecentlyPlayed,
     PlayRecentEntry(usize),
@@ -153,6 +161,7 @@ pub enum Message {
 
     // Window
     WindowResized(f32, f32),
+    WindowMoved(i32, i32),
 
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
@@ -227,7 +236,7 @@ pub fn track_info_bar<'a>(
 
     let vis = visualizer.view();
 
-    // Heart button for currently playing track
+    // Heart button + scroll-to-current button for currently playing track
     let now_playing_buttons: Element<'_, Message> = if has_track {
         let heart_label = if is_now_playing_favorite {
             "♥"
@@ -587,6 +596,7 @@ pub fn search_bar<'a>(
     loading_status: &str,
 ) -> Element<'a, Message> {
     let search_input = text_input("Search playlist...", search_text)
+        .id(search_input_id()) // wired up so Ctrl+F can focus it
         .on_input(Message::SearchChanged)
         .size(13)
         .padding(Padding::from([4, 8]))
@@ -615,7 +625,7 @@ pub fn search_bar<'a>(
     };
 
     let count_color = if !loading_status.is_empty() {
-        Color::from_rgb(0.4, 0.75, 0.9) // Blue-ish for loading
+        Color::from_rgb(0.4, 0.75, 0.9) // blue-ish for loading
     } else {
         Color::from_rgb(0.5, 0.5, 0.6)
     };
@@ -1176,7 +1186,7 @@ pub fn settings_panel<'a>(
             } else {
                 format!("○ {display}")
             };
-            let btn = button(text(label).size(12))
+            button(text(label).size(12))
                 .on_press(Message::SetOutputEngine(name.to_string()))
                 .padding(Padding::from([4, 10]))
                 .width(Length::Fill)
@@ -1212,8 +1222,8 @@ pub fn settings_panel<'a>(
                         },
                         ..Default::default()
                     }
-                });
-            btn.into()
+                })
+                .into()
         })
         .collect();
 
@@ -1432,6 +1442,35 @@ pub fn settings_panel<'a>(
 
     let dl_section = column![dl_label, dl_url_input, dl_btn, load_btn, dl_status].spacing(6);
 
+    // ── Keyboard shortcuts reference ─────────────────────────────
+    let kb_label = text("Keyboard shortcuts:")
+        .size(14)
+        .color(Color::from_rgb(0.75, 0.77, 0.82));
+
+    let shortcuts = [
+        ("Space", "Play / Pause"),
+        ("← →", "Previous / Next track"),
+        ("↑ ↓", "Navigate playlist selection"),
+        ("Delete", "Remove selected track"),
+        ("Ctrl + F", "Focus search"),
+    ];
+
+    let mut kb_col = column![kb_label].spacing(4);
+    for (key, desc) in &shortcuts {
+        kb_col = kb_col.push(
+            row![
+                text(*key)
+                    .size(12)
+                    .color(Color::from_rgb(0.75, 0.88, 1.0))
+                    .width(Length::Fixed(100.0)),
+                text(*desc)
+                    .size(12)
+                    .color(Color::from_rgb(0.65, 0.67, 0.72)),
+            ]
+            .spacing(8),
+        );
+    }
+
     // ── Assemble ─────────────────────────────────────────────────
     let content = column![
         header,
@@ -1445,6 +1484,8 @@ pub fn settings_panel<'a>(
         length_section,
         rule::horizontal(1),
         dl_section,
+        rule::horizontal(1),
+        kb_col,
     ]
     .spacing(16)
     .padding(Padding::from([16, 24]))

@@ -8,6 +8,10 @@ use std::path::PathBuf;
 pub const DEFAULT_SONGLENGTH_URL: &str =
     "https://hvsc.c64.org/download/C64Music/DOCUMENTS/Songlengths.md5";
 
+/// Default window dimensions — used on first launch.
+const DEFAULT_WINDOW_WIDTH: f32 = 900.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 600.0;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Skip RSID tunes during playback (auto-advance to next PSID).
@@ -34,6 +38,12 @@ pub struct Config {
     /// Force stereo mirroring for 2SID tunes (duplicate SID1 writes to SID2).
     /// When enabled, 2SID tunes play in mono-stereo mode instead of true dual-SID.
     pub force_stereo_2sid: bool,
+    /// Last known window position — restored on next launch.
+    pub window_x: Option<i32>,
+    pub window_y: Option<i32>,
+    /// Last known window size — restored on next launch.
+    pub window_width_saved: f32,
+    pub window_height_saved: f32,
 }
 
 impl Default for Config {
@@ -50,6 +60,10 @@ impl Default for Config {
             last_songlength_file: None,
             last_playlist_dir: None,
             force_stereo_2sid: false,
+            window_x: None,
+            window_y: None,
+            window_width_saved: DEFAULT_WINDOW_WIDTH,
+            window_height_saved: DEFAULT_WINDOW_HEIGHT,
         }
     }
 }
@@ -109,11 +123,7 @@ impl Config {
             let line = line.trim().trim_end_matches(',');
             if let Some(rest) = line.strip_prefix("\"skip_rsid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
-                if val == "true" {
-                    config.skip_rsid = true;
-                } else {
-                    config.skip_rsid = false;
-                }
+                config.skip_rsid = val == "true";
             } else if let Some(rest) = line.strip_prefix("\"default_song_length_secs\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if let Ok(n) = val.parse::<u32>() {
@@ -162,6 +172,31 @@ impl Config {
             } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.force_stereo_2sid = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"window_x\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.window_x = val.parse::<i32>().ok();
+                }
+            } else if let Some(rest) = line.strip_prefix("\"window_y\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.window_y = val.parse::<i32>().ok();
+                }
+            } else if let Some(rest) = line.strip_prefix("\"window_width_saved\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Ok(n) = val.parse::<f32>() {
+                    // Sanity clamp: ignore absurd values from a corrupt config
+                    if n >= 400.0 && n <= 8000.0 {
+                        config.window_width_saved = n;
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("\"window_height_saved\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Ok(n) = val.parse::<f32>() {
+                    if n >= 300.0 && n <= 6000.0 {
+                        config.window_height_saved = n;
+                    }
+                }
             }
         }
 
@@ -170,9 +205,15 @@ impl Config {
 
     /// Serialize config to a JSON string.
     fn to_json(&self) -> String {
-        let fmt_opt = |v: &Option<String>| -> String {
+        let fmt_opt_str = |v: &Option<String>| -> String {
             match v {
                 Some(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+                None => "null".to_string(),
+            }
+        };
+        let fmt_opt_i32 = |v: Option<i32>| -> String {
+            match v {
+                Some(n) => n.to_string(),
                 None => "null".to_string(),
             }
         };
@@ -189,7 +230,11 @@ impl Config {
                 "  \"last_songlength_dir\": {},\n",
                 "  \"last_songlength_file\": {},\n",
                 "  \"last_playlist_dir\": {},\n",
-                "  \"force_stereo_2sid\": {}\n",
+                "  \"force_stereo_2sid\": {},\n",
+                "  \"window_x\": {},\n",
+                "  \"window_y\": {},\n",
+                "  \"window_width_saved\": {},\n",
+                "  \"window_height_saved\": {}\n",
                 "}}\n",
             ),
             self.skip_rsid,
@@ -198,11 +243,15 @@ impl Config {
             self.output_engine,
             self.u64_address.replace('\\', "\\\\").replace('"', "\\\""),
             self.u64_password.replace('\\', "\\\\").replace('"', "\\\""),
-            fmt_opt(&self.last_sid_dir),
-            fmt_opt(&self.last_songlength_dir),
-            fmt_opt(&self.last_songlength_file),
-            fmt_opt(&self.last_playlist_dir),
+            fmt_opt_str(&self.last_sid_dir),
+            fmt_opt_str(&self.last_songlength_dir),
+            fmt_opt_str(&self.last_songlength_file),
+            fmt_opt_str(&self.last_playlist_dir),
             self.force_stereo_2sid,
+            fmt_opt_i32(self.window_x),
+            fmt_opt_i32(self.window_y),
+            self.window_width_saved,
+            self.window_height_saved,
         )
     }
 
