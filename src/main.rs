@@ -154,8 +154,8 @@ impl App {
                         Err(e) => eprintln!("[phosphor] Failed to load playlist: {e}"),
                     },
                     _ => {
-                        let _ = playlist.add_file(&path);
-                    } // try anyway
+                        let _ = playlist.add_file(&path); // try anyway
+                    }
                 }
             }
         }
@@ -201,6 +201,7 @@ impl App {
 
         let favorites = FavoritesDb::load();
         let recently_played = RecentlyPlayed::load();
+        let window_width = config.window_width_saved;
 
         let app = Self {
             cmd_tx,
@@ -231,7 +232,7 @@ impl App {
             new_version: None,
             favorites,
             favorites_only: false,
-            window_width: 900.0,
+            window_width,
             recently_played,
             show_recently_played: false,
         };
@@ -457,7 +458,7 @@ impl App {
                 }
             }
 
-            // ── Drag & drop ─────────────────────────────────────────
+            // ── Drag & drop ──────────────────────────────────────────────
             Message::FileDropped(path) => {
                 let ext = path
                     .extension()
@@ -606,7 +607,7 @@ impl App {
                 }
             }
 
-            // ── Search / filter ───────────────────────────────────────
+            // ── Search / filter ───────────────────────────────────────────
             Message::SearchChanged(query) => {
                 self.search_text = query;
                 let mut indices = ui::filter_playlist(
@@ -629,7 +630,7 @@ impl App {
                 self.rebuild_filter();
             }
 
-            // ── Sort ─────────────────────────────────────────────────────
+            // ── Sort ──────────────────────────────────────────────────────
             Message::SortBy(col) => {
                 if self.sort_column == col {
                     // Same column — flip direction
@@ -640,6 +641,59 @@ impl App {
                     self.sort_direction = SortDirection::Ascending;
                 }
                 self.rebuild_filter();
+            }
+
+            // ── Keyboard navigation ───────────────────────────────────────
+            Message::SelectNext => {
+                if self.filtered_indices.is_empty() {
+                    return Task::none();
+                }
+                // Find position of current selection in filtered list, move down one
+                let current_pos = self
+                    .selected
+                    .and_then(|sel| self.filtered_indices.iter().position(|&i| i == sel))
+                    .unwrap_or(0);
+                let next_pos = (current_pos + 1).min(self.filtered_indices.len() - 1);
+                self.selected = Some(self.filtered_indices[next_pos]);
+                // Scroll to keep selection visible
+                let total = self.filtered_indices.len();
+                if total > 1 {
+                    let fraction = next_pos as f32 / (total - 1) as f32;
+                    return iced::widget::operation::snap_to(
+                        ui::playlist_scrollable_id(),
+                        iced::widget::scrollable::RelativeOffset {
+                            x: 0.0,
+                            y: fraction,
+                        },
+                    );
+                }
+            }
+
+            Message::SelectPrev => {
+                if self.filtered_indices.is_empty() {
+                    return Task::none();
+                }
+                let current_pos = self
+                    .selected
+                    .and_then(|sel| self.filtered_indices.iter().position(|&i| i == sel))
+                    .unwrap_or(0);
+                let prev_pos = current_pos.saturating_sub(1);
+                self.selected = Some(self.filtered_indices[prev_pos]);
+                let total = self.filtered_indices.len();
+                if total > 1 {
+                    let fraction = prev_pos as f32 / (total - 1) as f32;
+                    return iced::widget::operation::snap_to(
+                        ui::playlist_scrollable_id(),
+                        iced::widget::scrollable::RelativeOffset {
+                            x: 0.0,
+                            y: fraction,
+                        },
+                    );
+                }
+            }
+
+            Message::FocusSearch => {
+                return iced::widget::operation::focus(ui::search_input_id());
             }
 
             // ── Recently played ───────────────────────────────────────────
@@ -666,22 +720,20 @@ impl App {
                         // Found in playlist — play it normally
                         self.show_recently_played = false;
                         self.play_track(idx);
-                    } else {
+                    } else if recent_entry.path.exists() {
                         // Not in current playlist — add it then play
-                        if recent_entry.path.exists() {
-                            let paths = vec![recent_entry.path.clone()];
-                            let pg = self.loading_progress.clone();
-                            self.show_recently_played = false;
-                            return Task::perform(
-                                async move { playlist::parse_files(paths, pg) },
-                                Message::FilesLoaded,
-                            );
-                        } else {
-                            eprintln!(
-                                "[phosphor] Recent entry path no longer exists: {}",
-                                recent_entry.path.display()
-                            );
-                        }
+                        let paths = vec![recent_entry.path.clone()];
+                        let pg = self.loading_progress.clone();
+                        self.show_recently_played = false;
+                        return Task::perform(
+                            async move { playlist::parse_files(paths, pg) },
+                            Message::FilesLoaded,
+                        );
+                    } else {
+                        eprintln!(
+                            "[phosphor] Recent entry path no longer exists: {}",
+                            recent_entry.path.display()
+                        );
                     }
                 }
             }
@@ -692,7 +744,7 @@ impl App {
                 eprintln!("[phosphor] Recently played history cleared");
             }
 
-            // ── Settings ─────────────────────────────────────────────────
+            // ── Settings ──────────────────────────────────────────────────
             Message::ToggleSettings => {
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
@@ -803,7 +855,7 @@ impl App {
                 eprintln!("[phosphor] Songlength download failed: {e}");
             }
 
-            // ── Favorites ────────────────────────────────────────────────
+            // ── Favorites ─────────────────────────────────────────────────
             Message::ToggleFavorite(idx) => {
                 if let Some(entry) = self.playlist.entries.get(idx) {
                     if let Some(ref md5) = entry.md5 {
@@ -875,7 +927,7 @@ impl App {
                 }
             }
 
-            // ── Tick ─────────────────────────────────────────────────────
+            // ── Tick ──────────────────────────────────────────────────────
             Message::Tick => {
                 self.poll_status();
                 // Auto-scroll playlist to current track
@@ -921,8 +973,18 @@ impl App {
                 }
             }
 
-            Message::WindowResized(w, _h) => {
+            // ── Window ────────────────────────────────────────────────────
+            Message::WindowResized(w, h) => {
                 self.window_width = w;
+                self.config.window_width_saved = w;
+                self.config.window_height_saved = h;
+                self.config.save();
+            }
+
+            Message::WindowMoved(x, y) => {
+                self.config.window_x = Some(x);
+                self.config.window_y = Some(y);
+                self.config.save();
             }
 
             Message::None => {}
@@ -966,46 +1028,42 @@ impl App {
                 &self.download_status,
             );
 
-            let content = column![
+            container(column![
                 info_bar,
                 progress,
                 rule::horizontal(1),
                 controls,
                 rule::horizontal(1),
                 settings,
-            ];
-
-            container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
-                    ..Default::default()
-                })
-                .into()
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+                ..Default::default()
+            })
+            .into()
         } else if self.show_recently_played {
             // Recently played panel
             let current_md5 = self.playlist.current_entry().and_then(|e| e.md5.as_deref());
 
             let recent_panel = ui::recently_played_view(&self.recently_played, current_md5);
 
-            let content = column![
+            container(column![
                 info_bar,
                 progress,
                 rule::horizontal(1),
                 controls,
                 rule::horizontal(1),
                 recent_panel,
-            ];
-
-            container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
-                    ..Default::default()
-                })
-                .into()
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+                ..Default::default()
+            })
+            .into()
         } else {
             // Normal view: search + playlist
             let loading_status = self
@@ -1031,7 +1089,7 @@ impl App {
                 self.sort_direction,
             );
 
-            let content = column![
+            container(column![
                 info_bar,
                 progress,
                 rule::horizontal(1),
@@ -1040,16 +1098,14 @@ impl App {
                 search,
                 rule::horizontal(1),
                 playlist_widget,
-            ];
-
-            container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
-                    ..Default::default()
-                })
-                .into()
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+                ..Default::default()
+            })
+            .into()
         }
     }
 
@@ -1057,13 +1113,38 @@ impl App {
         // Tick at ~30 Hz for smooth visualisation + status polling.
         let tick = time::every(Duration::from_millis(33)).map(|_| Message::Tick);
 
-        // Listen for file-drop and window-resize events from the OS.
+        // Listen for OS window events and keyboard shortcuts.
         let window_events = event::listen_with(|event, _status, _id| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
             }
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(size.width, size.height))
+            }
+            iced::Event::Window(iced::window::Event::Moved(point)) => {
+                Some(Message::WindowMoved(point.x as i32, point.y as i32))
+            }
+            // ── Keyboard shortcuts ────────────────────────────────────────
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                use iced::keyboard::key::Named;
+                use iced::keyboard::Key;
+                match key {
+                    // Space — play / pause
+                    Key::Named(Named::Space) => Some(Message::PlayPause),
+                    // Left / Right — previous / next track
+                    Key::Named(Named::ArrowLeft) => Some(Message::PrevTrack),
+                    Key::Named(Named::ArrowRight) => Some(Message::NextTrack),
+                    // Up / Down — navigate playlist selection
+                    Key::Named(Named::ArrowUp) => Some(Message::SelectPrev),
+                    Key::Named(Named::ArrowDown) => Some(Message::SelectNext),
+                    // Delete — remove selected track
+                    Key::Named(Named::Delete) => Some(Message::RemoveSelected),
+                    // Ctrl+F — focus search input
+                    Key::Character(ref c) if c.as_str() == "f" && modifiers.control() => {
+                        Some(Message::FocusSearch)
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         });
@@ -1075,13 +1156,13 @@ impl App {
         Theme::Dark
     }
 
-    // ── Internal ─────────────────────────────────────────────────────────
+    // ── Internal ──────────────────────────────────────────────────────────
 
     fn play_track(&mut self, idx: usize) {
         if let Some(entry) = self.playlist.entries.get(idx) {
             // Skip RSID tunes if configured
             if self.config.skip_rsid && entry.is_rsid {
-                eprintln!("[phosphor] Skipping RSID tune: \"{}\"", entry.title,);
+                eprintln!("[phosphor] Skipping RSID tune: \"{}\"", entry.title);
                 self.playlist.current = Some(idx);
                 // Try next track (avoid infinite loop by tracking visited)
                 if let Some(next_idx) = self.playlist.next() {
@@ -1140,9 +1221,9 @@ impl App {
         // Update visualiser
         self.visualizer.update(&self.status.voice_levels);
 
-        // Auto-advance: SID tunes loop forever, so we must check
-        // elapsed time against the Songlength duration while playing
-        // and force-advance to the next track or sub-tune.
+        // Auto-advance: SID tunes loop forever, so we must check elapsed time
+        // against the Songlength duration while playing and force-advance to
+        // the next track or sub-tune.
         if self.status.state == PlayState::Playing {
             if let Some(cur_idx) = self.playlist.current {
                 // Extract what we need from the entry before mutating
@@ -1168,7 +1249,6 @@ impl App {
                                     .and_then(|db| db.lookup(m, subtune_idx))
                             })
                             .or_else(|| {
-                                // Use default length if no DB entry
                                 let def = self.config.default_song_length_secs;
                                 if def > 0 {
                                     Some(def)
@@ -1270,7 +1350,7 @@ fn sort_indices(
             },
 
             SortColumn::SidType =>
-            // false (PSID) < true (RSID), so ascending puts PSID first
+            // false (PSID) < true (RSID) — ascending puts PSID first
             {
                 ea.is_rsid.cmp(&eb.is_rsid)
             }
@@ -1343,9 +1423,8 @@ async fn pick_files(start_dir: Option<String>) -> Vec<PathBuf> {
         }
     }
 
-    let result = dialog.pick_files().await;
-
-    result
+    rfd::AsyncFileDialog::pick_files(dialog)
+        .await
         .map(|handles| handles.iter().map(|h| h.path().to_path_buf()).collect())
         .unwrap_or_default()
 }
@@ -1412,9 +1491,7 @@ async fn save_playlist_dialog(
         }
     }
 
-    let handle = dialog.save_file().await;
-
-    match handle {
+    match dialog.save_file().await {
         Some(h) => {
             let path = h.path().to_path_buf();
             write_m3u(&path, &entries)?;
@@ -1463,7 +1540,7 @@ fn parse_sid4_from_args() -> u16 {
 
 fn parse_hex_addr(s: &str) -> Option<u16> {
     let s = s.trim();
-    let hex = if let Some(h) = s.strip_prefix("$") {
+    let hex = if let Some(h) = s.strip_prefix('$') {
         h
     } else if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         h
@@ -1490,6 +1567,10 @@ async fn flush_frame() {
 fn main() -> iced::Result {
     env_logger::init();
 
+    // Load config here to restore window geometry before iced initialises the window.
+    // App::boot() loads it again independently for the rest of the app state.
+    let config_for_window = Config::load();
+
     let icon = {
         let bytes = include_bytes!("../assets/phosphor.png");
         let img = image::load_from_memory(bytes)
@@ -1503,9 +1584,19 @@ fn main() -> iced::Result {
         .title(|_: &App| format!("Phosphor v{}", env!("CARGO_PKG_VERSION")))
         .subscription(App::subscription)
         .theme(App::theme)
-        .window_size((900.0, 600.0))
+        .window_size((
+            config_for_window.window_width_saved,
+            config_for_window.window_height_saved,
+        ))
         .window(iced::window::Settings {
             icon: Some(icon),
+            // Restore last window position if we have one, otherwise let the OS decide.
+            position: match (config_for_window.window_x, config_for_window.window_y) {
+                (Some(x), Some(y)) => {
+                    iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))
+                }
+                _ => iced::window::Position::Default,
+            },
             ..Default::default()
         })
         .run()
