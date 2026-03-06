@@ -121,6 +121,11 @@ pub enum Message {
     SelectNext,
     FocusSearch,
 
+    // Virtual scroll — fired by the scrollable widget on every scroll event.
+    /// Carries the new absolute Y offset in pixels so the virtual list can
+    /// recompute which rows are in the viewport.
+    PlaylistScrolled(iced::widget::scrollable::Viewport),
+
     // Context menu
     ShowContextMenu(usize, f32, f32), // track_idx, abs_x, abs_y
     DismissContextMenu,
@@ -693,8 +698,26 @@ pub fn search_bar<'a>(
     .into()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Virtual list constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Height of a single playlist row in logical pixels.
+/// Must match the actual rendered height: 4px top pad + 13px text + 4px bottom
+/// pad + 1px rule = 22px.  We add a small buffer (26px) so a partially visible
+/// row at either edge is always included.
+pub const ROW_HEIGHT: f32 = 26.0;
+
+/// Number of extra rows to render above and below the visible window.
+/// Acts as a scroll lookahead so rows don't pop in mid-scroll.
+const OVERSCAN: usize = 8;
+
 /// Build the scrollable playlist table with sortable column headers.
 /// `filtered_indices` maps visible row position → actual `playlist.entries` index.
+///
+/// Virtual scrolling: only the rows currently in the viewport (plus `OVERSCAN`
+/// above/below) are built as iced widgets.  The rest of the space is filled by
+/// two `Space` widgets so the scrollbar thumb stays correctly sized.
 pub fn playlist_view<'a>(
     playlist: &Playlist,
     selected: Option<usize>,
@@ -702,6 +725,8 @@ pub fn playlist_view<'a>(
     favorites: &FavoritesDb,
     sort_col: SortColumn,
     sort_dir: SortDirection,
+    scroll_offset_y: f32,
+    viewport_height: f32,
 ) -> Element<'a, Message> {
     let header_btn = move |label: &'static str, col: SortColumn| -> Element<'a, Message> {
         let is_active = sort_col == col;
@@ -776,7 +801,23 @@ pub fn playlist_view<'a>(
                 .center_x(Length::Fill),
         );
     } else {
-        for (display_pos, &actual_idx) in filtered_indices.iter().enumerate() {
+        let total_rows = filtered_indices.len();
+
+        // ── Virtual window calculation ────────────────────────────────────
+        // Compute which rows are visible, with overscan on both sides.
+        let first_visible = ((scroll_offset_y / ROW_HEIGHT) as usize).saturating_sub(OVERSCAN);
+        let rows_in_view = (viewport_height / ROW_HEIGHT).ceil() as usize + 1;
+        let last_visible = (first_visible + rows_in_view + OVERSCAN * 2).min(total_rows);
+
+        // Top spacer — replaces all rows above the render window
+        let top_space = first_visible as f32 * ROW_HEIGHT;
+        if top_space > 0.0 {
+            rows = rows.push(Space::new().height(Length::Fixed(top_space)));
+        }
+
+        // Visible rows — only these are built as iced widgets
+        for display_pos in first_visible..last_visible {
+            let actual_idx = filtered_indices[display_pos];
             if let Some(entry) = playlist.entries.get(actual_idx) {
                 let is_current = playlist.current == Some(actual_idx);
                 let is_selected = selected == Some(actual_idx);
@@ -795,10 +836,18 @@ pub fn playlist_view<'a>(
                 ));
             }
         }
+
+        // Bottom spacer — replaces all rows below the render window
+        let bottom_rows = total_rows.saturating_sub(last_visible);
+        let bottom_space = bottom_rows as f32 * ROW_HEIGHT;
+        if bottom_space > 0.0 {
+            rows = rows.push(Space::new().height(Length::Fixed(bottom_space)));
+        }
     }
 
     scrollable(rows)
         .id(playlist_scrollable_id())
+        .on_scroll(Message::PlaylistScrolled)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -1445,7 +1494,7 @@ pub fn settings_panel<'a>(
         .color(Color::from_rgb(0.75, 0.77, 0.82))]
     .spacing(4);
     for (key, desc) in [
-        ("Space", "Play / Pause"),
+        ("Space", "Play / Pause (when search inactive)"),
         ("← →", "Previous / Next track"),
         ("↑ ↓", "Navigate playlist"),
         ("Delete", "Remove selected"),
