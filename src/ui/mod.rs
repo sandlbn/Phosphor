@@ -179,6 +179,10 @@ pub enum Message {
     WindowResized(f32, f32),
     WindowMoved(i32, i32),
 
+    // Visualiser
+    /// Toggle between Bar and Scope display modes.
+    ToggleVisMode,
+
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,

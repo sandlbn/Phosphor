@@ -1040,6 +1040,10 @@ impl App {
                 self.config.save();
             }
 
+            Message::ToggleVisMode => {
+                self.visualizer.toggle_mode();
+            }
+
             Message::None => {}
         }
 
