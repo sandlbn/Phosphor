@@ -114,6 +114,13 @@ struct App {
     /// Whether the recently played panel is visible instead of the playlist.
     show_recently_played: bool,
 
+    /// Absolute Y scroll offset of the playlist in pixels (updated by on_scroll).
+    /// Used by the virtual list to compute which rows are in the viewport.
+    playlist_scroll_offset_y: f32,
+    /// Height of the playlist viewport in pixels (updated by on_scroll).
+    /// Falls back to `window_height` as an estimate before the first scroll event.
+    playlist_viewport_height: f32,
+
     /// Some(_) when the right-click context menu is visible.
     context_menu: Option<ContextMenu>,
 }
@@ -247,6 +254,10 @@ impl App {
             window_height,
             recently_played,
             show_recently_played: false,
+            playlist_scroll_offset_y: 0.0,
+            // Use the saved window height as a reasonable first-frame estimate;
+            // the real value arrives with the first PlaylistScrolled event.
+            playlist_viewport_height: window_height,
             context_menu: None,
         };
 
@@ -738,6 +749,9 @@ impl App {
                 let next = (cur + 1).min(self.filtered_indices.len() - 1);
                 self.selected = Some(self.filtered_indices[next]);
                 let total = self.filtered_indices.len();
+                // Update virtual scroll offset immediately so the newly selected
+                // row is included in the render window before the snap_to fires.
+                self.playlist_scroll_offset_y = next as f32 * ui::ROW_HEIGHT;
                 if total > 1 {
                     return iced::widget::operation::snap_to(
                         ui::playlist_scrollable_id(),
@@ -761,6 +775,8 @@ impl App {
                 let prev = cur.saturating_sub(1);
                 self.selected = Some(self.filtered_indices[prev]);
                 let total = self.filtered_indices.len();
+                // Same immediate update for SelectPrev.
+                self.playlist_scroll_offset_y = prev as f32 * ui::ROW_HEIGHT;
                 if total > 1 {
                     return iced::widget::operation::snap_to(
                         ui::playlist_scrollable_id(),
@@ -1044,6 +1060,14 @@ impl App {
                 self.visualizer.toggle_mode();
             }
 
+            // ── Virtual scroll ────────────────────────────────────────────
+            Message::PlaylistScrolled(viewport) => {
+                // Store absolute Y offset and viewport height so playlist_view()
+                // can compute the visible window on the next view() call.
+                self.playlist_scroll_offset_y = viewport.absolute_offset().y;
+                self.playlist_viewport_height = viewport.bounds().height;
+            }
+
             Message::None => {}
         }
 
@@ -1124,6 +1148,8 @@ impl App {
                 &self.favorites,
                 self.sort_column,
                 self.sort_direction,
+                self.playlist_scroll_offset_y,
+                self.playlist_viewport_height,
             );
             column![
                 info_bar,
@@ -1169,7 +1195,7 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let tick = time::every(Duration::from_millis(33)).map(|_| Message::Tick);
 
-        let window_events = event::listen_with(|event, _status, _id| match event {
+        let window_events = event::listen_with(|event, status, _id| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
             }
@@ -1180,10 +1206,15 @@ impl App {
                 Some(Message::WindowMoved(point.x as i32, point.y as i32))
             }
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                use iced::event::Status;
                 use iced::keyboard::key::Named;
                 use iced::keyboard::Key;
                 match key {
-                    Key::Named(Named::Space) => Some(Message::PlayPause),
+                    // Space only fires when no widget has captured the event —
+                    // prevents stopping playback while typing in the search box.
+                    Key::Named(Named::Space) if status != Status::Captured => {
+                        Some(Message::PlayPause)
+                    }
                     Key::Named(Named::ArrowLeft) => Some(Message::PrevTrack),
                     Key::Named(Named::ArrowRight) => Some(Message::NextTrack),
                     Key::Named(Named::ArrowUp) => Some(Message::SelectPrev),
@@ -1350,6 +1381,9 @@ impl App {
             self.sort_direction,
         );
         self.filtered_indices = indices;
+        // Scroll back to top whenever the visible set changes so the virtual
+        // window starts at row 0 rather than mid-list with wrong rows shown.
+        self.playlist_scroll_offset_y = 0.0;
     }
 }
 
