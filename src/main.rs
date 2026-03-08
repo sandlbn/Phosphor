@@ -113,6 +113,8 @@ struct App {
     recently_played: RecentlyPlayed,
     /// Whether the recently played panel is visible instead of the playlist.
     show_recently_played: bool,
+    /// Whether the SID register info panel is visible instead of the playlist.
+    show_sid_panel: bool,
 
     /// Absolute Y scroll offset of the playlist in pixels (updated by on_scroll).
     /// Used by the virtual list to compute which rows are in the viewport.
@@ -231,6 +233,7 @@ impl App {
                 voice_levels: vec![],
                 writes_per_frame: 0,
                 error: None,
+                sid_regs: vec![0u8; 128],
             },
             playlist,
             selected: None,
@@ -254,6 +257,7 @@ impl App {
             window_height,
             recently_played,
             show_recently_played: false,
+            show_sid_panel: false,
             playlist_scroll_offset_y: 0.0,
             // Use the saved window height as a reasonable first-frame estimate;
             // the real value arrives with the first PlaylistScrolled event.
@@ -799,6 +803,7 @@ impl App {
                 self.show_recently_played = !self.show_recently_played;
                 if self.show_recently_played {
                     self.show_settings = false;
+                    self.show_sid_panel = false;
                 }
             }
 
@@ -841,6 +846,7 @@ impl App {
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
                     self.show_recently_played = false;
+                    self.show_sid_panel = false;
                 }
             }
 
@@ -1060,6 +1066,16 @@ impl App {
                 self.visualizer.toggle_mode();
             }
 
+            Message::ToggleSidPanel => {
+                self.show_sid_panel = !self.show_sid_panel;
+                // Mutually exclusive with other panels
+                if self.show_sid_panel {
+                    self.show_settings = false;
+                    self.show_recently_played = false;
+                }
+                self.context_menu = None;
+            }
+
             // ── Virtual scroll ────────────────────────────────────────────
             Message::PlaylistScrolled(viewport) => {
                 // Store absolute Y offset and viewport height so playlist_view()
@@ -1095,6 +1111,7 @@ impl App {
             self.new_version.as_ref(),
             self.window_width,
             self.show_recently_played,
+            self.show_sid_panel,
         );
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
         let progress = ui::progress_bar(&self.status, current_duration);
@@ -1125,6 +1142,29 @@ impl App {
                 controls,
                 rule::horizontal(1),
                 recent_panel
+            ]
+            .into()
+        } else if self.show_sid_panel {
+            let num_sids = self
+                .status
+                .track_info
+                .as_ref()
+                .map(|i| i.num_sids)
+                .unwrap_or(1);
+            let is_pal = self
+                .status
+                .track_info
+                .as_ref()
+                .map(|i| i.is_pal)
+                .unwrap_or(true);
+            let sid_view = ui::sid_panel::sid_panel(&self.status.sid_regs, num_sids, is_pal);
+            column![
+                info_bar,
+                progress,
+                rule::horizontal(1),
+                controls,
+                rule::horizontal(1),
+                sid_view
             ]
             .into()
         } else {

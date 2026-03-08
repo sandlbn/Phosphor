@@ -1,4 +1,5 @@
 pub mod right_click;
+pub mod sid_panel;
 pub mod visualizer;
 
 use std::path::PathBuf;
@@ -187,6 +188,11 @@ pub enum Message {
     // Visualiser
     /// Toggle between Bar and Scope display modes.
     ToggleVisMode,
+
+    // Panels
+    /// Toggle the SID register info panel (mutually exclusive with settings
+    /// and recently played).
+    ToggleSidPanel,
 
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
@@ -384,6 +390,7 @@ pub fn controls_bar<'a>(
     new_version: Option<&crate::version_check::NewVersionInfo>,
     window_width: f32,
     show_recently_played: bool,
+    show_sid_panel: bool,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let btn_size = if compact { 11.0_f32 } else { 12.0 };
@@ -492,6 +499,45 @@ pub fn controls_bar<'a>(
             })
             .into();
 
+    let sid_btn: Element<'a, Message> =
+        button(text(if compact { "SID" } else { "SID" }).size(btn_size))
+            .on_press(Message::ToggleSidPanel)
+            .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+            .style(move |_theme: &Theme, st| {
+                let bg = if show_sid_panel {
+                    match st {
+                        button::Status::Hovered => Color::from_rgb(0.15, 0.35, 0.25),
+                        button::Status::Pressed => Color::from_rgb(0.10, 0.28, 0.18),
+                        _ => Color::from_rgb(0.11, 0.30, 0.20),
+                    }
+                } else {
+                    match st {
+                        button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                        button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                        _ => Color::from_rgb(0.18, 0.19, 0.22),
+                    }
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: if show_sid_panel {
+                        Color::from_rgb(0.30, 0.85, 0.55)
+                    } else {
+                        Color::from_rgb(0.8, 0.82, 0.88)
+                    },
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: if show_sid_panel {
+                            Color::from_rgb(0.20, 0.55, 0.35)
+                        } else {
+                            Color::from_rgb(0.25, 0.27, 0.30)
+                        },
+                    },
+                    ..Default::default()
+                }
+            })
+            .into();
+
     let playlist_controls = if compact {
         row![
             small_button("+Files", Message::AddFiles),
@@ -500,6 +546,7 @@ pub fn controls_bar<'a>(
             small_button("💾", Message::SavePlaylist),
             small_button("🗑", Message::ClearPlaylist),
             recent_btn,
+            sid_btn,
             small_button("⚙", Message::ToggleSettings),
         ]
         .spacing(3)
@@ -511,6 +558,7 @@ pub fn controls_bar<'a>(
             small_button("💾 Save", Message::SavePlaylist),
             small_button("🗑 Clear", Message::ClearPlaylist),
             recent_btn,
+            sid_btn,
             small_button("⚙", Message::ToggleSettings),
         ]
         .spacing(4)
