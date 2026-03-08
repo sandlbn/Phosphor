@@ -50,6 +50,9 @@ pub struct PlayerStatus {
     pub voice_levels: Vec<f32>,
     pub writes_per_frame: usize,
     pub error: Option<String>,
+    /// Raw SID register shadow — 128 bytes (4 SIDs × 32 bytes each).
+    /// Indices 0x00–0x1F = SID1, 0x20–0x3F = SID2, etc.
+    pub sid_regs: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -376,14 +379,15 @@ fn send_status(
     error: &Option<String>,
     tx: &Sender<PlayerStatus>,
 ) {
-    let (info, elapsed, levels, writes) = match ctx {
+    let (info, elapsed, levels, writes, regs) = match ctx {
         Some(c) => (
             Some(c.track_info.clone()),
             c.elapsed,
             c.voice_levels(),
             c.sid_writes().len(),
+            c.sid_regs(),
         ),
-        None => (None, Duration::ZERO, vec![], 0),
+        None => (None, Duration::ZERO, vec![], 0, vec![0u8; 128]),
     };
 
     let _ = tx.try_send(PlayerStatus {
@@ -393,6 +397,7 @@ fn send_status(
         voice_levels: levels,
         writes_per_frame: writes,
         error: error.clone(),
+        sid_regs: regs,
     });
 }
 
@@ -855,6 +860,18 @@ impl PlayContext {
             PlayEngine::Native { shadow } => match shadow {
                 NativeShadow::Psid { cpu, .. } => cpu.memory.voice_levels(),
                 NativeShadow::Rsid { cpu, .. } => cpu.memory.voice_levels(),
+            },
+        }
+    }
+
+    /// Return a copy of the raw SID register shadow for the UI panel.
+    fn sid_regs(&self) -> Vec<u8> {
+        match &self.engine {
+            PlayEngine::Psid(cpu) => cpu.memory.sid_shadow.to_vec(),
+            PlayEngine::Rsid { cpu, .. } => cpu.memory.sid_shadow.to_vec(),
+            PlayEngine::Native { shadow } => match shadow {
+                NativeShadow::Psid { cpu, .. } => cpu.memory.sid_shadow.to_vec(),
+                NativeShadow::Rsid { cpu, .. } => cpu.memory.sid_shadow.to_vec(),
             },
         }
     }
