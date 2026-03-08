@@ -760,34 +760,33 @@ pub fn playlist_view<'a>(
             .into()
     };
 
-    let header_row = row![
-        text("♥")
-            .size(11)
-            .color(Color::from_rgb(0.5, 0.5, 0.6))
-            .width(Length::Fixed(22.0)),
-        container(header_btn("#", SortColumn::Index)).width(Length::Fixed(50.0)),
-        container(header_btn("Title", SortColumn::Title)).width(Length::FillPortion(4)),
-        container(header_btn("Author", SortColumn::Author)).width(Length::FillPortion(3)),
-        container(header_btn("Released", SortColumn::Released)).width(Length::FillPortion(2)),
-        container(header_btn("Time", SortColumn::Duration)).width(Length::Fixed(55.0)),
-        container(header_btn("Type", SortColumn::SidType)).width(Length::Fixed(42.0)),
-        container(header_btn("SIDs", SortColumn::NumSids)).width(Length::Fixed(45.0)),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .padding(Padding::from([4, 16]));
+    // ── Header (lives outside the scrollable so it never scrolls away) ───────
+    let header = container(
+        row![
+            text("♥")
+                .size(11)
+                .color(Color::from_rgb(0.5, 0.5, 0.6))
+                .width(Length::Fixed(22.0)),
+            container(header_btn("#", SortColumn::Index)).width(Length::Fixed(50.0)),
+            container(header_btn("Title", SortColumn::Title)).width(Length::FillPortion(4)),
+            container(header_btn("Author", SortColumn::Author)).width(Length::FillPortion(3)),
+            container(header_btn("Released", SortColumn::Released)).width(Length::FillPortion(2)),
+            container(header_btn("Time", SortColumn::Duration)).width(Length::Fixed(55.0)),
+            container(header_btn("Type", SortColumn::SidType)).width(Length::Fixed(42.0)),
+            container(header_btn("SIDs", SortColumn::NumSids)).width(Length::Fixed(45.0)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([4, 16])),
+    )
+    .width(Length::Fill)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.15))),
+        ..Default::default()
+    });
 
-    let header = container(header_row)
-        .width(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.15))),
-            ..Default::default()
-        });
-
-    let mut rows = Column::new()
-        .spacing(0)
-        .push(header)
-        .push(rule::horizontal(1));
+    // ── Scrollable rows (no header inside) ───────────────────────────────────
+    let mut rows = Column::new().spacing(0);
 
     if filtered_indices.is_empty() {
         let msg = if playlist.is_empty() {
@@ -845,9 +844,16 @@ pub fn playlist_view<'a>(
         }
     }
 
-    scrollable(rows)
+    let scroll = scrollable(rows)
         .id(playlist_scrollable_id())
         .on_scroll(Message::PlaylistScrolled)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    // Stack header above the scrollable — both sit in a column so the header
+    // takes its natural height and the scrollable fills the rest.
+    column![header, rule::horizontal(1), scroll]
+        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
