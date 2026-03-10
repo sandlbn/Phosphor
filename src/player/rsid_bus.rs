@@ -8,6 +8,7 @@ use mos6502::memory::Bus;
 use crate::c64_emu::c64::{C64CiaModel, C64Model, C64};
 use crate::c64_emu::mmu::PageMapping;
 
+use super::hacks::HackFlags;
 use super::memory::{SidMapper, SidWrite, SID_REG_SIZE};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ pub struct RsidBus {
     mapper: SidMapper,
     mono: bool,
     osc3_seed: u32,
+    /// Hack flags set during setup; carried into the emulation loops.
+    pub hack_flags: HackFlags,
 }
 
 impl RsidBus {
@@ -73,6 +76,7 @@ impl RsidBus {
             mapper,
             mono,
             osc3_seed: 0x12345678,
+            hack_flags: HackFlags::default(),
         }
     }
 
@@ -128,48 +132,142 @@ impl RsidBus {
         // $E544 (CLRSCR) — RTS
         s!(0xE544, 0x60);
 
-        // $FF48: KERNAL IRQ entry — saves A/X/Y, checks BRK, dispatches
+        // ── $FF48: KERNAL IRQ entry ─────────────────────────────────────────
+        // Saves A/X/Y, checks if source is BRK (bit 4 of stacked P).
+        // Reference uses BEQ (F0): if B=0 (normal IRQ) branch skips the 3 NOPs
+        // and falls into JMP($0314).  If B=1 (BRK) fall through NOPs to JMP($0314)
+        // anyway — reference routes both through $0314.
+        // F0 03 = BEQ +3  (branch if B==0, i.e. normal IRQ → skip 3 NOPs to JMP)
         let kernal_irq: [u8; 19] = [
-            0x48, 0x8A, 0x48, 0x98, 0x48, 0xBA, 0xBD, 0x04, 0x01, 0x29, 0x10, 0xD0, 0x03, 0x6C,
-            0x14, 0x03, 0x6C, 0x16, 0x03,
+            0x48, 0x8A, 0x48, 0x98, 0x48,  // PHA; TXA;PHA; TYA;PHA
+            0xBA,                           // TSX
+            0xBD, 0x04, 0x01,               // LDA $0104,X  (stacked P)
+            0x29, 0x10,                     // AND #$10     (test B flag)
+            0xF0, 0x03,                     // BEQ +3       (normal IRQ → skip NOPs)
+            0xEA, 0xEA, 0xEA,               // NOP NOP NOP  (BRK path, falls through)
+            0x6C, 0x14, 0x03,               // JMP ($0314)  (user IRQ handler)
         ];
         rom[0xFF48 - 0xE000..0xFF48 - 0xE000 + 19].copy_from_slice(&kernal_irq);
 
-        // $EA31: Default IRQ handler — ack CIA1 + ack VIC + bump jiffy
-        s!(0xEA31, 0xAD);
-        s!(0xEA32, 0x0D);
-        s!(0xEA33, 0xDC); // LDA $DC0D
-        s!(0xEA34, 0xA9);
-        s!(0xEA35, 0xFF); // LDA #$FF
-        s!(0xEA36, 0x8D);
-        s!(0xEA37, 0x19);
-        s!(0xEA38, 0xD0); // STA $D019
-        s!(0xEA39, 0xEE);
-        s!(0xEA3A, 0xA2);
-        s!(0xEA3B, 0x00); // INC $00A2
-        s!(0xEA3C, 0x4C);
-        s!(0xEA3D, 0x81);
-        s!(0xEA3E, 0xEA); // JMP $EA81
+        // ── $EA31–$EA74: NOP sled (reference fills this range with NOPs) ───
+        // Tunes that JMP into the middle of the EA31 area still reach EA75.
+        for addr in 0xEA31u16..0xEA75 {
+            s!(addr, 0xEA); // NOP
+        }
 
-        // $EA81: IRQ exit — PLA; TAY; PLA; TAX; PLA; RTI
-        s!(0xEA81, 0x68);
-        s!(0xEA82, 0xA8);
-        s!(0xEA83, 0x68);
-        s!(0xEA84, 0xAA);
-        s!(0xEA85, 0x68);
-        s!(0xEA86, 0x40);
+        // ── $EA75: IRQ return handler (matches WebSid _irq_handler_EA75) ───
+        // LDA $01 / AND #$1F / STA $01 — restores KERNAL bank in case tune
+        //   switched it off; ensures $DC0D read goes through I/O.
+        // INC $A2  — jiffy clock lo-byte (frame counter)
+        // NOP      — timing pad (present in reference)
+        // LDA $DC0D — ack CIA1 interrupt (reading clears flags)
+        // PLA/TAY/PLA/TAX/PLA/RTI — restore Y, X, A; return from interrupt
+        let ea75: [u8; 18] = [
+            0xA5, 0x01,             // LDA $01
+            0x29, 0x1F,             // AND #$1F   (keep lower 5 bits = enable KERNAL/IO)
+            0x85, 0x01,             // STA $01    (restore bank: KERNAL+IO visible)
+            0xE6, 0xA2,             // INC $A2    (jiffy counter, frame tick)
+            0xEA,                   // NOP
+            0xAD, 0x0D, 0xDC,       // LDA $DC0D  (ack CIA1, clears interrupt flag)
+            0x68, 0xA8,             // PLA; TAY
+            0x68, 0xAA,             // PLA; TAX
+            0x68,                   // PLA
+            0x40,                   // RTI
+        ];
+        rom[0xEA75 - 0xE000..0xEA75 - 0xE000 + 18].copy_from_slice(&ea75);
 
-        // $FE43: KERNAL NMI entry
-        let kernal_nmi: [u8; 8] = [0x48, 0x8A, 0x48, 0x98, 0x48, 0x6C, 0x18, 0x03];
-        rom[0xFE43 - 0xE000..0xFE43 - 0xE000 + 8].copy_from_slice(&kernal_nmi);
+        // ── $EA81: IRQ exit — register restore + RTI (alias used by many tunes) ─
+        // (EA81 falls inside the NOP sled range above, so we patch it explicitly)
+        s!(0xEA81, 0x68); // PLA
+        s!(0xEA82, 0xA8); // TAY
+        s!(0xEA83, 0x68); // PLA
+        s!(0xEA84, 0xAA); // TAX
+        s!(0xEA85, 0x68); // PLA
+        s!(0xEA86, 0x40); // RTI
 
-        // $FE72: Default NMI handler — LDA $DD0D; JMP $EA81
-        s!(0xFE72, 0xAD);
+        // ── $FEBC: IRQ end handler (same as EA81 — PLA;TAY;PLA;TAX;PLA;RTI) ─
+        // Some tunes (e.g. Contact_Us_tune_2) JMP here to finish IRQ.
+        let febc: [u8; 6] = [0x68, 0xA8, 0x68, 0xAA, 0x68, 0x40];
+        rom[0xFEBC - 0xE000..0xFEBC - 0xE000 + 6].copy_from_slice(&febc);
+
+        // ── $FE43: KERNAL NMI entry ─────────────────────────────────────────
+        // Reference: SEI; JMP($0318)  — just disables IRQs and dispatches.
+        // Does NOT push A/X/Y.  Tunes save their own registers.
+        // (Our old stub pushed A,X,Y but never popped them → 3-byte stack leak
+        //  per NMI which would corrupt the stack within seconds of playback.)
+        let kernal_nmi: [u8; 5] = [
+            0x78,               // SEI
+            0x6C, 0x18, 0x03,   // JMP ($0318)  (user NMI handler)
+            0x40,               // RTI  (unreachable, just a safety net)
+        ];
+        rom[0xFE43 - 0xE000..0xFE43 - 0xE000 + 5].copy_from_slice(&kernal_nmi);
+
+        // ── $FE72: Default NMI handler — ack CIA2 + RTI ────────────────────
+        // FE43 does SEI; JMP($0318) without pushing any registers.
+        // So the default handler at $0318 must NOT pop registers either.
+        // Reference default $0318 points to FE47 = RTI (the last byte of FE43).
+        // We use FE72 as our default, matching that: just ack CIA2 and RTI.
+        // Tunes that need register save/restore install their own handler at $0318.
+        s!(0xFE72, 0xAD); // LDA $DD0D  (ack CIA2 NMI, clears interrupt flag)
         s!(0xFE73, 0x0D);
         s!(0xFE74, 0xDD);
-        s!(0xFE75, 0x4C);
-        s!(0xFE76, 0x81);
-        s!(0xFE77, 0xEA);
+        s!(0xFE75, 0x40); // RTI        (return — hardware already saved/restores PC+P)
+
+        // ── $FF6E: Schedule timer A (KERNAL routine used by some INIT code) ─
+        // Enables CIA1 timer-A interrupt and starts the timer with force-load.
+        // Then falls into $EE8E which raises the serial clock line on CIA2.
+        // Reference: LDA #$81; STA $DC0D; LDA $DC0E; AND #$80; ORA #$11;
+        //            STA $DC0E; JMP $EE8E
+        let ff6e: [u8; 18] = [
+            0xA9, 0x81,             // LDA #$81  (set CIA1 timer-A IRQ mask)
+            0x8D, 0x0D, 0xDC,       // STA $DC0D
+            0xAD, 0x0E, 0xDC,       // LDA $DC0E (read CRA)
+            0x29, 0x80,             // AND #$80  (keep TOD-frequency bit only)
+            0x09, 0x11,             // ORA #$11  (set start + force-load)
+            0x8D, 0x0E, 0xDC,       // STA $DC0E (write CRA: start timer)
+            0x4C, 0x8E, 0xEE,       // JMP $EE8E
+        ];
+        rom[0xFF6E - 0xE000..0xFF6E - 0xE000 + 18].copy_from_slice(&ff6e);
+
+        // ── $EE8E: Serial clock high (tail of FF6E, also called directly) ───
+        // Sets bit 4 of CIA2 port-A (serial clock line high), then RTS.
+        let ee8e: [u8; 9] = [
+            0xAD, 0x00, 0xDD,   // LDA $DD00
+            0x09, 0x10,         // ORA #$10
+            0x8D, 0x00, 0xDD,   // STA $DD00
+            0x60,               // RTS
+        ];
+        rom[0xEE8E - 0xE000..0xEE8E - 0xE000 + 9].copy_from_slice(&ee8e);
+
+        // ── $FDA3: Initialize I/O devices (KERNAL routine) ──────────────────
+        // Disables ALL CIA1+CIA2 interrupts, stops all timers, resets DDRs/ports.
+        // Tunes that call JSR $FDA3 expect the CIA to be in a clean disabled state
+        // before they configure their own timer settings.
+        let fda3: [u8; 83] = [
+            0xA9, 0x7F, 0x8D, 0x0D, 0xDC,   // LDA #$7F; STA $DC0D (disable CIA1 irqs)
+            0x8D, 0x0D, 0xDD,                // STA $DD0D (disable CIA2 irqs)
+            0x8D, 0x00, 0xDC,                // STA $DC00 (CIA1 port A)
+            0xA9, 0x08, 0x8D, 0x0E, 0xDC,   // LDA #$08; STA $DC0E (CRA: one-shot, stopped)
+            0x8D, 0x0E, 0xDD,                // STA $DD0E (CIA2 CRA: one-shot, stopped)
+            0xA9, 0x00, 0x8D, 0x0F, 0xDC,   // LDA #$00; STA $DC0F (CRB: stopped)
+            0xA9, 0x00, 0x8D, 0x0F, 0xDD,   // LDA #$00; STA $DD0F (CRB: stopped)
+            0xA9, 0xFF, 0x8D, 0x02, 0xDC,   // LDA #$FF; STA $DC02 (DDRA: all outputs)
+            0xA9, 0x00, 0x8D, 0x03, 0xDC,   // LDA #$00; STA $DC03 (DDRB: all inputs)
+            0x8D, 0x03, 0xDD,                // STA $DD03 (CIA2 DDRB)
+            0xA9, 0x3F, 0x8D, 0x02, 0xDD,   // LDA #$3F; STA $DD02 (CIA2 DDRA)
+            0xA9, 0x17, 0x8D, 0x00, 0xDD,   // LDA #$17; STA $DD00 (CIA2 PRA: VIC bank)
+            0xA9, 0x7F, 0x8D, 0x01, 0xDD,   // LDA #$7F; STA $DD01 (CIA2 PRB)
+            0xA2, 0x00,                      // LDX #$00
+            0x8E, 0x12, 0xDC,                // STX $DC12 (CIA1 SDR)
+            0x8E, 0x02, 0xDD,                // STX $DD02 (CIA2 DDRA = 0)
+            0xA9, 0x00, 0x8D, 0x11, 0xDC,   // LDA #$00; STA $DC11 (VIC ctrl)
+            0x8D, 0x08, 0xDC,                // STA $DC08 (CIA1 TOD 1/10s)
+            0x8E, 0x09, 0xDC,                // STX $DC09 (CIA1 TOD sec)
+            0x8E, 0x08, 0xDD,                // STX $DD08 (CIA2 TOD 1/10s)
+            0x8E, 0x09, 0xDD,                // STX $DD09 (CIA2 TOD sec)
+            0x60,                            // RTS
+        ];
+        rom[0xFDA3 - 0xE000..0xFDA3 - 0xE000 + 83].copy_from_slice(&fda3);
 
         // Hardware interrupt vectors
         s!(0xFFFA, 0x43);
@@ -197,6 +295,13 @@ impl RsidBus {
         // CPU port
         ram[0x0000] = 0x2F; // DDR: bits 0-2,5 output
         ram[0x0001] = 0x37; // BASIC+KERNAL+I/O visible
+
+        // Stack sentinel values (matching WebSid reference: $01FE=0xFF, $01FF=0x7F)
+        ram[0x01FE] = 0xFF;
+        ram[0x01FF] = 0x7F;
+
+        // Flag used by some tunes to detect RSID environment
+        ram[0xA003] = 0x80;
 
         // Zero-page / KERNAL workspace
         ram[0x02A6] = if is_pal { 0x01 } else { 0x00 };

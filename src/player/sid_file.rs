@@ -18,6 +18,12 @@ pub struct SidHeader {
     pub released: String,
     pub is_pal: bool,
     pub is_rsid: bool,
+    /// True when an RSID file contains a C64 BASIC program (flags bit 1 set).
+    /// These tunes require a full KERNAL/BASIC boot before INIT is called.
+    pub is_basic: bool,
+    /// SID chip model hint from flags[7:4] (0 = unknown/6581, 1 = 6581,
+    /// 2 = 8580, 3 = both).  Two nibbles: first SID in [7:4], second in [11:8].
+    pub sid_model: u8,
     /// C64 addresses of extra SIDs (0 = unused). Index 0 = SID2, 1 = SID3.
     pub extra_sid_addrs: [u16; 2],
 }
@@ -129,11 +135,17 @@ pub fn parse_header(data: &[u8]) -> Result<SidHeader, String> {
     let is_rsid = magic == "RSID";
     let version = read_be_u16(data, 0x04);
     let mut is_pal = true;
+    let mut is_basic = false;
+    let mut sid_model: u8 = 0;
     let mut extra_sid_addrs = [0u16; 2];
 
     if version >= 2 && data.len() >= 0x7C {
         let flags = read_be_u16(data, 0x76);
         is_pal = ((flags >> 2) & 0x03) != 2;
+        // RSID BASIC flag: bit 1 of flags (version 2+, RSID only)
+        is_basic = is_rsid && (flags & 0x02) != 0;
+        // SID model hint: bits [7:4] for SID1, bits [11:8] for SID2
+        sid_model = ((flags >> 4) & 0x03) as u8;
 
         if version >= 3 && data.len() > 0x7A {
             extra_sid_addrs[0] = decode_sid_addr_byte(data[0x7A]);
@@ -158,6 +170,8 @@ pub fn parse_header(data: &[u8]) -> Result<SidHeader, String> {
         released: read_string(data, 0x56, 32),
         is_pal,
         is_rsid,
+        is_basic,
+        sid_model,
         extra_sid_addrs,
     })
 }

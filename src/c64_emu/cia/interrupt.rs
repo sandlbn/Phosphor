@@ -100,10 +100,14 @@ impl InterruptSource {
     }
 
     /// Read and clear the IDR (acknowledge).
+    /// On real hardware, reading ICR clears ALL interrupt flags and
+    /// deasserts the IRQ/NMI line immediately, including any queued
+    /// 1-cycle-delayed interrupt that hasn't fired yet.
     pub fn clear(&mut self) -> u8 {
         let old = self.idr;
         self.idr = 0;
         self.asserted = false;
+        self.pending_trigger = None; // cancel any queued delayed interrupt
         old
     }
 
