@@ -5,6 +5,7 @@
 
 use mos6502::memory::Bus;
 
+use crate::c64_emu::banks::Bank;
 use crate::c64_emu::c64::{C64CiaModel, C64Model, C64};
 use crate::c64_emu::mmu::PageMapping;
 
@@ -290,51 +291,64 @@ impl RsidBus {
 
     /// Set up C64 machine state (CPU port, zero-page, CIA DDRs, VIC defaults).
     pub fn setup_machine_state(&mut self, is_pal: bool) {
-        let ram = &mut self.c64.ram.ram;
+        // ── Phase 1: raw RAM writes (CPU port, ZP, stack sentinels) ──────────
+        // Scoped so `ram` borrow is dropped before the set_byte() calls below.
+        {
+            let ram = &mut self.c64.ram.ram;
 
-        // CPU port
-        ram[0x0000] = 0x2F; // DDR: bits 0-2,5 output
-        ram[0x0001] = 0x37; // BASIC+KERNAL+I/O visible
+            // CPU port (will be properly committed via set_byte in Phase 2)
+            ram[0x0000] = 0x2F; // DDR: bits 0-2,5 output
+            ram[0x0001] = 0x37; // BASIC+KERNAL+I/O visible
 
-        // Stack sentinel values (matching WebSid reference: $01FE=0xFF, $01FF=0x7F)
-        ram[0x01FE] = 0xFF;
-        ram[0x01FF] = 0x7F;
+            // Stack sentinel values (matching WebSid reference: $01FE=0xFF, $01FF=0x7F)
+            ram[0x01FE] = 0xFF;
+            ram[0x01FF] = 0x7F;
 
-        // Flag used by some tunes to detect RSID environment
-        ram[0xA003] = 0x80;
+            // Flag used by some tunes to detect RSID environment
+            ram[0xA003] = 0x80;
 
-        // Zero-page / KERNAL workspace
-        ram[0x02A6] = if is_pal { 0x01 } else { 0x00 };
-        ram[0x0028] = 0xF0;
-        ram[0x0037] = 0x00;
-        ram[0x0038] = 0xA0;
-        ram[0x0073] = 39;
-        ram[0x0282] = 0x08;
-        ram[0x0286] = 0x0E;
-        ram[0x00C5] = 0x40;
-        ram[0x00CB] = 0x40;
-        ram[0x00C6] = 0x00;
-        ram[0x028F] = 0x0A;
+            // Zero-page / KERNAL workspace
+            ram[0x02A6] = if is_pal { 0x01 } else { 0x00 };
+            ram[0x0028] = 0xF0;
+            ram[0x0037] = 0x00;
+            ram[0x0038] = 0xA0;
+            ram[0x0073] = 39;
+            ram[0x0282] = 0x08;
+            ram[0x0286] = 0x0E;
+            ram[0x00C5] = 0x40;
+            ram[0x00CB] = 0x40;
+            ram[0x00C6] = 0x00;
+            ram[0x028F] = 0x0A;
+        } // `ram` borrow ends — self is now freely accessible
 
-        // VIC register shadows in RAM
-        ram[0xD018] = 0x15;
-        ram[0xD020] = 0x0E;
-        ram[0xD021] = 0x06;
-        ram[0xD011] = 0x1B;
+        // ── Phase 2: I/O writes through the MMU ──────────────────────────────
 
-        // CIA DDR shadows
-        ram[0xDC02] = 0xFF;
-        ram[0xDC03] = 0x00;
-        ram[0xDD02] = 0x3F;
-        ram[0xDD03] = 0x00;
-        ram[0xDD00] = 0x17;
-
-        // Sync CPU port to the PLA/MMU
-        // Write through the Bus impl to trigger the MMU update
+        // CPU port: goes through zero_ram bank so the MMU recalculates its
+        // read/write maps (bank $37 → BASIC+KERNAL+I/O visible).
         self.c64.set_byte(0x0000, 0x2F);
         self.c64.set_byte(0x0001, 0x37);
 
-        // Configure CIA DDRs through the chip registers
+        // VIC register initialisation.
+        // These MUST go through c64.set_byte() so the actual VIC chip registers
+        // are updated.  With bank=$37 the $D000-$DFFF page is I/O; writing
+        // ram.ram[$D0xx] directly only touches the underlying RAM shadow and
+        // never reaches the VIC registers.
+        //
+        //   $D018 = 0x15  (VIC memory control: char base $3800, screen $0400)
+        //   $D020 = 0x0E  (border colour: light blue)
+        //   $D021 = 0x06  (background colour: blue)
+        //   $D011 = 0x1B  (screen ctrl: DEN=1, RSEL=1, YSCROLL=3 → enables badlines)
+        //
+        // $D011 with DEN=1 is critical: without it are_bad_lines_enabled is
+        // never set, so BA never goes low and BA-stun never fires.
+        self.c64.set_byte(0xD018, 0x15);
+        self.c64.set_byte(0xD020, 0x0E);
+        self.c64.set_byte(0xD021, 0x06);
+        self.c64.set_byte(0xD011, 0x1B);
+
+        // CIA DDRs: write directly to chip registers (not through set_byte,
+        // which would route through I/O and the CIA write handler — DDR writes
+        // via the Bus interface are fine but the regs[] shortcut is simpler here).
         self.c64.cia1.regs[2] = 0xFF; // DDRA
         self.c64.cia1.regs[3] = 0x00; // DDRB
         self.c64.cia2.regs[2] = 0x3F; // DDRA
@@ -448,17 +462,19 @@ impl RsidBus {
 
     /// Get the opcode byte at `pc` through the banking layer.
     pub fn opcode_cycles(&self, pc: u16) -> u32 {
-        // Read through KERNAL ROM banking
-        let byte = if pc >= 0xE000 {
-            // Check if KERNAL ROM is visible (HIRAM set)
-            let port = self.c64.ram.ram[0x0001];
-            if port & 0x02 != 0 {
-                self.c64.kernal_rom.rom_ref()[(pc - 0xE000) as usize]
-            } else {
-                self.c64.ram.ram[pc as usize]
-            }
-        } else {
-            self.c64.ram.ram[pc as usize]
+        // Resolve opcode byte through the same MMU banking that single_step() uses,
+        // so cycle counts match what the CPU actually executes.
+        //
+        // We replicate the read-map lookup manually (without &mut self) for the
+        // two ROM regions that matter for SID tunes:
+        //   $A000-$BFFF — BASIC ROM (when LORAM+HIRAM set, port $01 bits 0+1)
+        //   $E000-$FFFF — KERNAL ROM (when HIRAM set, port $01 bit 1)
+        // All other regions read from RAM, matching the MMU default for writes.
+        let page = (pc >> 12) as usize;
+        let byte = match self.c64.mmu.read_map[page] {
+            PageMapping::BasicRom  => self.c64.basic_rom.peek(pc),
+            PageMapping::KernalRom => self.c64.kernal_rom.peek(pc),
+            _                      => self.c64.ram.ram[pc as usize],
         };
         OPCODE_CYCLES[byte as usize] as u32
     }

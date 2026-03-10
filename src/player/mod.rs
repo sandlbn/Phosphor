@@ -1075,6 +1075,52 @@ fn setup_playback(
             PlayEngine::Psid(cpu)
         }
         PlayEngine::Rsid { mut cpu, prev_nmi } => {
+            // ── CIA latch rate detection for RSID ─────────────────────────
+            // RSID tunes program CIA1 Timer A during their INIT routine just
+            // like PSIDs do.  Read the latch (the reload value the tune wrote,
+            // not the live counter) to find the intended play rate.
+            //
+            // For RSID the speed-bit concept doesn't exist — CIA timing is
+            // always the case — so we check unconditionally.  We only override
+            // if the latch encodes a rate meaningfully different from the
+            // default VIC frame rate (>5% off) to avoid reacting to rounding.
+            //
+            // Access path differs from PSID: RsidBus exposes the c64_emu CIA
+            // directly as cpu.memory.c64.cia1.timer_a.latch (u16), whereas
+            // C64Memory uses cpu.memory.cia1.timer_a.latch.
+            {
+                let cia_latch = cpu.memory.c64.cia1.timer_a.latch as u64;
+                let clock: u64 = if header.is_pal { 985_248 } else { 1_022_727 };
+                let default_frame_cycles: u64 = if header.is_pal {
+                    PAL_CYCLES_PER_FRAME as u64
+                } else {
+                    NTSC_CYCLES_PER_FRAME as u64
+                };
+
+                if cia_latch > 0 && cia_latch < 0xFFFF {
+                    let cia_us = (cia_latch * 1_000_000) / clock;
+                    let cia_hz = clock as f64 / cia_latch as f64;
+                    let ratio = cia_latch as f64 / default_frame_cycles as f64;
+
+                    eprintln!(
+                        "[phosphor] RSID CIA1 Timer A latch={} → {}µs ({:.1}Hz)",
+                        cia_latch, cia_us, cia_hz,
+                    );
+
+                    // Only override when the rate is meaningfully non-standard.
+                    // Tunes running at exactly the VIC frame rate (or within 5%)
+                    // are left alone — their latch value is just the default.
+                    if cia_us > 0 && (ratio < 0.95 || ratio > 1.05) {
+                        frame_us = cia_us;
+                        cycles_per_frame = cia_latch as u32;
+                        eprintln!(
+                            "[phosphor] RSID frame rate adjusted to {}µs ({:.1}Hz) from CIA latch",
+                            frame_us, cia_hz,
+                        );
+                    }
+                }
+            }
+
             cpu.memory.clear_writes();
             PlayEngine::Rsid { cpu, prev_nmi }
         }
