@@ -622,8 +622,16 @@ pub fn opcode_cycles_banked(mem: &C64Memory, pc: u16) -> u32 {
 //  Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const PAL_CYCLES_PER_FRAME: u32 = 19705;
-pub const NTSC_CYCLES_PER_FRAME: u32 = 17045;
+// VIC-II PAL:  312 lines × 63 cycles/line = 19656 cycles/frame → 50.125 Hz
+// VIC-II NTSC: 263 lines × 65 cycles/line = 17095 cycles/frame → 59.826 Hz
+//
+// These are the HARDWARE frame sizes that the VIC-II actually produces.
+// Using clock/50 (19705) or clock/60 (17045) is wrong: it makes the emulator
+// tick 49 cycles past the end of one VIC frame into the next on PAL, causing
+// raster IRQ at line 0 to fire a second time within a single "frame" run —
+// the player gets called twice and the music plays at double tempo.
+pub const PAL_CYCLES_PER_FRAME: u32 = 19656; // 312 × 63
+pub const NTSC_CYCLES_PER_FRAME: u32 = 17095; // 263 × 65
 
 /// A SID register write with cycle timestamp for accurate replay timing.
 pub type SidWrite = (u32, u8, u8);

@@ -160,8 +160,7 @@ fn patch_swallow_if_needed(bus: &mut RsidBus, init_addr: u16, flags: &mut HackFl
     let p1: &[u8] = &[0x8E, 0x16, 0xD0, 0xA5, 0xE0, 0x69, 0x29];
     let p2: &[u8] = &[0x8E, 0x16, 0xD0, 0xA5, 0xC1, 0x69, 0x29];
     if init_addr == 0x2000
-        && (mem_match(&bus.c64.ram.ram, 0x28C8, p1)
-            || mem_match(&bus.c64.ram.ram, 0x28C8, p2))
+        && (mem_match(&bus.c64.ram.ram, 0x28C8, p1) || mem_match(&bus.c64.ram.ram, 0x28C8, p2))
     {
         flags.disable_badline_stun = true;
         eprintln!("[hacks] Swallow (Comaland/Fantasmolytic): disabling badline stun");

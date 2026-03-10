@@ -47,9 +47,11 @@ impl SidHeader {
     /// Frame duration in microseconds.
     pub fn frame_us(&self) -> u64 {
         if self.is_pal {
-            20_000
+            // 19656 cycles / 985248 Hz = 19951.16µs  (50.125 Hz)
+            19_951
         } else {
-            16_667
+            // 17095 cycles / 1022727 Hz = 16714.35µs (59.826 Hz)
+            16_714
         }
     }
 }

@@ -1,10 +1,10 @@
 // Background player engine. Runs in its own thread, communicates
 // with the GUI via crossbeam channels. USB I/O goes through the
 // setuid usbsid-bridge helper (fixed-size protocol, async ring buffer).
+pub mod hacks;
 pub mod memory;
 pub mod rsid_bus;
 pub mod sid_file;
-pub mod hacks;
 
 use std::path::PathBuf;
 use std::thread;
@@ -17,10 +17,10 @@ use mos6502::memory::Bus;
 use mos6502::registers::{StackPointer, Status};
 
 use crate::sid_device::{create_engine, SidDevice};
+use hacks::{apply_hacks, HackFlags};
 use memory::*;
 use rsid_bus::RsidBus;
 use sid_file::*;
-use hacks::{apply_hacks, HackFlags};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Public message types
@@ -90,10 +90,26 @@ pub struct TrackInfo {
 /// write) and pushes them through `ring_cycled`. The device's background
 /// thread drains the ring buffer to USB asynchronously with cycle-accurate
 /// timing on the firmware side.
-fn send_sid_writes(bridge: &mut dyn SidDevice, writes: &[(u32, u8, u8)], mirror_mono: bool) {
+fn send_sid_writes(
+    bridge: &mut dyn SidDevice,
+    writes: &[(u32, u8, u8)],
+    mirror_mono: bool,
+    cycles_per_frame: u32,
+) {
     if writes.is_empty() {
         return;
     }
+
+    // Clamp cycle timestamps to [0, cycles_per_frame].
+    // When the player fires right at the frame boundary it executes a few hundred
+    // overflow cycles (see PLAYER_OVERFLOW in run_rsid_sub_emu).  Those SID writes
+    // have frame_cycle > cycles_per_frame.  Clamping ensures:
+    //   • The emulated device never generates more audio samples than one frame worth.
+    //   • The hardware device delta stream sums to at most cycles_per_frame so
+    //     set_flush() pads correctly from the right position.
+    // Musically: overflow writes land at the very end of the audio frame — correct,
+    // since they happened "past" the nominal frame boundary anyway.
+    let clamp = |c: u32| c.min(cycles_per_frame);
 
     if mirror_mono {
         // Mono: duplicate each write for SID2 at delta=0 (same cycle position).
@@ -101,6 +117,7 @@ fn send_sid_writes(bridge: &mut dyn SidDevice, writes: &[(u32, u8, u8)], mirror_
         let mut prev_cycle: u32 = 0;
 
         for &(cycle, reg, val) in writes {
+            let cycle = clamp(cycle);
             let delta = cycle.saturating_sub(prev_cycle).min(0xFFFF) as u16;
             cycled.push((delta, reg, val));
             if reg <= SID_VOL_REG {
@@ -116,6 +133,7 @@ fn send_sid_writes(bridge: &mut dyn SidDevice, writes: &[(u32, u8, u8)], mirror_
         let mut prev_cycle: u32 = 0;
 
         for &(cycle, reg, val) in writes {
+            let cycle = clamp(cycle);
             let delta = cycle.saturating_sub(prev_cycle).min(0xFFFF) as u16;
             cycled.push((delta, reg, val));
             prev_cycle = cycle;
@@ -266,6 +284,7 @@ fn player_loop(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
                                         ctx.mirror_mono,
+                                        ctx.cycles_per_frame,
                                     );
                                 }
                             }
@@ -281,6 +300,7 @@ fn player_loop(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
                                         ctx.mirror_mono,
+                                        ctx.cycles_per_frame,
                                     );
                                 }
                             }
@@ -1107,10 +1127,18 @@ fn setup_playback(
                         cia_latch, cia_us, cia_hz,
                     );
 
-                    // Only override when the rate is meaningfully non-standard.
-                    // Tunes running at exactly the VIC frame rate (or within 5%)
-                    // are left alone — their latch value is just the default.
-                    if cia_us > 0 && (ratio < 0.95 || ratio > 1.05) {
+                    // Only override when:
+                    // 1. Rate is meaningfully non-standard (>5% off VIC frame rate).
+                    //    Tunes that don't program CIA1 leave the latch at our startup
+                    //    default (= VIC frame cycles), so ratio ≈ 1.0 → no override.
+                    // 2. Rate is sane (between 20Hz and 300Hz). Bogus latch values
+                    //    from tunes that briefly use CIA1 for other purposes and then
+                    //    reprogram it won't have a realistic play rate.
+                    if cia_us > 0
+                        && (ratio < 0.95 || ratio > 1.05)
+                        && cia_hz >= 20.0
+                        && cia_hz <= 300.0
+                    {
                         frame_us = cia_us;
                         cycles_per_frame = cia_latch as u32;
                         eprintln!(
@@ -1250,7 +1278,8 @@ fn setup_rsid_engine(
             let sys_addr = {
                 let ram = &bus.c64.ram.ram;
                 let next_line = ram[0x0801] as u16 | ((ram[0x0802] as u16) << 8);
-                if next_line > 0x0805 && ram[0x0805] == 0x9E
+                if next_line > 0x0805
+                    && ram[0x0805] == 0x9E
                     && (next_line as usize) < ram.len()
                     && ram[next_line as usize] == 0x00
                 {
@@ -1263,7 +1292,11 @@ fn setup_rsid_engine(
                             break;
                         }
                     }
-                    if addr > 0 { addr } else { header.init_address }
+                    if addr > 0 {
+                        addr
+                    } else {
+                        header.init_address
+                    }
                 } else {
                     header.init_address
                 }
@@ -1369,18 +1402,17 @@ fn run_rsid_init_emu(
         // ── Fix #2: Check IRQ BEFORE stepping the CPU ─────────────────────
         // Delivering before single_step() eliminates the "last instruction
         // already ran" window that caused systematic cycle timing errors.
-        let irq_cycles =
-            if cpu.memory.irq_pending()
-                && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS)
-            {
-                let c = deliver_irq_emu(cpu);
-                for _ in 0..c {
-                    cpu.memory.c64.tick_peripherals();
-                }
-                c
-            } else {
-                0
-            };
+        let irq_cycles = if cpu.memory.irq_pending()
+            && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS)
+        {
+            let c = deliver_irq_emu(cpu);
+            for _ in 0..c {
+                cpu.memory.c64.tick_peripherals();
+            }
+            c
+        } else {
+            0
+        };
 
         // ── Fix #2 (NMI): Check NMI BEFORE stepping the CPU ──────────────
         // NMI gate mirrors reference: ciaNMI() && (_no_nmi_hack || _no_flag_i)
@@ -1434,37 +1466,69 @@ fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mu
     let mut cycles_done: u32 = 0;
     let hack_flags = cpu.memory.hack_flags.clone();
 
-    while cycles_done < cycles {
-        // ── Fix #1: BA stun ───────────────────────────────────────────────
+    // Maximum extra cycles we run past the frame boundary to let an IRQ handler
+    // (the tune's player routine) finish after it was triggered right at or near
+    // the end of the frame.
+    //
+    // Why this is needed:
+    //   CIA1 Timer A is set to exactly `cycles` (the frame length), so it fires
+    //   on the very last cycle of the frame.  We deliver the IRQ (7 cycles),
+    //   which pushes cycles_done past `cycles`.  Without overflow budget, the
+    //   loop exits immediately and the player never runs.  On the next frame the
+    //   CPU's PC is still inside the IRQ vector so the player executes at the
+    //   START of that frame — one frame late — causing every other frame to
+    //   receive a double player call and the audio to be badly out of sync.
+    //
+    //   On real hardware the player routine runs, then the CPU sits in a CLI idle
+    //   loop until the next CIA fire.  We replicate that: run up to
+    //   `cycles + PLAYER_OVERFLOW` cycles so the player can always complete, then
+    //   the idle loop will trigger the cycle-count exit naturally on the next frame.
+    //
+    //   4096 is well above any known SID player routine (typically 100–500 cycles).
+    //   SID writes that occur in the overflow are stamped with frame_cycle values
+    //   slightly above `cycles`; flush()/send_sid_writes() handles this correctly
+    //   via saturating_sub (remaining = 0 if last_write > cycles_per_frame).
+    const PLAYER_OVERFLOW: u32 = 4096;
+    let hard_limit = cycles + PLAYER_OVERFLOW;
+
+    // true while the CPU is executing an IRQ or NMI handler (I-flag set by us).
+    // We track this so the loop does not exit mid-handler when cycles_done >= cycles.
+    let mut in_interrupt: bool = false;
+
+    while cycles_done < hard_limit {
+        // Exit once we've run the full frame AND we're not inside an interrupt handler.
+        // This lets a player that was triggered right at the frame boundary finish.
+        if cycles_done >= cycles && !in_interrupt {
+            break;
+        }
+
+        // ── BA stun ───────────────────────────────────────────────────────
         if !hack_flags.disable_badline_stun {
             while cpu.memory.c64.is_cpu_jammed() {
                 cpu.memory.c64.tick_peripherals();
                 cpu.memory.frame_cycle += 1;
                 cycles_done += 1;
-                if cycles_done >= cycles {
+                if cycles_done >= hard_limit {
                     return;
                 }
             }
         }
 
-        // ── Fix #2: Deliver IRQ BEFORE executing the next instruction ─────
-        let irq_cycles =
-            if cpu.memory.irq_pending()
-                && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS)
-            {
-                let c = deliver_irq_emu(cpu);
-                for _ in 0..c {
-                    cpu.memory.c64.tick_peripherals();
-                }
-                c
-            } else {
-                0
-            };
+        // ── Deliver IRQ BEFORE executing the next instruction ─────────────
+        let irq_cycles = if cpu.memory.irq_pending()
+            && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS)
+        {
+            let c = deliver_irq_emu(cpu);
+            for _ in 0..c {
+                cpu.memory.c64.tick_peripherals();
+            }
+            in_interrupt = true;
+            c
+        } else {
+            0
+        };
 
-        // ── Fix #2: Deliver NMI before instruction, with I-flag gate ─────
-        // Mirrors: ciaNMI() && (_no_nmi_hack || _no_flag_i)
-        // When nmi_needs_i_flag_clear (_no_nmi_hack=0), NMI only fires when
-        // the I-flag is clear.
+        // ── Deliver NMI before instruction, with I-flag gate ──────────────
         let cur_nmi = cpu.memory.nmi_pending();
         let i_flag_clear = !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS);
         let nmi_allowed = !hack_flags.nmi_needs_i_flag_clear || i_flag_clear;
@@ -1474,6 +1538,7 @@ fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mu
             for _ in 0..c {
                 cpu.memory.c64.tick_peripherals();
             }
+            in_interrupt = true;
             c
         } else {
             0
@@ -1485,7 +1550,6 @@ fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mu
         cpu.memory.frame_cycle += int_cycles;
 
         if int_cycles > 0 {
-            // Jiffy clock check after interrupt delivery
             if cpu.memory.c64.vic.new_frame {
                 cpu.memory.c64.vic.new_frame = false;
                 cpu.memory.tick_jiffy_clock();
@@ -1503,7 +1567,14 @@ fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mu
             cpu.memory.c64.tick_peripherals();
         }
 
-        // Jiffy clock on VIC frame boundary
+        // Detect RTI: if I-flag was set (we're in an interrupt) and the CPU
+        // just executed RTI ($40), the interrupt handler has returned.
+        // The CPU restored the status register from the stack, which will have
+        // cleared the I-flag (most SID players run with I clear in the main loop).
+        if in_interrupt && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS) {
+            in_interrupt = false;
+        }
+
         if cpu.memory.c64.vic.new_frame {
             cpu.memory.c64.vic.new_frame = false;
             cpu.memory.tick_jiffy_clock();

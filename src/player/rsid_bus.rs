@@ -7,6 +7,7 @@ use mos6502::memory::Bus;
 
 use crate::c64_emu::banks::Bank;
 use crate::c64_emu::c64::{C64CiaModel, C64Model, C64};
+use crate::c64_emu::cia::timer::{CIAT_COUNT2, CIAT_COUNT3, CIAT_CR_START, CIAT_PHI2IN};
 use crate::c64_emu::mmu::PageMapping;
 
 use super::hacks::HackFlags;
@@ -140,13 +141,13 @@ impl RsidBus {
         // anyway — reference routes both through $0314.
         // F0 03 = BEQ +3  (branch if B==0, i.e. normal IRQ → skip 3 NOPs to JMP)
         let kernal_irq: [u8; 19] = [
-            0x48, 0x8A, 0x48, 0x98, 0x48,  // PHA; TXA;PHA; TYA;PHA
-            0xBA,                           // TSX
-            0xBD, 0x04, 0x01,               // LDA $0104,X  (stacked P)
-            0x29, 0x10,                     // AND #$10     (test B flag)
-            0xF0, 0x03,                     // BEQ +3       (normal IRQ → skip NOPs)
-            0xEA, 0xEA, 0xEA,               // NOP NOP NOP  (BRK path, falls through)
-            0x6C, 0x14, 0x03,               // JMP ($0314)  (user IRQ handler)
+            0x48, 0x8A, 0x48, 0x98, 0x48, // PHA; TXA;PHA; TYA;PHA
+            0xBA, // TSX
+            0xBD, 0x04, 0x01, // LDA $0104,X  (stacked P)
+            0x29, 0x10, // AND #$10     (test B flag)
+            0xF0, 0x03, // BEQ +3       (normal IRQ → skip NOPs)
+            0xEA, 0xEA, 0xEA, // NOP NOP NOP  (BRK path, falls through)
+            0x6C, 0x14, 0x03, // JMP ($0314)  (user IRQ handler)
         ];
         rom[0xFF48 - 0xE000..0xFF48 - 0xE000 + 19].copy_from_slice(&kernal_irq);
 
@@ -157,23 +158,27 @@ impl RsidBus {
         }
 
         // ── $EA75: IRQ return handler (matches WebSid _irq_handler_EA75) ───
-        // LDA $01 / AND #$1F / STA $01 — restores KERNAL bank in case tune
-        //   switched it off; ensures $DC0D read goes through I/O.
+        // LDA $01 / AND #$07 / STA $01 — restores banking to LORAM|HIRAM|CHAREN=$07.
+        //   AND #$07 keeps only bits 0-2 (LORAM=1, HIRAM=1, CHAREN=1), which ensures
+        //   I/O ($D000-$DFFF) remains visible for the $DC0D CIA1 ACK read that follows.
+        //   The original AND #$1F was wrong: it cleared bit 2 (CHAREN), mapping $D000-$DFFF
+        //   to Character ROM instead of I/O, so $DC0D read the char ROM instead of CIA1 —
+        //   CIA1 was never acknowledged and the IRQ would re-fire immediately forever.
         // INC $A2  — jiffy clock lo-byte (frame counter)
         // NOP      — timing pad (present in reference)
         // LDA $DC0D — ack CIA1 interrupt (reading clears flags)
         // PLA/TAY/PLA/TAX/PLA/RTI — restore Y, X, A; return from interrupt
         let ea75: [u8; 18] = [
-            0xA5, 0x01,             // LDA $01
-            0x29, 0x1F,             // AND #$1F   (keep lower 5 bits = enable KERNAL/IO)
-            0x85, 0x01,             // STA $01    (restore bank: KERNAL+IO visible)
-            0xE6, 0xA2,             // INC $A2    (jiffy counter, frame tick)
-            0xEA,                   // NOP
-            0xAD, 0x0D, 0xDC,       // LDA $DC0D  (ack CIA1, clears interrupt flag)
-            0x68, 0xA8,             // PLA; TAY
-            0x68, 0xAA,             // PLA; TAX
-            0x68,                   // PLA
-            0x40,                   // RTI
+            0xA5, 0x01, // LDA $01
+            0x29, 0x07, // AND #$07   (keep LORAM|HIRAM|CHAREN — I/O visible)
+            0x85, 0x01, // STA $01    (restore bank)
+            0xE6, 0xA2, // INC $A2    (jiffy counter, frame tick)
+            0xEA, // NOP
+            0xAD, 0x0D, 0xDC, // LDA $DC0D  (ack CIA1, clears interrupt flag)
+            0x68, 0xA8, // PLA; TAY
+            0x68, 0xAA, // PLA; TAX
+            0x68, // PLA
+            0x40, // RTI
         ];
         rom[0xEA75 - 0xE000..0xEA75 - 0xE000 + 18].copy_from_slice(&ea75);
 
@@ -197,9 +202,9 @@ impl RsidBus {
         // (Our old stub pushed A,X,Y but never popped them → 3-byte stack leak
         //  per NMI which would corrupt the stack within seconds of playback.)
         let kernal_nmi: [u8; 5] = [
-            0x78,               // SEI
-            0x6C, 0x18, 0x03,   // JMP ($0318)  (user NMI handler)
-            0x40,               // RTI  (unreachable, just a safety net)
+            0x78, // SEI
+            0x6C, 0x18, 0x03, // JMP ($0318)  (user NMI handler)
+            0x40, // RTI  (unreachable, just a safety net)
         ];
         rom[0xFE43 - 0xE000..0xFE43 - 0xE000 + 5].copy_from_slice(&kernal_nmi);
 
@@ -220,23 +225,23 @@ impl RsidBus {
         // Reference: LDA #$81; STA $DC0D; LDA $DC0E; AND #$80; ORA #$11;
         //            STA $DC0E; JMP $EE8E
         let ff6e: [u8; 18] = [
-            0xA9, 0x81,             // LDA #$81  (set CIA1 timer-A IRQ mask)
-            0x8D, 0x0D, 0xDC,       // STA $DC0D
-            0xAD, 0x0E, 0xDC,       // LDA $DC0E (read CRA)
-            0x29, 0x80,             // AND #$80  (keep TOD-frequency bit only)
-            0x09, 0x11,             // ORA #$11  (set start + force-load)
-            0x8D, 0x0E, 0xDC,       // STA $DC0E (write CRA: start timer)
-            0x4C, 0x8E, 0xEE,       // JMP $EE8E
+            0xA9, 0x81, // LDA #$81  (set CIA1 timer-A IRQ mask)
+            0x8D, 0x0D, 0xDC, // STA $DC0D
+            0xAD, 0x0E, 0xDC, // LDA $DC0E (read CRA)
+            0x29, 0x80, // AND #$80  (keep TOD-frequency bit only)
+            0x09, 0x11, // ORA #$11  (set start + force-load)
+            0x8D, 0x0E, 0xDC, // STA $DC0E (write CRA: start timer)
+            0x4C, 0x8E, 0xEE, // JMP $EE8E
         ];
         rom[0xFF6E - 0xE000..0xFF6E - 0xE000 + 18].copy_from_slice(&ff6e);
 
         // ── $EE8E: Serial clock high (tail of FF6E, also called directly) ───
         // Sets bit 4 of CIA2 port-A (serial clock line high), then RTS.
         let ee8e: [u8; 9] = [
-            0xAD, 0x00, 0xDD,   // LDA $DD00
-            0x09, 0x10,         // ORA #$10
-            0x8D, 0x00, 0xDD,   // STA $DD00
-            0x60,               // RTS
+            0xAD, 0x00, 0xDD, // LDA $DD00
+            0x09, 0x10, // ORA #$10
+            0x8D, 0x00, 0xDD, // STA $DD00
+            0x60, // RTS
         ];
         rom[0xEE8E - 0xE000..0xEE8E - 0xE000 + 9].copy_from_slice(&ee8e);
 
@@ -245,28 +250,28 @@ impl RsidBus {
         // Tunes that call JSR $FDA3 expect the CIA to be in a clean disabled state
         // before they configure their own timer settings.
         let fda3: [u8; 83] = [
-            0xA9, 0x7F, 0x8D, 0x0D, 0xDC,   // LDA #$7F; STA $DC0D (disable CIA1 irqs)
-            0x8D, 0x0D, 0xDD,                // STA $DD0D (disable CIA2 irqs)
-            0x8D, 0x00, 0xDC,                // STA $DC00 (CIA1 port A)
-            0xA9, 0x08, 0x8D, 0x0E, 0xDC,   // LDA #$08; STA $DC0E (CRA: one-shot, stopped)
-            0x8D, 0x0E, 0xDD,                // STA $DD0E (CIA2 CRA: one-shot, stopped)
-            0xA9, 0x00, 0x8D, 0x0F, 0xDC,   // LDA #$00; STA $DC0F (CRB: stopped)
-            0xA9, 0x00, 0x8D, 0x0F, 0xDD,   // LDA #$00; STA $DD0F (CRB: stopped)
-            0xA9, 0xFF, 0x8D, 0x02, 0xDC,   // LDA #$FF; STA $DC02 (DDRA: all outputs)
-            0xA9, 0x00, 0x8D, 0x03, 0xDC,   // LDA #$00; STA $DC03 (DDRB: all inputs)
-            0x8D, 0x03, 0xDD,                // STA $DD03 (CIA2 DDRB)
-            0xA9, 0x3F, 0x8D, 0x02, 0xDD,   // LDA #$3F; STA $DD02 (CIA2 DDRA)
-            0xA9, 0x17, 0x8D, 0x00, 0xDD,   // LDA #$17; STA $DD00 (CIA2 PRA: VIC bank)
-            0xA9, 0x7F, 0x8D, 0x01, 0xDD,   // LDA #$7F; STA $DD01 (CIA2 PRB)
-            0xA2, 0x00,                      // LDX #$00
-            0x8E, 0x12, 0xDC,                // STX $DC12 (CIA1 SDR)
-            0x8E, 0x02, 0xDD,                // STX $DD02 (CIA2 DDRA = 0)
-            0xA9, 0x00, 0x8D, 0x11, 0xDC,   // LDA #$00; STA $DC11 (VIC ctrl)
-            0x8D, 0x08, 0xDC,                // STA $DC08 (CIA1 TOD 1/10s)
-            0x8E, 0x09, 0xDC,                // STX $DC09 (CIA1 TOD sec)
-            0x8E, 0x08, 0xDD,                // STX $DD08 (CIA2 TOD 1/10s)
-            0x8E, 0x09, 0xDD,                // STX $DD09 (CIA2 TOD sec)
-            0x60,                            // RTS
+            0xA9, 0x7F, 0x8D, 0x0D, 0xDC, // LDA #$7F; STA $DC0D (disable CIA1 irqs)
+            0x8D, 0x0D, 0xDD, // STA $DD0D (disable CIA2 irqs)
+            0x8D, 0x00, 0xDC, // STA $DC00 (CIA1 port A)
+            0xA9, 0x08, 0x8D, 0x0E, 0xDC, // LDA #$08; STA $DC0E (CRA: one-shot, stopped)
+            0x8D, 0x0E, 0xDD, // STA $DD0E (CIA2 CRA: one-shot, stopped)
+            0xA9, 0x00, 0x8D, 0x0F, 0xDC, // LDA #$00; STA $DC0F (CRB: stopped)
+            0xA9, 0x00, 0x8D, 0x0F, 0xDD, // LDA #$00; STA $DD0F (CRB: stopped)
+            0xA9, 0xFF, 0x8D, 0x02, 0xDC, // LDA #$FF; STA $DC02 (DDRA: all outputs)
+            0xA9, 0x00, 0x8D, 0x03, 0xDC, // LDA #$00; STA $DC03 (DDRB: all inputs)
+            0x8D, 0x03, 0xDD, // STA $DD03 (CIA2 DDRB)
+            0xA9, 0x3F, 0x8D, 0x02, 0xDD, // LDA #$3F; STA $DD02 (CIA2 DDRA)
+            0xA9, 0x17, 0x8D, 0x00, 0xDD, // LDA #$17; STA $DD00 (CIA2 PRA: VIC bank)
+            0xA9, 0x7F, 0x8D, 0x01, 0xDD, // LDA #$7F; STA $DD01 (CIA2 PRB)
+            0xA2, 0x00, // LDX #$00
+            0x8E, 0x12, 0xDC, // STX $DC12 (CIA1 SDR)
+            0x8E, 0x02, 0xDD, // STX $DD02 (CIA2 DDRA = 0)
+            0xA9, 0x00, 0x8D, 0x11, 0xDC, // LDA #$00; STA $DC11 (VIC ctrl)
+            0x8D, 0x08, 0xDC, // STA $DC08 (CIA1 TOD 1/10s)
+            0x8E, 0x09, 0xDC, // STX $DC09 (CIA1 TOD sec)
+            0x8E, 0x08, 0xDD, // STX $DD08 (CIA2 TOD 1/10s)
+            0x8E, 0x09, 0xDD, // STX $DD09 (CIA2 TOD sec)
+            0x60, // RTS
         ];
         rom[0xFDA3 - 0xE000..0xFDA3 - 0xE000 + 83].copy_from_slice(&fda3);
 
@@ -358,17 +363,41 @@ impl RsidBus {
 
     /// Set RSID defaults for CIA1 (timer A at frame rate, running, IRQ enabled).
     pub fn setup_rsid_cia_defaults(&mut self, is_pal: bool) {
-        let latch: u16 = if is_pal { 0x4025 } else { 0x4295 };
+        // Use the TRUE 50Hz/60Hz frame rate as the startup latch rather than the
+        // C64 KERNAL's traditional 0x4025/0x4295 ("1/60 second always") value.
+        //
+        // Why: CIA latch detection in prepare_context() reads timer_a.latch after INIT
+        // and overrides frame_us / cycles_per_frame when the latch deviates >5% from
+        // the VIC frame period.  The KERNAL default 0x4025 = 16421 cycles is PAL 60Hz,
+        // which is 16.7% off PAL 50Hz (19705) — so detection ALWAYS fires for PAL tunes
+        // that never reprogram CIA1, setting frame timing to 60Hz and playing 20% fast.
+        //
+        // By initialising the latch to the actual VIC frame period (19705 PAL / 17045 NTSC),
+        // detection sees ratio = 1.0 → no override for tunes that leave CIA1 alone.
+        // Tunes that DO program their own rate (100Hz, 125Hz, …) write a different
+        // latch during INIT → detection correctly overrides to their intended rate.
+        let latch: u16 = if is_pal {
+            use crate::player::memory::PAL_CYCLES_PER_FRAME;
+            PAL_CYCLES_PER_FRAME as u16
+        } else {
+            use crate::player::memory::NTSC_CYCLES_PER_FRAME;
+            NTSC_CYCLES_PER_FRAME as u16
+        };
 
-        // Set timer A latch and load counter
+        // Set timer A latch and counter directly.
         self.c64.cia1.timer_a.latch = latch;
         self.c64.cia1.timer_a.counter = latch;
 
-        // Start timer A counting PHI2, continuous mode
-        self.c64.cia1.write(0x0E, 0x11); // CRA: start + force-load
-        self.c64.cia1.regs[0x0E] = 0x01; // CRA read-back: just started
+        // Put timer A into steady-state "already running" condition — no force-load,
+        // no scripted_transition delays. Matches C++ ciaReset which writes $DC0E=0x01
+        // then bootstraps via initTimerData() (counter = latch, is_started = 1,
+        // scripted_transition = 0). Any use of write(0x0E, 0x11) goes through the
+        // VICE state machine and queues a force-load sequence (CIAT_CR_FLOAD→LOAD1→LOAD)
+        // that stalls counting for 2 cycles and fires the first IRQ ~2 cycles late.
+        self.c64.cia1.timer_a.state = CIAT_CR_START | CIAT_PHI2IN | CIAT_COUNT2 | CIAT_COUNT3;
+        self.c64.cia1.regs[0x0E] = 0x01; // CRA read-back: started, continuous
 
-        // Enable timer A interrupt
+        // Enable timer A interrupt (ICR mask bit 0 = timer A).
         self.c64.cia1.write(0x0D, 0x81); // ICR: set Timer A mask
     }
 
@@ -472,9 +501,9 @@ impl RsidBus {
         // All other regions read from RAM, matching the MMU default for writes.
         let page = (pc >> 12) as usize;
         let byte = match self.c64.mmu.read_map[page] {
-            PageMapping::BasicRom  => self.c64.basic_rom.peek(pc),
+            PageMapping::BasicRom => self.c64.basic_rom.peek(pc),
             PageMapping::KernalRom => self.c64.kernal_rom.peek(pc),
-            _                      => self.c64.ram.ram[pc as usize],
+            _ => self.c64.ram.ram[pc as usize],
         };
         OPCODE_CYCLES[byte as usize] as u32
     }
