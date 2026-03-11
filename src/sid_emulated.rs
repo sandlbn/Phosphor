@@ -29,8 +29,8 @@ use crate::sid_device::SidDevice;
 
 const PAL_CLOCK: u32 = 985_248;
 const NTSC_CLOCK: u32 = 1_022_727;
-const PAL_CYCLES_PER_FRAME: u32 = 19_705;
-const NTSC_CYCLES_PER_FRAME: u32 = 17_045;
+const PAL_CYCLES_PER_FRAME: u32 = 19_656; // 312 lines × 63 cycles
+const NTSC_CYCLES_PER_FRAME: u32 = 17_095; // 263 lines × 65 cycles
 
 /// Number of SID registers per chip (0x00-0x1F).
 const SID_REGS: u8 = 0x20;
