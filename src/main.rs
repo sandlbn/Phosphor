@@ -125,6 +125,10 @@ struct App {
 
     /// Some(_) when the right-click context menu is visible.
     context_menu: Option<ContextMenu>,
+    /// Whether the window is currently in fullscreen mode (toggled by
+    /// double-clicking the visualiser).
+    /// Whether the visualiser is expanded to fill the whole window (overlay mode).
+    vis_expanded: bool,
 }
 
 impl App {
@@ -263,6 +267,7 @@ impl App {
             // the real value arrives with the first PlaylistScrolled event.
             playlist_viewport_height: window_height,
             context_menu: None,
+            vis_expanded: false,
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -1066,6 +1071,10 @@ impl App {
                 self.visualizer.toggle_mode();
             }
 
+            Message::ToggleVisFull => {
+                self.vis_expanded = !self.vis_expanded;
+            }
+
             Message::ToggleSidPanel => {
                 self.show_sid_panel = !self.show_sid_panel;
                 // Mutually exclusive with other panels
@@ -1224,6 +1233,20 @@ impl App {
                 self.window_height,
             );
             iced::widget::stack![base, overlay]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.vis_expanded {
+            // Full-window visualiser overlay — double-click it again to collapse.
+            let song_title = self.status.track_info.as_ref().map(|i| i.name.as_str());
+            let vis_overlay = container(self.visualizer.view_expanded(song_title))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.06, 0.07, 0.09))),
+                    ..Default::default()
+                });
+            iced::widget::stack![base, vis_overlay]
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()

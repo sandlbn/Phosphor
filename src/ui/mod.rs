@@ -188,6 +188,8 @@ pub enum Message {
     // Visualiser
     /// Toggle between Bar and Scope display modes.
     ToggleVisMode,
+    /// Toggle fullscreen mode (triggered by double-clicking the visualiser).
+    ToggleVisFull,
 
     // Panels
     /// Toggle the SID register info panel (mutually exclusive with settings
