@@ -9,8 +9,7 @@
 //                   natural attack / sustain / release envelope shape.
 //
 // Single-click anywhere on the widget to toggle between Bar and Scope modes.
-// Double-click to toggle fullscreen.
-// The song title is rendered as a faint pixel label at the bottom of the canvas.
+// Double-click to expand the visualiser to fill the whole window.
 
 use iced::widget::canvas::{self, Cache, Canvas, Frame, Geometry, Path, Stroke};
 use iced::{mouse, Color, Element, Length, Point, Rectangle, Size, Theme};
@@ -78,6 +77,24 @@ impl VisMode {
 #[derive(Debug, Default)]
 pub struct VisState {
     last_click: Option<Instant>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Track info for the expanded overlay
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct ExpandedInfo {
+    pub name: String,
+    pub author: String,
+    pub released: String,
+    pub sid_type: String,
+    pub current_song: u16,
+    pub songs: u16,
+    pub is_pal: bool,
+    pub is_rsid: bool,
+    pub num_sids: usize,
+    pub elapsed_secs: f32,
+    pub duration_secs: Option<f32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,12 +212,14 @@ pub struct Visualizer {
 
     // ── Scope mode state ────────────────────────────────────────────────────
     /// Circular history buffer of raw level samples, one ring per voice.
+    /// `scope_history[voice][frame]` = level at that frame.
     scope_history: Vec<Vec<f32>>,
     /// Write cursor into each voice's ring buffer.
     scope_cursor: usize,
 
     // ── Shared state ────────────────────────────────────────────────────────
     /// Number of SID chips in the current tune (1–4).
+    /// Determines how many bars / lanes are drawn: `num_sids × 3`.
     num_sids: usize,
     /// Current display mode (bar or scope).
     pub mode: VisMode,
@@ -223,6 +242,7 @@ impl Visualizer {
     }
 
     /// Set the number of SIDs for the current tune.
+    /// Call this whenever a new track starts so the layout updates.
     pub fn set_num_sids(&mut self, n: usize) {
         self.num_sids = n.clamp(1, 4);
         self.cache.clear();
@@ -230,26 +250,27 @@ impl Visualizer {
 
     /// Feed a new frame of voice levels from the player.
     /// `levels` is a flat slice: [SID1V1, SID1V2, SID1V3, SID2V1, …].
+    /// Values are expected in the range 0.0–1.0.
     pub fn update(&mut self, levels: &[f32]) {
         let n = self.bar_count();
         for i in 0..MAX_BARS {
             let new_val = levels.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-
+            // Rise immediately on a new peak, decay gradually when falling.
             if new_val > self.bars[i] {
                 self.bars[i] = new_val;
             } else {
                 self.bars[i] *= DECAY;
             }
+            // Peak-hold: rise instantly, decay slowly.
             if self.bars[i] > self.peaks[i] {
                 self.peaks[i] = self.bars[i];
             } else {
                 self.peaks[i] *= PEAK_DECAY;
             }
-
-            let sample = if i < n { new_val } else { 0.0 };
-            self.scope_history[i][self.scope_cursor] = sample;
+            // Only record voices active in the current tune; rest stay at zero.
+            self.scope_history[i][self.scope_cursor] = if i < n { new_val } else { 0.0 };
         }
-
+        // Advance the shared write cursor (all voices share the same timeline).
         self.scope_cursor = (self.scope_cursor + 1) % SCOPE_HISTORY;
         self.cache.clear();
     }
@@ -277,26 +298,29 @@ impl Visualizer {
         self.num_sids * 3
     }
 
-    /// Return the iced Element to embed in the track-info bar (small mode).
-    ///
-    /// - Single click  → toggle Bar / Scope mode (`ToggleVisMode`).
-    /// - Double-click  → expand to full window (`ToggleVisFull`).
+    /// Compact 60 px strip for the track-info bar.
+    /// Single click toggles Bar / Scope mode; double-click expands to full window.
     pub fn view(&self) -> Element<'_, super::Message> {
         Canvas::new(VisProg {
             vis: self,
-            song_title: None,
+            info: None,
+            expanded: false,
         })
         .width(Length::Fill)
         .height(Length::Fixed(60.0))
         .into()
     }
 
-    /// Return the iced Element for the full-window expanded overlay.
-    /// The song title is rendered inside the canvas in this mode.
-    pub fn view_expanded<'a>(&'a self, song_title: Option<&'a str>) -> Element<'a, super::Message> {
+    /// Full-window concert-screen overlay.
+    /// Single click still toggles Bar / Scope; double-click collapses back.
+    pub fn view_expanded<'a>(
+        &'a self,
+        info: Option<&'a ExpandedInfo>,
+    ) -> Element<'a, super::Message> {
         Canvas::new(VisProg {
             vis: self,
-            song_title,
+            info,
+            expanded: true,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -308,14 +332,13 @@ impl Visualizer {
 //  Canvas program
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Thin wrapper so we can carry `song_title` into the canvas program without
-/// storing it on `Visualizer` itself.
-struct VisProg<'a> {
-    vis: &'a Visualizer,
-    song_title: Option<&'a str>,
+struct VisProg<'v, 'i> {
+    vis: &'v Visualizer,
+    info: Option<&'i ExpandedInfo>,
+    expanded: bool,
 }
 
-impl<'a> canvas::Program<super::Message> for VisProg<'a> {
+impl<'v, 'i> canvas::Program<super::Message> for VisProg<'v, 'i> {
     type State = VisState;
 
     fn draw(
@@ -327,18 +350,18 @@ impl<'a> canvas::Program<super::Message> for VisProg<'a> {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let geom = self.vis.cache.draw(renderer, bounds.size(), |frame| {
-            match self.vis.mode {
-                VisMode::Bars => draw_bars(self.vis, frame, bounds),
-                VisMode::Scope => draw_scope(self.vis, frame, bounds),
-            }
-            if let Some(title) = self.song_title {
-                draw_song_title(frame, bounds, title);
+            if self.expanded {
+                draw_expanded(self.vis, frame, bounds, self.info);
+            } else {
+                match self.vis.mode {
+                    VisMode::Bars => draw_bars(self.vis, frame, bounds),
+                    VisMode::Scope => draw_scope(self.vis, frame, bounds),
+                }
             }
         });
         vec![geom]
     }
 
-    /// Single click → `ToggleVisMode`.  Double-click → `ToggleVisFull`.
     fn update(
         &self,
         state: &mut Self::State,
@@ -351,12 +374,10 @@ impl<'a> canvas::Program<super::Message> for VisProg<'a> {
                 let now = Instant::now();
                 if let Some(prev) = state.last_click {
                     if now.duration_since(prev).as_millis() <= DOUBLE_CLICK_MS {
-                        // Double-click: toggle fullscreen and reset the timer.
                         state.last_click = None;
                         return Some(canvas::Action::publish(super::Message::ToggleVisFull));
                     }
                 }
-                // First (or spaced-out) click: record time and toggle mode.
                 state.last_click = Some(now);
                 return Some(canvas::Action::publish(super::Message::ToggleVisMode));
             }
@@ -366,21 +387,20 @@ impl<'a> canvas::Program<super::Message> for VisProg<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Bar mode drawing
+//  Small bar — Bars
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Draw the vertical bar chart with peak-hold indicators.
 fn draw_bars(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
     let n = vis.bar_count();
     if n == 0 {
         return;
     }
-
     let w = bounds.width;
     let h = bounds.height;
     let gap = 2.0_f32;
     let bar_w = ((w - gap * (n as f32 - 1.0)) / n as f32).max(4.0);
 
-    // Background
     frame.fill_rectangle(
         Point::ORIGIN,
         Size::new(w, h),
@@ -391,18 +411,17 @@ fn draw_bars(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
         let x = i as f32 * (bar_w + gap);
         let level = vis.bars[i].clamp(0.0, 1.0);
         let color = voice_color(i);
-
-        // Dimmed background slot so silent bars are visible.
-        let dim = Color {
-            r: color.r * 0.2,
-            g: color.g * 0.2,
-            b: color.b * 0.2,
-            a: 0.5,
-        };
         let min_h = MIN_BAR_HEIGHT * (h - 4.0);
-        frame.fill_rectangle(Point::new(x, h - 2.0 - min_h), Size::new(bar_w, min_h), dim);
-
-        // Active bar.
+        frame.fill_rectangle(
+            Point::new(x, h - 2.0 - min_h),
+            Size::new(bar_w, min_h),
+            Color {
+                r: color.r * 0.2,
+                g: color.g * 0.2,
+                b: color.b * 0.2,
+                a: 0.5,
+            },
+        );
         let bar_h = level * (h - 4.0);
         if bar_h > min_h {
             frame.fill_rectangle(
@@ -411,52 +430,44 @@ fn draw_bars(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
                 color,
             );
         }
-
-        // Peak-hold indicator.
         let peak = vis.peaks[i].clamp(0.0, 1.0);
         if peak > 0.01 {
-            let peak_y = h - 2.0 - peak * (h - 4.0);
             frame.fill_rectangle(
-                Point::new(x, peak_y),
+                Point::new(x, h - 2.0 - peak * (h - 4.0)),
                 Size::new(bar_w, 2.0),
                 Color { a: 0.85, ..color },
             );
         }
     }
-
-    draw_mode_hint(frame, bounds, "SCOPE ▶");
+    draw_mode_hint(frame, bounds);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Scope mode drawing
+//  Small bar — Scope
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Draw the scrolling oscilloscope, one lane per active voice.
 fn draw_scope(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
     let n = vis.bar_count();
     if n == 0 {
         return;
     }
-
     let w = bounds.width;
     let h = bounds.height;
+    let lane_h = h / n as f32;
 
-    // Background
     frame.fill_rectangle(
         Point::ORIGIN,
         Size::new(w, h),
         Color::from_rgb(0.06, 0.07, 0.09),
     );
 
-    let lane_h = h / n as f32;
-
     for i in 0..n {
         let lane_top = i as f32 * lane_h;
         let lane_mid = lane_top + lane_h * 0.5;
         let amplitude = lane_h * (0.5 - SCOPE_LANE_PADDING);
-
         let color = voice_color(i);
 
-        // Faint lane separator line.
         if i > 0 {
             frame.fill_rectangle(
                 Point::new(0.0, lane_top),
@@ -469,8 +480,6 @@ fn draw_scope(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
                 },
             );
         }
-
-        // Faint centre line for each lane.
         frame.fill_rectangle(
             Point::new(0.0, lane_mid - 0.5),
             Size::new(w, 1.0),
@@ -482,22 +491,19 @@ fn draw_scope(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
             },
         );
 
-        // Waveform path — read SCOPE_HISTORY samples oldest-first.
-        let path = Path::new(|builder| {
-            for sample_idx in 0..SCOPE_HISTORY {
-                let ring_pos = (vis.scope_cursor + sample_idx) % SCOPE_HISTORY;
-                let level = vis.scope_history[i][ring_pos].clamp(0.0, 1.0);
-                let y_offset = -(level * amplitude);
-                let x = (sample_idx as f32 / (SCOPE_HISTORY - 1) as f32) * w;
-                let y = lane_mid + y_offset;
-                if sample_idx == 0 {
-                    builder.move_to(Point::new(x, y));
+        let path = Path::new(|b| {
+            for s in 0..SCOPE_HISTORY {
+                let level =
+                    vis.scope_history[i][(vis.scope_cursor + s) % SCOPE_HISTORY].clamp(0.0, 1.0);
+                let x = (s as f32 / (SCOPE_HISTORY - 1) as f32) * w;
+                let y = lane_mid - level * amplitude;
+                if s == 0 {
+                    b.move_to(Point::new(x, y));
                 } else {
-                    builder.line_to(Point::new(x, y));
+                    b.line_to(Point::new(x, y));
                 }
             }
         });
-
         frame.stroke(
             &path,
             Stroke::default()
@@ -505,7 +511,6 @@ fn draw_scope(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
                 .with_width(SCOPE_LINE_WIDTH),
         );
 
-        // Small coloured dot at the left edge to identify the lane.
         let dot_r = 2.5_f32;
         frame.fill_rectangle(
             Point::new(3.0, lane_mid - dot_r),
@@ -513,16 +518,542 @@ fn draw_scope(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
             Color { a: 0.7, ..color },
         );
     }
-
-    draw_mode_hint(frame, bounds, "BARS ▶");
+    draw_mode_hint(frame, bounds);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Shared helpers
+//  Expanded full-window view
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Three faint dots in the bottom-right corner as a clickable affordance hint.
-fn draw_mode_hint(frame: &mut Frame, bounds: Rectangle, _label: &str) {
+fn format_time(secs: f32) -> String {
+    let s = secs as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+fn draw_expanded(
+    vis: &Visualizer,
+    frame: &mut Frame,
+    bounds: Rectangle,
+    info: Option<&ExpandedInfo>,
+) {
+    let w = bounds.width;
+    let h = bounds.height;
+
+    // ── Background ────────────────────────────────────────────────────────────
+    frame.fill_rectangle(
+        Point::ORIGIN,
+        Size::new(w, h),
+        Color::from_rgb(0.04, 0.04, 0.06),
+    );
+
+    // CRT scanlines
+    let mut sy = 0.0_f32;
+    while sy < h {
+        frame.fill_rectangle(
+            Point::new(0.0, sy),
+            Size::new(w, 1.0),
+            Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.15,
+            },
+        );
+        sy += 4.0;
+    }
+
+    // Vignette — darken edges with a few border rectangles
+    for ring in 0..6_u8 {
+        let t = ring as f32 / 6.0;
+        let alpha = 0.20 * (1.0 - t) * (1.0 - t);
+        let pad = t * (w.min(h) * 0.42);
+        let v = Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: alpha,
+        };
+        frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(w, pad), v);
+        frame.fill_rectangle(Point::new(0.0, h - pad), Size::new(w, pad), v);
+        frame.fill_rectangle(Point::new(0.0, pad), Size::new(pad, h - 2.0 * pad), v);
+        frame.fill_rectangle(Point::new(w - pad, pad), Size::new(pad, h - 2.0 * pad), v);
+    }
+
+    // ── Corner brackets ───────────────────────────────────────────────────────
+    let bl = 28.0_f32;
+    let bt = 2.0_f32;
+    let bp = 16.0_f32;
+    let bc = Color {
+        r: 0.35,
+        g: 0.88,
+        b: 0.58,
+        a: 0.55,
+    };
+    // TL
+    frame.fill_rectangle(Point::new(bp, bp), Size::new(bl, bt), bc);
+    frame.fill_rectangle(Point::new(bp, bp), Size::new(bt, bl), bc);
+    // TR
+    frame.fill_rectangle(Point::new(w - bp - bl, bp), Size::new(bl, bt), bc);
+    frame.fill_rectangle(Point::new(w - bp - bt, bp), Size::new(bt, bl), bc);
+    // BL
+    frame.fill_rectangle(Point::new(bp, h - bp - bt), Size::new(bl, bt), bc);
+    frame.fill_rectangle(Point::new(bp, h - bp - bl), Size::new(bt, bl), bc);
+    // BR
+    frame.fill_rectangle(Point::new(w - bp - bl, h - bp - bt), Size::new(bl, bt), bc);
+    frame.fill_rectangle(Point::new(w - bp - bt, h - bp - bl), Size::new(bt, bl), bc);
+
+    // ── Layout zones ──────────────────────────────────────────────────────────
+    let title_h = h * 0.22;
+    let meta_h = h * 0.15;
+    let vis_top = title_h;
+    let vis_bot = h - meta_h;
+    let vis_h = vis_bot - vis_top;
+    let pad_x = 40.0_f32;
+    let div = Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 0.06,
+    };
+
+    frame.fill_rectangle(Point::new(0.0, vis_top - 1.0), Size::new(w, 1.0), div);
+    frame.fill_rectangle(Point::new(0.0, vis_bot + 1.0), Size::new(w, 1.0), div);
+
+    // ── Title block ───────────────────────────────────────────────────────────
+    if let Some(info) = info {
+        // Song name — scale 3
+        let ns = 3_u32;
+        let ncw = (3 * ns + ns) as f32;
+        let nch = (5 * ns) as f32;
+        let nmax = ((w - 80.0) / ncw).floor() as usize;
+        let nch_vec: Vec<char> = info.name.chars().take(nmax).collect();
+        let ntw = nch_vec.len() as f32 * ncw;
+        draw_pixel_text(
+            frame,
+            &nch_vec,
+            ((w - ntw) / 2.0).max(40.0),
+            title_h * 0.15,
+            ns,
+            Color {
+                r: 0.35,
+                g: 0.90,
+                b: 0.60,
+                a: 0.95,
+            },
+        );
+
+        // Author — scale 2
+        let aus = 2_u32;
+        let aucw = (3 * aus + aus) as f32;
+        let aumax = ((w - 80.0) / aucw).floor() as usize;
+        let au_vec: Vec<char> = info.author.chars().take(aumax).collect();
+        let autw = au_vec.len() as f32 * aucw;
+        draw_pixel_text(
+            frame,
+            &au_vec,
+            ((w - autw) / 2.0).max(40.0),
+            title_h * 0.15 + nch + 10.0,
+            aus,
+            Color {
+                r: 0.55,
+                g: 0.65,
+                b: 0.90,
+                a: 0.80,
+            },
+        );
+
+        // ── Progress bar ──────────────────────────────────────────────────────
+        if let Some(dur) = info.duration_secs {
+            if dur > 0.0 {
+                let progress = (info.elapsed_secs / dur).clamp(0.0, 1.0);
+                let bar_y = title_h * 0.15 + nch + 10.0 + (5 * aus) as f32 + 14.0;
+                let bar_w_full = w * 0.5;
+                let bar_x = (w - bar_w_full) / 2.0;
+                // Track
+                frame.fill_rectangle(
+                    Point::new(bar_x, bar_y),
+                    Size::new(bar_w_full, 3.0),
+                    Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.10,
+                    },
+                );
+                // Fill
+                frame.fill_rectangle(
+                    Point::new(bar_x, bar_y),
+                    Size::new(bar_w_full * progress, 3.0),
+                    Color {
+                        r: 0.35,
+                        g: 0.90,
+                        b: 0.60,
+                        a: 0.70,
+                    },
+                );
+                // Elapsed / duration label
+                let et_str = format_time(info.elapsed_secs);
+                let dt_str = format_time(dur);
+                let ts = 1_u32;
+                let tcw = (3 * ts + ts) as f32;
+                draw_pixel_text(
+                    frame,
+                    &et_str.chars().collect::<Vec<_>>(),
+                    bar_x,
+                    bar_y + 6.0,
+                    ts,
+                    Color {
+                        r: 0.6,
+                        g: 0.7,
+                        b: 0.6,
+                        a: 0.55,
+                    },
+                );
+                let dt_w = dt_str.chars().count() as f32 * tcw;
+                draw_pixel_text(
+                    frame,
+                    &dt_str.chars().collect::<Vec<_>>(),
+                    bar_x + bar_w_full - dt_w,
+                    bar_y + 6.0,
+                    ts,
+                    Color {
+                        r: 0.6,
+                        g: 0.7,
+                        b: 0.6,
+                        a: 0.55,
+                    },
+                );
+            }
+        }
+
+        // ── Metadata strip ────────────────────────────────────────────────────
+        let song_str = if info.songs > 1 {
+            format!("SONG {}/{}", info.current_song, info.songs)
+        } else {
+            String::from("SINGLE")
+        };
+        let sids_str = format!(
+            "{} SID{}",
+            info.num_sids,
+            if info.num_sids > 1 { "S" } else { "" }
+        );
+        let tokens: &[&str] = &[
+            &song_str,
+            if info.is_pal { "PAL" } else { "NTSC" },
+            if info.is_rsid { "RSID" } else { "PSID" },
+            info.sid_type.as_str(),
+            &sids_str,
+            info.released.as_str(),
+        ];
+        let meta_colors = [
+            Color {
+                r: 0.35,
+                g: 0.90,
+                b: 0.60,
+                a: 0.70,
+            },
+            Color {
+                r: 0.55,
+                g: 0.65,
+                b: 0.90,
+                a: 0.60,
+            },
+            Color {
+                r: 0.90,
+                g: 0.55,
+                b: 0.30,
+                a: 0.60,
+            },
+            Color {
+                r: 0.85,
+                g: 0.35,
+                b: 0.55,
+                a: 0.60,
+            },
+            Color {
+                r: 0.55,
+                g: 0.65,
+                b: 0.90,
+                a: 0.60,
+            },
+            Color {
+                r: 0.65,
+                g: 0.65,
+                b: 0.65,
+                a: 0.50,
+            },
+        ];
+
+        let ms = 2_u32;
+        let mcw = (3 * ms + ms) as f32;
+        let mch = (5 * ms) as f32;
+        let sep_w = mcw * 3.0;
+        let meta_y = vis_bot + (meta_h - mch) / 2.0;
+
+        let total_tok_w: f32 = tokens
+            .iter()
+            .enumerate()
+            .map(|(ti, tok)| {
+                let tw = tok.chars().count() as f32 * mcw;
+                tw + if ti < tokens.len() - 1 { sep_w } else { 0.0 }
+            })
+            .sum();
+
+        let mut mx = ((w - total_tok_w) / 2.0).max(40.0);
+        let dot_c = Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.18,
+        };
+
+        for (ti, tok) in tokens.iter().enumerate() {
+            let chars: Vec<char> = tok.chars().collect();
+            let tw = chars.len() as f32 * mcw;
+            draw_pixel_text(frame, &chars, mx, meta_y, ms, meta_colors[ti]);
+            mx += tw;
+            if ti < tokens.len() - 1 {
+                let dot_x = mx + sep_w / 2.0 - (ms as f32) / 2.0;
+                let dot_y = meta_y + mch / 2.0 - (ms as f32) / 2.0;
+                frame.fill_rectangle(
+                    Point::new(dot_x, dot_y),
+                    Size::new(ms as f32, ms as f32),
+                    dot_c,
+                );
+                mx += sep_w;
+            }
+        }
+    }
+
+    // ── Main visualiser ───────────────────────────────────────────────────────
+    let vis_bounds = Rectangle {
+        x: bounds.x + pad_x,
+        y: bounds.y + vis_top,
+        width: w - pad_x * 2.0,
+        height: vis_h,
+    };
+    match vis.mode {
+        VisMode::Bars => draw_bars_expanded(vis, frame, vis_bounds),
+        VisMode::Scope => draw_scope_expanded(vis, frame, vis_bounds),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Expanded — Bars (bi-directional with glow)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn draw_bars_expanded(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
+    let n = vis.bar_count();
+    if n == 0 {
+        return;
+    }
+
+    let w = bounds.width;
+    let h = bounds.height;
+    let x0 = bounds.x;
+    let y0 = bounds.y;
+    let mid = y0 + h / 2.0;
+    let gap = 6.0_f32;
+    let bar_w = ((w - gap * (n as f32 - 1.0)) / n as f32).max(8.0);
+
+    // Centre line
+    frame.fill_rectangle(
+        Point::new(x0, mid - 0.5),
+        Size::new(w, 1.0),
+        Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.08,
+        },
+    );
+
+    for i in 0..n {
+        let x = x0 + i as f32 * (bar_w + gap);
+        let level = vis.bars[i].clamp(0.0, 1.0);
+        let color = voice_color(i);
+        let slot_h = h * 0.96;
+
+        // Faint background slot
+        frame.fill_rectangle(
+            Point::new(x, mid - slot_h / 2.0),
+            Size::new(bar_w, slot_h),
+            Color {
+                r: color.r * 0.07,
+                g: color.g * 0.07,
+                b: color.b * 0.07,
+                a: 0.6,
+            },
+        );
+
+        if level > 0.005 {
+            let half = level * (h / 2.0 - 4.0);
+
+            // Glow layers (wider, more transparent)
+            for g in 0..4_u8 {
+                let extra = g as f32 * 5.0;
+                let alpha = 0.10 - g as f32 * 0.02;
+                frame.fill_rectangle(
+                    Point::new(x - extra / 2.0, mid - half - extra / 2.0),
+                    Size::new(bar_w + extra, half * 2.0 + extra),
+                    Color {
+                        r: color.r,
+                        g: color.g,
+                        b: color.b,
+                        a: alpha,
+                    },
+                );
+            }
+
+            // Solid bar bi-directional from centre
+            frame.fill_rectangle(
+                Point::new(x, mid - half),
+                Size::new(bar_w, half * 2.0),
+                color,
+            );
+
+            // Hot white core at the centre axis
+            let core_h = (half * 0.12).max(2.0);
+            frame.fill_rectangle(
+                Point::new(x, mid - core_h / 2.0),
+                Size::new(bar_w, core_h),
+                Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.40,
+                },
+            );
+        }
+
+        // Peak hold — pair of lines above and below centre
+        let peak = vis.peaks[i].clamp(0.0, 1.0);
+        if peak > 0.01 {
+            let ph = peak * (h / 2.0 - 4.0);
+            frame.fill_rectangle(
+                Point::new(x, mid - ph - 2.0),
+                Size::new(bar_w, 2.0),
+                Color { a: 0.75, ..color },
+            );
+            frame.fill_rectangle(
+                Point::new(x, mid + ph),
+                Size::new(bar_w, 2.0),
+                Color { a: 0.75, ..color },
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Expanded — Scope (phosphor glow, 3-pass)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn draw_scope_expanded(vis: &Visualizer, frame: &mut Frame, bounds: Rectangle) {
+    let n = vis.bar_count();
+    if n == 0 {
+        return;
+    }
+
+    let w = bounds.width;
+    let h = bounds.height;
+    let x0 = bounds.x;
+    let y0 = bounds.y;
+    let lane_h = h / n as f32;
+
+    for i in 0..n {
+        let lane_top = y0 + i as f32 * lane_h;
+        let lane_mid = lane_top + lane_h * 0.5;
+        let amplitude = lane_h * (0.5 - 0.06);
+        let color = voice_color(i);
+
+        // Lane tint
+        frame.fill_rectangle(
+            Point::new(x0, lane_top),
+            Size::new(w, lane_h),
+            Color {
+                r: color.r * 0.04,
+                g: color.g * 0.04,
+                b: color.b * 0.04,
+                a: 1.0,
+            },
+        );
+
+        // Separator
+        if i > 0 {
+            frame.fill_rectangle(
+                Point::new(x0, lane_top),
+                Size::new(w, 1.0),
+                Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.06,
+                },
+            );
+        }
+
+        // Centre line
+        frame.fill_rectangle(
+            Point::new(x0, lane_mid - 0.5),
+            Size::new(w, 1.0),
+            Color {
+                r: color.r * 0.30,
+                g: color.g * 0.30,
+                b: color.b * 0.30,
+                a: 0.70,
+            },
+        );
+
+        // 3-pass phosphor: wide+faint → medium → sharp+bright
+        for pass in 0..3_u8 {
+            let (lw, alpha) = match pass {
+                0 => (7.0_f32, 0.05_f32),
+                1 => (2.5, 0.22),
+                _ => (1.2, 0.92),
+            };
+            let path = Path::new(|b| {
+                for s in 0..SCOPE_HISTORY {
+                    let level = vis.scope_history[i][(vis.scope_cursor + s) % SCOPE_HISTORY]
+                        .clamp(0.0, 1.0);
+                    let x = x0 + (s as f32 / (SCOPE_HISTORY - 1) as f32) * w;
+                    let y = lane_mid - level * amplitude;
+                    if s == 0 {
+                        b.move_to(Point::new(x, y));
+                    } else {
+                        b.line_to(Point::new(x, y));
+                    }
+                }
+            });
+            frame.stroke(
+                &path,
+                Stroke::default()
+                    .with_color(Color {
+                        r: color.r,
+                        g: color.g,
+                        b: color.b,
+                        a: alpha,
+                    })
+                    .with_width(lw),
+            );
+        }
+
+        // Voice dot
+        let dot = 3.5_f32;
+        frame.fill_rectangle(
+            Point::new(x0 + 6.0, lane_mid - dot),
+            Size::new(dot * 2.0, dot * 2.0),
+            Color { a: 0.60, ..color },
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Shared small-bar helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Draw a very faint "click to switch mode" indicator dot in the bottom-right
+/// corner.  We use a tiny rectangle rather than text to avoid font deps.
+fn draw_mode_hint(frame: &mut Frame, bounds: Rectangle) {
     let x = bounds.width - 12.0;
     let y = bounds.height - 6.0;
     for dot in 0..3_u8 {
@@ -539,109 +1070,89 @@ fn draw_mode_hint(frame: &mut Frame, bounds: Rectangle, _label: &str) {
     }
 }
 
-/// Render `title` as a faint pixel-dot label centred at the bottom of the
-/// canvas.  Uses a built-in 3×5 bitmap glyph set — no font dependencies.
-fn draw_song_title(frame: &mut Frame, bounds: Rectangle, title: &str) {
-    /// Unpack a 3-bit row into per-pixel flags.
-    const fn bits(b: u8) -> [bool; 3] {
-        [b & 0b100 != 0, b & 0b010 != 0, b & 0b001 != 0]
-    }
+// ─────────────────────────────────────────────────────────────────────────────
+//  Pixel font renderer
+// ─────────────────────────────────────────────────────────────────────────────
 
-    /// Return the 3×5 bitmap for a character, or `None` for unknowns.
-    #[allow(clippy::unusual_byte_groupings)]
-    fn glyph(c: char) -> Option<[[bool; 3]; 5]> {
-        macro_rules! g {
-            ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr) => {
-                Some([bits($a), bits($b), bits($c), bits($d), bits($e)])
-            };
-        }
-        match c.to_ascii_uppercase() {
-            'A' => g!(0b010, 0b101, 0b111, 0b101, 0b101),
-            'B' => g!(0b110, 0b101, 0b110, 0b101, 0b110),
-            'C' => g!(0b011, 0b100, 0b100, 0b100, 0b011),
-            'D' => g!(0b110, 0b101, 0b101, 0b101, 0b110),
-            'E' => g!(0b111, 0b100, 0b110, 0b100, 0b111),
-            'F' => g!(0b111, 0b100, 0b110, 0b100, 0b100),
-            'G' => g!(0b011, 0b100, 0b101, 0b101, 0b011),
-            'H' => g!(0b101, 0b101, 0b111, 0b101, 0b101),
-            'I' => g!(0b111, 0b010, 0b010, 0b010, 0b111),
-            'J' => g!(0b001, 0b001, 0b001, 0b101, 0b010),
-            'K' => g!(0b101, 0b110, 0b100, 0b110, 0b101),
-            'L' => g!(0b100, 0b100, 0b100, 0b100, 0b111),
-            'M' => g!(0b101, 0b111, 0b101, 0b101, 0b101),
-            'N' => g!(0b101, 0b111, 0b111, 0b111, 0b101),
-            'O' => g!(0b010, 0b101, 0b101, 0b101, 0b010),
-            'P' => g!(0b110, 0b101, 0b110, 0b100, 0b100),
-            'Q' => g!(0b010, 0b101, 0b101, 0b111, 0b011),
-            'R' => g!(0b110, 0b101, 0b110, 0b110, 0b101),
-            'S' => g!(0b011, 0b100, 0b010, 0b001, 0b110),
-            'T' => g!(0b111, 0b010, 0b010, 0b010, 0b010),
-            'U' => g!(0b101, 0b101, 0b101, 0b101, 0b010),
-            'V' => g!(0b101, 0b101, 0b101, 0b010, 0b010),
-            'W' => g!(0b101, 0b101, 0b101, 0b111, 0b101),
-            'X' => g!(0b101, 0b101, 0b010, 0b101, 0b101),
-            'Y' => g!(0b101, 0b101, 0b010, 0b010, 0b010),
-            'Z' => g!(0b111, 0b001, 0b010, 0b100, 0b111),
-            '0' => g!(0b010, 0b101, 0b101, 0b101, 0b010),
-            '1' => g!(0b010, 0b110, 0b010, 0b010, 0b111),
-            '2' => g!(0b110, 0b001, 0b010, 0b100, 0b111),
-            '3' => g!(0b110, 0b001, 0b010, 0b001, 0b110),
-            '4' => g!(0b101, 0b101, 0b111, 0b001, 0b001),
-            '5' => g!(0b111, 0b100, 0b110, 0b001, 0b110),
-            '6' => g!(0b010, 0b100, 0b110, 0b101, 0b010),
-            '7' => g!(0b111, 0b001, 0b010, 0b010, 0b010),
-            '8' => g!(0b010, 0b101, 0b010, 0b101, 0b010),
-            '9' => g!(0b010, 0b101, 0b011, 0b001, 0b010),
-            ' ' => g!(0b000, 0b000, 0b000, 0b000, 0b000),
-            '-' => g!(0b000, 0b000, 0b111, 0b000, 0b000),
-            '_' => g!(0b000, 0b000, 0b000, 0b000, 0b111),
-            '.' => g!(0b000, 0b000, 0b000, 0b000, 0b010),
-            ',' => g!(0b000, 0b000, 0b000, 0b010, 0b100),
-            ':' => g!(0b000, 0b010, 0b000, 0b010, 0b000),
-            '/' => g!(0b001, 0b001, 0b010, 0b100, 0b100),
-            '\'' | '`' => g!(0b010, 0b100, 0b000, 0b000, 0b000),
-            '!' => g!(0b010, 0b010, 0b010, 0b000, 0b010),
-            '?' => g!(0b010, 0b101, 0b010, 0b000, 0b010),
-            '(' => g!(0b001, 0b010, 0b010, 0b010, 0b001),
-            ')' => g!(0b100, 0b010, 0b010, 0b010, 0b100),
-            _ => None,
-        }
-    }
-
-    let pixel = 1.0_f32;
-    let char_w = 3.0 * pixel + pixel; // 3 px glyph + 1 px kerning gap
-    let char_h = 5.0 * pixel;
-    let pad_x = 4.0_f32;
-    let pad_y = 3.0_f32;
-
-    let max_chars = ((bounds.width - pad_x * 2.0) / char_w).floor() as usize;
-    let chars: Vec<char> = title.chars().take(max_chars).collect();
-    let total_w = chars.len() as f32 * char_w;
-    // Centre-align the label horizontally.
-    let start_x = ((bounds.width - total_w) / 2.0).max(pad_x);
-    let start_y = bounds.height - char_h - pad_y;
-
-    let color = Color {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 0.35,
-    };
-
+fn draw_pixel_text(frame: &mut Frame, chars: &[char], x: f32, y: f32, scale: u32, color: Color) {
+    let s = scale as f32;
+    let char_w = 3.0 * s + s;
     for (ci, ch) in chars.iter().enumerate() {
         if let Some(rows) = glyph(*ch) {
-            let cx = start_x + ci as f32 * char_w;
+            let cx = x + ci as f32 * char_w;
             for (ri, row) in rows.iter().enumerate() {
                 for (pi, &on) in row.iter().enumerate() {
                     if on {
                         frame.fill_rectangle(
-                            Point::new(cx + pi as f32 * pixel, start_y + ri as f32 * pixel),
-                            Size::new(pixel, pixel),
+                            Point::new(cx + pi as f32 * s, y + ri as f32 * s),
+                            Size::new(s, s),
                             color,
                         );
                     }
                 }
             }
         }
+    }
+}
+
+fn glyph(c: char) -> Option<[[bool; 3]; 5]> {
+    const fn b(v: u8) -> [bool; 3] {
+        [v & 4 != 0, v & 2 != 0, v & 1 != 0]
+    }
+    macro_rules! g {
+        ($a:expr,$b:expr,$c:expr,$d:expr,$e:expr) => {
+            Some([b($a), b($b), b($c), b($d), b($e)])
+        };
+    }
+    match c.to_ascii_uppercase() {
+        'A' => g!(0b010, 0b101, 0b111, 0b101, 0b101),
+        'B' => g!(0b110, 0b101, 0b110, 0b101, 0b110),
+        'C' => g!(0b011, 0b100, 0b100, 0b100, 0b011),
+        'D' => g!(0b110, 0b101, 0b101, 0b101, 0b110),
+        'E' => g!(0b111, 0b100, 0b110, 0b100, 0b111),
+        'F' => g!(0b111, 0b100, 0b110, 0b100, 0b100),
+        'G' => g!(0b011, 0b100, 0b101, 0b101, 0b011),
+        'H' => g!(0b101, 0b101, 0b111, 0b101, 0b101),
+        'I' => g!(0b111, 0b010, 0b010, 0b010, 0b111),
+        'J' => g!(0b001, 0b001, 0b001, 0b101, 0b010),
+        'K' => g!(0b101, 0b110, 0b100, 0b110, 0b101),
+        'L' => g!(0b100, 0b100, 0b100, 0b100, 0b111),
+        'M' => g!(0b101, 0b111, 0b101, 0b101, 0b101),
+        'N' => g!(0b101, 0b111, 0b111, 0b111, 0b101),
+        'O' => g!(0b010, 0b101, 0b101, 0b101, 0b010),
+        'P' => g!(0b110, 0b101, 0b110, 0b100, 0b100),
+        'Q' => g!(0b010, 0b101, 0b101, 0b111, 0b011),
+        'R' => g!(0b110, 0b101, 0b110, 0b110, 0b101),
+        'S' => g!(0b011, 0b100, 0b010, 0b001, 0b110),
+        'T' => g!(0b111, 0b010, 0b010, 0b010, 0b010),
+        'U' => g!(0b101, 0b101, 0b101, 0b101, 0b010),
+        'V' => g!(0b101, 0b101, 0b101, 0b010, 0b010),
+        'W' => g!(0b101, 0b101, 0b101, 0b111, 0b101),
+        'X' => g!(0b101, 0b101, 0b010, 0b101, 0b101),
+        'Y' => g!(0b101, 0b101, 0b010, 0b010, 0b010),
+        'Z' => g!(0b111, 0b001, 0b010, 0b100, 0b111),
+        '0' => g!(0b010, 0b101, 0b101, 0b101, 0b010),
+        '1' => g!(0b010, 0b110, 0b010, 0b010, 0b111),
+        '2' => g!(0b110, 0b001, 0b010, 0b100, 0b111),
+        '3' => g!(0b110, 0b001, 0b010, 0b001, 0b110),
+        '4' => g!(0b101, 0b101, 0b111, 0b001, 0b001),
+        '5' => g!(0b111, 0b100, 0b110, 0b001, 0b110),
+        '6' => g!(0b010, 0b100, 0b110, 0b101, 0b010),
+        '7' => g!(0b111, 0b001, 0b010, 0b010, 0b010),
+        '8' => g!(0b010, 0b101, 0b010, 0b101, 0b010),
+        '9' => g!(0b010, 0b101, 0b011, 0b001, 0b010),
+        ' ' => g!(0b000, 0b000, 0b000, 0b000, 0b000),
+        '-' => g!(0b000, 0b000, 0b111, 0b000, 0b000),
+        '_' => g!(0b000, 0b000, 0b000, 0b000, 0b111),
+        '.' => g!(0b000, 0b000, 0b000, 0b000, 0b010),
+        ',' => g!(0b000, 0b000, 0b000, 0b010, 0b100),
+        ':' => g!(0b000, 0b010, 0b000, 0b010, 0b000),
+        '/' => g!(0b001, 0b001, 0b010, 0b100, 0b100),
+        '\'' | '`' => g!(0b010, 0b100, 0b000, 0b000, 0b000),
+        '!' => g!(0b010, 0b010, 0b010, 0b000, 0b010),
+        '?' => g!(0b010, 0b101, 0b010, 0b000, 0b010),
+        '(' => g!(0b001, 0b010, 0b010, 0b010, 0b001),
+        ')' => g!(0b100, 0b010, 0b010, 0b010, 0b100),
+        _ => None,
     }
 }

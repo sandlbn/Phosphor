@@ -125,10 +125,12 @@ struct App {
 
     /// Some(_) when the right-click context menu is visible.
     context_menu: Option<ContextMenu>,
-    /// Whether the window is currently in fullscreen mode (toggled by
-    /// double-clicking the visualiser).
     /// Whether the visualiser is expanded to fill the whole window (overlay mode).
+    /// Double-clicking the visualiser canvas toggles this.
     vis_expanded: bool,
+    /// Cached metadata for the concert-screen overlay, kept in sync with track_info
+    /// on every tick so the borrow checker is happy in `view()`.
+    vis_expanded_info: Option<ui::visualizer::ExpandedInfo>,
 }
 
 impl App {
@@ -268,6 +270,7 @@ impl App {
             playlist_viewport_height: window_height,
             context_menu: None,
             vis_expanded: false,
+            vis_expanded_info: None,
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -1237,15 +1240,13 @@ impl App {
                 .height(Length::Fill)
                 .into()
         } else if self.vis_expanded {
-            // Full-window visualiser overlay — double-click it again to collapse.
-            let song_title = self.status.track_info.as_ref().map(|i| i.name.as_str());
-            let vis_overlay = container(self.visualizer.view_expanded(song_title))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.06, 0.07, 0.09))),
-                    ..Default::default()
-                });
+            // Full-window concert-screen overlay — double-click again to collapse.
+            let vis_overlay = container(
+                self.visualizer
+                    .view_expanded(self.vis_expanded_info.as_ref()),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill);
             iced::widget::stack![base, vis_overlay]
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1354,6 +1355,27 @@ impl App {
 
         if let Some(ref info) = self.status.track_info {
             self.visualizer.set_num_sids(info.num_sids);
+            // Keep the expanded-overlay info in sync with the current track.
+            let current_duration = self
+                .playlist
+                .current_entry()
+                .and_then(|e| e.duration_secs)
+                .map(|d| d as f32);
+            self.vis_expanded_info = Some(ui::visualizer::ExpandedInfo {
+                name: info.name.clone(),
+                author: info.author.clone(),
+                released: info.released.clone(),
+                sid_type: info.sid_type.clone(),
+                current_song: info.current_song,
+                songs: info.songs,
+                is_pal: info.is_pal,
+                is_rsid: info.is_rsid,
+                num_sids: info.num_sids,
+                elapsed_secs: self.status.elapsed.as_secs_f32(),
+                duration_secs: current_duration,
+            });
+        } else {
+            self.vis_expanded_info = None;
         }
         self.visualizer.update(&self.status.voice_levels);
 
