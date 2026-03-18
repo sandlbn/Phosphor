@@ -306,6 +306,7 @@ impl Cia {
     /// Called after INIT to prevent stale underflow flags from causing
     /// an IRQ flood (e.g., tune stopped CIA1 timer during INIT but didn't
     /// read $DC0D to acknowledge the underflow that occurred while running).
+    #[allow(dead_code)]
     pub fn clear_stale_ints(&mut self) {
         if !self.timer_a.running {
             self.int_data &= !0x01; // Clear Timer A underflow flag
