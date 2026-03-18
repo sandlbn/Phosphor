@@ -8,6 +8,7 @@ A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hard
 ## Downloads
 
 Prebuilt binaries for macOS, Linux and Windows are available on the GitHub **Releases** page:
+
 https://github.com/sandlbn/Phosphor/releases
 
 > **⚠️ Work in progress.** PSID playback works well. RSID support is experimental and many tunes won't play correctly yet.
@@ -21,8 +22,10 @@ https://github.com/sandlbn/Phosphor/releases
 - **Favorites** — heart any tune; filter playlist to favorites only
 - **Recently played** — persistent history of the last 100 unique tracks with human-readable timestamps
 - **HVSC Songlength DB** — automatic song-length lookup with configurable fallback duration
+- **HVSC STIL** — song info overlay (cover titles, original artists, composer comments) via the ⓘ button; downloaded or loaded from a local STIL.txt
 - **Multi-SID support** — PSID/RSID, 1SID/2SID/3SID tunes, PAL/NTSC
 - **Sub-tune navigation** — step through all sub-tunes within a SID file
+- **SID register panel** — real-time scrolling tracker view (note, waveform, ADSR per voice) plus live register readout for all active SID chips
 - **Keyboard shortcuts** — full keyboard control (see below)
 - **Window geometry** — size and position are remembered between sessions
 
@@ -45,7 +48,7 @@ Selectable in Settings (⚙):
 - **Auto** — tries USB first, falls back to software emulation
 - **USB** — USBSID-Pico hardware via register-level writes
 - **Emulated** — software SID via resid-rs + cpal audio output
-- **Ultimate 64** — native playback on Ultimate 64 Carts / Commodore 64 Ultimate or Elite II via REST API
+- **Ultimate 64** — native playback on Ultimate 64 / Elite II via REST API
 
 ## Requirements
 
@@ -122,3 +125,14 @@ Files stored there:
 | `favorites.txt` | Favorited tune MD5 hashes (one per line) |
 | `recently_played.json` | Last 100 played tracks with timestamps |
 | `Songlengths.md5` | Cached HVSC Songlength database |
+| `STIL.txt` | Cached HVSC SID Tune Information List |
+
+## HVSC Integration
+
+Phosphor can load two HVSC databases from Settings (⚙):
+
+**Songlength DB** — provides accurate per-subtune durations so tracks advance automatically at the right time. Download directly from the HVSC CDN or point to a local `Songlengths.md5` file.
+
+**STIL** — the SID Tune Information List maps each SID file to the original songs it covers, the performing artists, and curator comments. Once loaded, a ⓘ button appears next to the ♥ heart whenever info is available for the current tune. Click it to show the overlay; click the backdrop or ✕ to dismiss.
+
+For the most accurate STIL lookups, set the **HVSC root directory** in Settings to the root of your local HVSC tree (e.g. `/home/user/C64Music`). Without it Phosphor falls back to matching by filename, which works for most collections but can be ambiguous when multiple composers share a filename.
