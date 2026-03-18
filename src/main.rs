@@ -7,6 +7,7 @@ mod player;
 mod playlist;
 mod recently_played;
 mod sid_device;
+mod stil;
 mod ui;
 mod version_check;
 
@@ -28,12 +29,12 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use iced::widget::{column, container, rule};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
-use ui::sid_panel::{TrackerHistory, TrackerView};
 
 use config::{Config, FavoritesDb};
 use player::{PlayState, PlayerCmd, PlayerStatus};
 use playlist::{Playlist, SonglengthDb};
 use recently_played::RecentlyPlayed;
+use ui::sid_panel::{TrackerHistory, TrackerView};
 use ui::visualizer::Visualizer;
 use ui::{Message, SortColumn, SortDirection};
 
@@ -132,8 +133,23 @@ struct App {
     /// Cached metadata for the concert-screen overlay, kept in sync with track_info
     /// on every tick so the borrow checker is happy in `view()`.
     vis_expanded_info: Option<ui::visualizer::ExpandedInfo>,
+
+    /// Tracker ring buffer — decoded SID register frames for the tracker view.
     tracker_history: TrackerHistory,
+    /// Tracker canvas cache — owns the iced Cache for the tracker Canvas.
     tracker_view: TrackerView,
+
+    /// HVSC STIL database (loaded on demand from STIL.txt).
+    stil_db: Option<stil::StilDb>,
+    /// STIL entry for the currently playing tune (updated on track change).
+    stil_entry: Option<stil::StilEntry>,
+    /// Whether the STIL info overlay is currently visible.
+    show_stil_overlay: bool,
+    /// Status text shown below the STIL download button in settings.
+    stil_status: String,
+    /// Pre-formatted STIL text for the currently playing tune + subtune.
+    /// Kept in App so view() can borrow it without a local String lifetime issue.
+    stil_display_text: String,
 }
 
 impl App {
@@ -216,6 +232,23 @@ impl App {
         if let Some(ref db) = songlength_db {
             db.apply_to_playlist(&mut playlist);
         }
+
+        // Load STIL database from remembered path, then from default config path.
+        let stil_db = config
+            .last_stil_file
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .and_then(|p| {
+                eprintln!("[phosphor] Loading remembered STIL.txt at {}", p.display());
+                stil::StilDb::load(&p).ok()
+            })
+            .or_else(|| {
+                stil::stil_db_path().filter(|p| p.exists()).and_then(|p| {
+                    eprintln!("[phosphor] Found STIL.txt at {}", p.display());
+                    stil::StilDb::load(&p).ok()
+                })
+            });
         if config.default_song_length_secs > 0 {
             apply_default_length(&mut playlist, config.default_song_length_secs);
         }
@@ -276,6 +309,11 @@ impl App {
             vis_expanded_info: None,
             tracker_history: TrackerHistory::new(),
             tracker_view: TrackerView::new(),
+            stil_db,
+            stil_entry: None,
+            show_stil_overlay: false,
+            stil_status: String::new(),
+            stil_display_text: String::new(),
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -1026,7 +1064,7 @@ impl App {
             Message::Tick => {
                 self.poll_status();
 
-                // Feed the tracker ring buffer every tick while playing.
+                // Feed tracker history every tick while playing.
                 if self.status.state == PlayState::Playing {
                     let num_sids = self
                         .status
@@ -1044,7 +1082,10 @@ impl App {
                         .push(&self.status.sid_regs, num_sids, is_pal);
                     self.tracker_view.invalidate();
                 }
-
+                // Keep STIL text in sync with current subtune.
+                if self.stil_entry.is_some() {
+                    self.rebuild_stil_display();
+                }
                 if self.scroll_to_current {
                     self.scroll_to_current = false;
                     if let Some(cur_idx) = self.playlist.current {
@@ -1064,6 +1105,7 @@ impl App {
                     }
                 }
             }
+
             Message::VersionCheckDone(Ok(Some(info))) => {
                 eprintln!(
                     "[phosphor] New version available: {} → {}",
@@ -1122,6 +1164,85 @@ impl App {
                 self.playlist_viewport_height = viewport.bounds().height;
             }
 
+            // ── STIL overlay ──────────────────────────────────────────────
+            Message::ShowStilOverlay => {
+                self.show_stil_overlay = true;
+                self.context_menu = None;
+            }
+
+            Message::DismissStilOverlay => {
+                self.show_stil_overlay = false;
+            }
+
+            // ── STIL settings ─────────────────────────────────────────────
+            Message::StilUrlChanged(url) => {
+                self.config.stil_url = url;
+                self.config.save();
+            }
+
+            Message::HvscRootChanged(root) => {
+                self.config.hvsc_root = if root.trim().is_empty() {
+                    None
+                } else {
+                    Some(root)
+                };
+            }
+
+            Message::SetHvscRoot(root) => {
+                self.config.hvsc_root = if root.trim().is_empty() {
+                    None
+                } else {
+                    Some(root.trim().to_string())
+                };
+                self.config.save();
+                self.refresh_stil_entry();
+            }
+
+            Message::DownloadStil => {
+                self.stil_status = "Downloading…".to_string();
+                let url = self.config.stil_url.clone();
+                return Task::perform(stil::download_stil(url), Message::StilDownloaded);
+            }
+
+            Message::StilDownloaded(result) => match result {
+                Ok(path) => {
+                    self.config.remember_stil_path(&path);
+                    match stil::StilDb::load(&path) {
+                        Ok(db) => {
+                            let count = db.count;
+                            self.stil_status = format!("Loaded {} entries", count);
+                            self.stil_db = Some(db);
+                            self.refresh_stil_entry();
+                        }
+                        Err(e) => self.stil_status = format!("Error loading STIL: {e}"),
+                    }
+                }
+                Err(e) => {
+                    self.stil_status = format!("Download failed: {e}");
+                    eprintln!("[phosphor] STIL download failed: {e}");
+                }
+            },
+
+            Message::LoadStil => {
+                return Task::perform(pick_stil_file(), Message::StilFileChosen);
+            }
+
+            Message::StilFileChosen(opt) => {
+                if let Some(path) = opt {
+                    self.config.remember_stil_path(&path);
+                    match stil::StilDb::load(&path) {
+                        Ok(db) => {
+                            let count = db.count;
+                            self.stil_status =
+                                format!("Loaded {} entries from {}", count, path.display());
+                            self.stil_db = Some(db);
+                            self.refresh_stil_entry();
+                        }
+                        Err(e) => self.stil_status = format!("Error: {e}"),
+                    }
+                }
+            }
+
             Message::None => {}
         }
 
@@ -1141,6 +1262,7 @@ impl App {
             &self.visualizer,
             is_now_playing_fav,
             self.status.track_info.is_some(),
+            self.stil_entry.is_some(),
             self.window_width,
         );
         let controls = ui::controls_bar(
@@ -1160,6 +1282,7 @@ impl App {
                 &self.config,
                 &self.default_length_text,
                 &self.download_status,
+                &self.stil_status,
             );
             column![
                 info_bar,
@@ -1195,8 +1318,7 @@ impl App {
                 .as_ref()
                 .map(|i| i.is_pal)
                 .unwrap_or(true);
-            let tracker_height = (self.window_height * 0.45).clamp(200.0, 380.0);
-
+            let tracker_height = (self.window_height * 0.45).clamp(200.0, 400.0);
             let sid_view = ui::sid_panel::sid_panel(
                 &self.tracker_view,
                 &self.tracker_history,
@@ -1286,6 +1408,20 @@ impl App {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.show_stil_overlay && self.stil_entry.is_some() {
+            // STIL info overlay — click backdrop or ✕ to dismiss.
+            let current_song = self
+                .status
+                .track_info
+                .as_ref()
+                .map(|i| i.current_song)
+                .unwrap_or(1);
+            // stil_display_text lives in self, so the borrow is 'self-lived.
+            let overlay = ui::stil_overlay(&self.stil_display_text, current_song);
+            iced::widget::stack![base, overlay]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else {
             base.into()
         }
@@ -1369,20 +1505,66 @@ impl App {
             self.playlist.current = Some(idx);
             self.selected = Some(idx);
             self.scroll_to_current = true;
-            self.tracker_history.reset();
-            self.tracker_view.reset();
 
             let force_stereo =
                 self.config.force_stereo_2sid || std::env::args().any(|a| a == "--stereo");
             let sid4_addr = parse_sid4_from_args();
+            let play_path = entry.path.clone();
+            let play_song = entry.selected_song;
 
+            self.show_stil_overlay = false;
+            self.tracker_history.reset();
+            self.tracker_view.reset();
             let _ = self.cmd_tx.send(PlayerCmd::Play {
-                path: entry.path.clone(),
-                song: entry.selected_song,
+                path: play_path,
+                song: play_song,
                 force_stereo,
                 sid4_addr,
             });
+            // entry borrow ends here; now safe to call &mut self method.
+            self.refresh_stil_entry();
         }
+    }
+
+    /// Re-resolve STIL info for the currently playing track.
+    /// Call whenever the track changes or the STIL db / hvsc_root is updated.
+    fn refresh_stil_entry(&mut self) {
+        let db = match self.stil_db.as_ref() {
+            Some(db) => db,
+            None => {
+                self.stil_entry = None;
+                self.stil_display_text.clear();
+                return;
+            }
+        };
+        let path = match self.playlist.current_entry() {
+            Some(e) => e.path.clone(),
+            None => {
+                self.stil_entry = None;
+                self.stil_display_text.clear();
+                return;
+            }
+        };
+        let hvsc_root = self.config.hvsc_root.as_deref().map(std::path::Path::new);
+        self.stil_entry = db.lookup(&path, hvsc_root).cloned();
+        self.rebuild_stil_display();
+        if let Some(ref entry) = self.stil_entry {
+            eprintln!("[phosphor] STIL: found entry for {}", entry.hvsc_path);
+        }
+    }
+
+    /// Rebuild `stil_display_text` from the current `stil_entry` and active subtune.
+    fn rebuild_stil_display(&mut self) {
+        let subtune = self
+            .status
+            .track_info
+            .as_ref()
+            .map(|i| i.current_song)
+            .unwrap_or(1);
+        self.stil_display_text = match self.stil_entry.as_ref() {
+            Some(e) => e.format_for_display(subtune),
+            None => String::new(),
+        };
     }
 
     fn poll_status(&mut self) {
@@ -1609,6 +1791,16 @@ async fn pick_folder(start_dir: Option<String>) -> Option<PathBuf> {
         }
     }
     d.pick_folder().await.map(|h| h.path().to_path_buf())
+}
+
+async fn pick_stil_file() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Load STIL.txt")
+        .add_filter("STIL", &["txt"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+        .await
+        .map(|h| h.path().to_path_buf())
 }
 
 async fn pick_songlength_file(start_dir: Option<String>) -> Option<PathBuf> {

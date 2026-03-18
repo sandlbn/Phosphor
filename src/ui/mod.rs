@@ -200,6 +200,19 @@ pub enum Message {
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,
 
+    // STIL info overlay
+    ShowStilOverlay,
+    DismissStilOverlay,
+
+    // STIL settings
+    StilUrlChanged(String),
+    DownloadStil,
+    StilDownloaded(Result<std::path::PathBuf, String>),
+    LoadStil,
+    StilFileChosen(Option<std::path::PathBuf>),
+    HvscRootChanged(String),
+    SetHvscRoot(String),
+
     // No-op
     None,
 }
@@ -215,6 +228,7 @@ pub fn track_info_bar<'a>(
     visualizer: &'a Visualizer,
     is_now_playing_favorite: bool,
     has_track: bool,
+    has_stil_info: bool,
     window_width: f32,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
@@ -294,7 +308,22 @@ pub fn track_info_bar<'a>(
                 text_color: Color::WHITE,
                 ..Default::default()
             });
-        column![heart_btn, scroll_btn]
+        let info_btn = button(text("ⓘ").size(15).color(if has_stil_info {
+            Color::from_rgb(0.45, 0.75, 1.0)
+        } else {
+            Color::from_rgb(0.30, 0.30, 0.40)
+        }))
+        .on_press(if has_stil_info {
+            Message::ShowStilOverlay
+        } else {
+            Message::None
+        })
+        .padding(Padding::from([4, 6]))
+        .style(|_theme: &Theme, _status| button::Style {
+            background: None,
+            ..Default::default()
+        });
+        column![heart_btn, scroll_btn, info_btn]
             .spacing(0)
             .align_x(Alignment::Center)
             .into()
@@ -1345,6 +1374,7 @@ pub fn settings_panel<'a>(
     config: &Config,
     default_length_text: &'a str,
     download_status: &'a str,
+    stil_status: &'a str,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -1544,6 +1574,68 @@ pub fn settings_panel<'a>(
     ]
     .spacing(6);
 
+    // ── STIL database ────────────────────────────────────────────
+    let stil_color = if stil_status.contains("Error") || stil_status.contains("fail") {
+        Color::from_rgb(1.0, 0.4, 0.4)
+    } else if stil_status.contains("success") || stil_status.contains("Loaded") {
+        Color::from_rgb(0.4, 0.9, 0.5)
+    } else {
+        Color::from_rgb(0.5, 0.5, 0.6)
+    };
+
+    let stil_section = column![
+        text("HVSC STIL.txt (song info & comments):")
+            .size(14)
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text_input("STIL.txt URL", &config.stil_url)
+            .on_input(Message::StilUrlChanged)
+            .size(12)
+            .padding(Padding::from([6, 10]))
+            .width(Length::Fill)
+            .style(|_theme: &Theme, _st| text_input::Style {
+                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30),
+                },
+                icon: Color::from_rgb(0.5, 0.5, 0.6),
+                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+                value: Color::from_rgb(0.85, 0.87, 0.9),
+                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+            }),
+        tool_button("⬇ Download / Refresh STIL.txt", Message::DownloadStil),
+        tool_button("📂 Load STIL.txt from file…", Message::LoadStil),
+        text("HVSC root directory (optional — improves lookup accuracy):")
+            .size(11)
+            .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        text_input(
+            "e.g. /home/user/C64Music",
+            config.hvsc_root.as_deref().unwrap_or(""),
+        )
+        .on_input(Message::HvscRootChanged)
+        .on_submit(Message::SetHvscRoot(
+            config.hvsc_root.clone().unwrap_or_default(),
+        ))
+        .size(12)
+        .padding(Padding::from([6, 10]))
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _st| text_input::Style {
+            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.27, 0.30),
+            },
+            icon: Color::from_rgb(0.5, 0.5, 0.6),
+            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+            value: Color::from_rgb(0.85, 0.87, 0.9),
+            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+        }),
+        text(stil_status).size(12).color(stil_color),
+    ]
+    .spacing(6);
+
     // ── Keyboard shortcuts ───────────────────────────────────────
     let mut kb_col = column![text("Keyboard shortcuts:")
         .size(14)
@@ -1580,6 +1672,8 @@ pub fn settings_panel<'a>(
         length_section,
         rule::horizontal(1),
         dl_section,
+        rule::horizontal(1),
+        stil_section,
         rule::horizontal(1),
         kb_col,
     ]
@@ -1631,6 +1725,91 @@ fn engine_btn_style(is_active: bool, st: button::Status) -> button::Style {
         },
         ..Default::default()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STIL info overlay
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the STIL info overlay panel.  Rendered via `iced::widget::stack!`
+/// on top of the normal UI — clicking outside or the × button dismisses it.
+pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Message> {
+    use iced::widget::scrollable;
+
+    let header = row![
+        text(format!("ⓘ  Song Info  (subtune {})", subtune))
+            .size(13)
+            .color(Color::from_rgb(0.45, 0.75, 1.0))
+            .width(Length::Fill),
+        button(text("✕").size(13).color(Color::from_rgb(0.7, 0.7, 0.8)))
+            .on_press(Message::DismissStilOverlay)
+            .padding(Padding::from([2, 8]))
+            .style(|_theme: &Theme, _st| button::Style {
+                background: None,
+                ..Default::default()
+            }),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(8);
+
+    let body = scrollable(
+        container(
+            text(text_content)
+                .size(12)
+                .color(Color::from_rgb(0.80, 0.83, 0.88)),
+        )
+        .padding(Padding::from([0, 4])),
+    )
+    .height(Length::Fill);
+
+    let panel = container(
+        column![header, rule::horizontal(1), body]
+            .spacing(8)
+            .padding(Padding::from([12, 16])),
+    )
+    .width(Length::Fixed(440.0))
+    .height(Length::Fixed(340.0))
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(
+            0.07, 0.09, 0.12, 0.97,
+        ))),
+        border: iced::Border {
+            color: Color::from_rgb(0.20, 0.35, 0.55),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    });
+
+    // Semi-transparent backdrop that dismisses when clicked.
+    let backdrop = button(
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::DismissStilOverlay)
+    .padding(0)
+    .style(|_theme: &Theme, _st| button::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(
+            0.0, 0.0, 0.0, 0.55,
+        ))),
+        ..Default::default()
+    })
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    // Stack: backdrop first, then panel centred on top.
+    iced::widget::stack![
+        backdrop,
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

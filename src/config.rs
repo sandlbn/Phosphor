@@ -8,6 +8,9 @@ use std::path::PathBuf;
 pub const DEFAULT_SONGLENGTH_URL: &str =
     "https://hvsc.c64.org/download/C64Music/DOCUMENTS/Songlengths.md5";
 
+/// Default HVSC STIL.txt download URL.
+pub const DEFAULT_STIL_URL: &str = "https://hvsc.c64.org/download/C64Music/DOCUMENTS/STIL.txt";
+
 /// Default window dimensions — used on first launch.
 const DEFAULT_WINDOW_WIDTH: f32 = 900.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 600.0;
@@ -35,6 +38,12 @@ pub struct Config {
     pub last_songlength_file: Option<String>,
     /// Last directory used for playlists.
     pub last_playlist_dir: Option<String>,
+    /// URL to download STIL.txt from.
+    pub stil_url: String,
+    /// Path to last successfully loaded STIL.txt file.
+    pub last_stil_file: Option<String>,
+    /// Optional HVSC root directory — used to compute HVSC-relative paths for STIL lookup.
+    pub hvsc_root: Option<String>,
     /// Force stereo mirroring for 2SID tunes (duplicate SID1 writes to SID2).
     /// When enabled, 2SID tunes play in mono-stereo mode instead of true dual-SID.
     pub force_stereo_2sid: bool,
@@ -59,6 +68,9 @@ impl Default for Config {
             last_songlength_dir: None,
             last_songlength_file: None,
             last_playlist_dir: None,
+            stil_url: DEFAULT_STIL_URL.to_string(),
+            last_stil_file: None,
+            hvsc_root: None,
             force_stereo_2sid: false,
             window_x: None,
             window_y: None,
@@ -169,6 +181,21 @@ impl Config {
                 if val != "null" {
                     config.last_playlist_dir = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"stil_url\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    config.stil_url = s;
+                }
+            } else if let Some(rest) = line.strip_prefix("\"last_stil_file\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.last_stil_file = strip_json_string(val);
+                }
+            } else if let Some(rest) = line.strip_prefix("\"hvsc_root\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.hvsc_root = strip_json_string(val);
+                }
             } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.force_stereo_2sid = val == "true";
@@ -230,6 +257,9 @@ impl Config {
                 "  \"last_songlength_dir\": {},\n",
                 "  \"last_songlength_file\": {},\n",
                 "  \"last_playlist_dir\": {},\n",
+                "  \"stil_url\": \"{}\",\n",
+                "  \"last_stil_file\": {},\n",
+                "  \"hvsc_root\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
                 "  \"window_x\": {},\n",
                 "  \"window_y\": {},\n",
@@ -247,6 +277,9 @@ impl Config {
             fmt_opt_str(&self.last_songlength_dir),
             fmt_opt_str(&self.last_songlength_file),
             fmt_opt_str(&self.last_playlist_dir),
+            self.stil_url,
+            fmt_opt_str(&self.last_stil_file),
+            fmt_opt_str(&self.hvsc_root),
             self.force_stereo_2sid,
             fmt_opt_i32(self.window_x),
             fmt_opt_i32(self.window_y),
@@ -274,6 +307,12 @@ impl Config {
         if let Some(parent) = path.parent() {
             self.last_songlength_dir = Some(parent.to_string_lossy().into_owned());
         }
+        self.save();
+    }
+
+    /// Remember a STIL.txt file path.
+    pub fn remember_stil_path(&mut self, path: &std::path::Path) {
+        self.last_stil_file = Some(path.to_string_lossy().into_owned());
         self.save();
     }
 
