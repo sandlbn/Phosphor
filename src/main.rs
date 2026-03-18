@@ -28,6 +28,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use iced::widget::{column, container, rule};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
+use ui::sid_panel::{TrackerHistory, TrackerView};
 
 use config::{Config, FavoritesDb};
 use player::{PlayState, PlayerCmd, PlayerStatus};
@@ -131,6 +132,8 @@ struct App {
     /// Cached metadata for the concert-screen overlay, kept in sync with track_info
     /// on every tick so the borrow checker is happy in `view()`.
     vis_expanded_info: Option<ui::visualizer::ExpandedInfo>,
+    tracker_history: TrackerHistory,
+    tracker_view: TrackerView,
 }
 
 impl App {
@@ -271,6 +274,8 @@ impl App {
             context_menu: None,
             vis_expanded: false,
             vis_expanded_info: None,
+            tracker_history: TrackerHistory::new(),
+            tracker_view: TrackerView::new(),
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -394,6 +399,8 @@ impl App {
                 self.context_menu = None;
                 let _ = self.cmd_tx.send(PlayerCmd::Stop);
                 self.visualizer.reset();
+                self.tracker_history.reset();
+                self.tracker_view.reset();
             }
 
             Message::NextTrack => {
@@ -1018,6 +1025,26 @@ impl App {
             // ── Tick ──────────────────────────────────────────────────────
             Message::Tick => {
                 self.poll_status();
+
+                // Feed the tracker ring buffer every tick while playing.
+                if self.status.state == PlayState::Playing {
+                    let num_sids = self
+                        .status
+                        .track_info
+                        .as_ref()
+                        .map(|i| i.num_sids)
+                        .unwrap_or(1);
+                    let is_pal = self
+                        .status
+                        .track_info
+                        .as_ref()
+                        .map(|i| i.is_pal)
+                        .unwrap_or(true);
+                    self.tracker_history
+                        .push(&self.status.sid_regs, num_sids, is_pal);
+                    self.tracker_view.invalidate();
+                }
+
                 if self.scroll_to_current {
                     self.scroll_to_current = false;
                     if let Some(cur_idx) = self.playlist.current {
@@ -1037,7 +1064,6 @@ impl App {
                     }
                 }
             }
-
             Message::VersionCheckDone(Ok(Some(info))) => {
                 eprintln!(
                     "[phosphor] New version available: {} → {}",
@@ -1169,7 +1195,16 @@ impl App {
                 .as_ref()
                 .map(|i| i.is_pal)
                 .unwrap_or(true);
-            let sid_view = ui::sid_panel::sid_panel(&self.status.sid_regs, num_sids, is_pal);
+            let tracker_height = (self.window_height * 0.45).clamp(200.0, 380.0);
+
+            let sid_view = ui::sid_panel::sid_panel(
+                &self.tracker_view,
+                &self.tracker_history,
+                &self.status.sid_regs,
+                num_sids,
+                is_pal,
+                tracker_height,
+            );
             column![
                 info_bar,
                 progress,
@@ -1334,6 +1369,8 @@ impl App {
             self.playlist.current = Some(idx);
             self.selected = Some(idx);
             self.scroll_to_current = true;
+            self.tracker_history.reset();
+            self.tracker_view.reset();
 
             let force_stereo =
                 self.config.force_stereo_2sid || std::env::args().any(|a| a == "--stereo");
