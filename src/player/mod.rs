@@ -34,6 +34,8 @@ pub enum PlayerCmd {
         song: u16,
         force_stereo: bool,
         sid4_addr: u16,
+        /// Some(port) → start U64 audio stream on this port after native playback begins.
+        audio_port: Option<u16>,
     },
     Stop,
     TogglePause,
@@ -440,6 +442,7 @@ fn handle_cmd(
             song,
             force_stereo,
             sid4_addr,
+            audio_port,
         } => {
             *last_error = None;
             stop_playback(play_ctx, bridge);
@@ -491,6 +494,12 @@ fn handle_cmd(
                 match br.play_sid_native(&data, song) {
                     Ok(true) => {
                         eprintln!("[phosphor] Native playback active — skipping CPU emulation");
+                        // Start audio streaming back to host if configured.
+                        if let Some(port) = audio_port {
+                            if let Err(e) = br.start_audio(port) {
+                                eprintln!("[phosphor] U64 audio stream failed to start: {e}");
+                            }
+                        }
                         true
                     }
                     Ok(false) => false,
@@ -834,6 +843,7 @@ fn handle_cmd(
 fn stop_playback(ctx: &mut Option<PlayContext>, bridge: &mut Option<Box<dyn SidDevice>>) {
     if ctx.is_some() {
         if let Some(ref mut br) = bridge {
+            br.stop_audio(); // stop U64 audio stream before mute/reset
             br.flush();
             br.mute();
             br.set_stereo(0);

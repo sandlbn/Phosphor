@@ -26,6 +26,7 @@ https://github.com/sandlbn/Phosphor/releases
 - **Multi-SID support** — PSID/RSID, 1SID/2SID/3SID tunes, PAL/NTSC
 - **Sub-tune navigation** — step through all sub-tunes within a SID file
 - **SID register panel** — real-time scrolling tracker view (note, waveform, ADSR per voice) plus live register readout for all active SID chips
+- **U64 audio streaming** — stream SID audio from the Ultimate 64 back to the host machine over UDP
 - **Keyboard shortcuts** — full keyboard control (see below)
 - **Window geometry** — size and position are remembered between sessions
 
@@ -48,7 +49,7 @@ Selectable in Settings (⚙):
 - **Auto** — tries USB first, falls back to software emulation
 - **USB** — USBSID-Pico hardware via register-level writes
 - **Emulated** — software SID via resid-rs + cpal audio output
-- **Ultimate 64** — native playback on Ultimate 64 / Elite II via REST API
+- **Ultimate 64** — native playback on Ultimate 64 / Elite II via REST API (firmware 3.14+ required)
 
 ## Requirements
 
@@ -136,3 +137,13 @@ Phosphor can load two HVSC databases from Settings (⚙):
 **STIL** — the SID Tune Information List maps each SID file to the original songs it covers, the performing artists, and curator comments. Once loaded, a ⓘ button appears next to the ♥ heart whenever info is available for the current tune. Click it to show the overlay; click the backdrop or ✕ to dismiss.
 
 For the most accurate STIL lookups, set the **HVSC root directory** in Settings to the root of your local HVSC tree (e.g. `/home/user/C64Music`). Without it Phosphor falls back to matching by filename, which works for most collections but can be ambiguous when multiple composers share a filename.
+
+## U64 Audio Streaming
+
+When using the Ultimate 64 engine, Phosphor can stream the C64's audio output back to the host machine so you can hear playback through your computer speakers.
+
+Enable it in Settings (⚙) under **U64 audio streaming**. Set the UDP port (default `11001`) to any free port above 1024.
+
+When a tune starts playing, Phosphor sends a REST command to the U64 asking it to stream audio as UDP unicast packets to your machine's IP on the configured port. A local receiver resamples from the C64's native PAL/NTSC clock rate to your audio device's sample rate and plays through your default output device with a short jitter buffer to absorb network timing variation.
+
+> **Requires Ultimate 64 firmware 3.14 or later.** Earlier firmware versions had a bug in the audio streaming API. A wired network connection to U64 machine is required. 

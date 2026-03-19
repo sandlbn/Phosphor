@@ -44,6 +44,12 @@ pub struct Config {
     pub last_stil_file: Option<String>,
     /// Optional HVSC root directory — used to compute HVSC-relative paths for STIL lookup.
     pub hvsc_root: Option<String>,
+    /// Stream audio from the Ultimate 64 back to this machine via UDP.
+    /// When enabled, Phosphor starts a UDP listener and asks the U64 to stream
+    /// its audio output to us — letting you hear playback on the host computer.
+    pub u64_audio_enabled: bool,
+    /// UDP port to receive U64 audio stream on (default 11001).
+    pub u64_audio_port: u16,
     /// Force stereo mirroring for 2SID tunes (duplicate SID1 writes to SID2).
     /// When enabled, 2SID tunes play in mono-stereo mode instead of true dual-SID.
     pub force_stereo_2sid: bool,
@@ -71,6 +77,8 @@ impl Default for Config {
             stil_url: DEFAULT_STIL_URL.to_string(),
             last_stil_file: None,
             hvsc_root: None,
+            u64_audio_enabled: false,
+            u64_audio_port: 11001,
             force_stereo_2sid: false,
             window_x: None,
             window_y: None,
@@ -196,6 +204,14 @@ impl Config {
                 if val != "null" {
                     config.hvsc_root = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.u64_audio_enabled = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"u64_audio_port\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Ok(n) = val.parse::<u16>() {
+                    config.u64_audio_port = n;
+                }
             } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.force_stereo_2sid = val == "true";
@@ -260,6 +276,8 @@ impl Config {
                 "  \"stil_url\": \"{}\",\n",
                 "  \"last_stil_file\": {},\n",
                 "  \"hvsc_root\": {},\n",
+                "  \"u64_audio_enabled\": {},\n",
+                "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
                 "  \"window_x\": {},\n",
                 "  \"window_y\": {},\n",
@@ -280,6 +298,8 @@ impl Config {
             self.stil_url,
             fmt_opt_str(&self.last_stil_file),
             fmt_opt_str(&self.hvsc_root),
+            self.u64_audio_enabled,
+            self.u64_audio_port,
             self.force_stereo_2sid,
             fmt_opt_i32(self.window_x),
             fmt_opt_i32(self.window_y),

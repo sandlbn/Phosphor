@@ -1243,6 +1243,21 @@ impl App {
                 }
             }
 
+            // ── U64 audio streaming ───────────────────────────────────────
+            Message::ToggleU64Audio => {
+                self.config.u64_audio_enabled = !self.config.u64_audio_enabled;
+                self.config.save();
+            }
+
+            Message::U64AudioPortChanged(val) => {
+                if let Ok(port) = val.trim().parse::<u16>() {
+                    if port >= 1024 {
+                        self.config.u64_audio_port = port;
+                        self.config.save();
+                    }
+                }
+            }
+
             Message::None => {}
         }
 
@@ -1515,11 +1530,18 @@ impl App {
             self.show_stil_overlay = false;
             self.tracker_history.reset();
             self.tracker_view.reset();
+            let audio_port = if self.config.output_engine == "u64" && self.config.u64_audio_enabled
+            {
+                Some(self.config.u64_audio_port)
+            } else {
+                None
+            };
             let _ = self.cmd_tx.send(PlayerCmd::Play {
                 path: play_path,
                 song: play_song,
                 force_stereo,
                 sid4_addr,
+                audio_port,
             });
             // entry borrow ends here; now safe to call &mut self method.
             self.refresh_stil_entry();

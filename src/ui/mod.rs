@@ -200,6 +200,10 @@ pub enum Message {
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,
 
+    // U64 audio streaming
+    ToggleU64Audio,
+    U64AudioPortChanged(String),
+
     // STIL info overlay
     ShowStilOverlay,
     DismissStilOverlay,
@@ -1460,6 +1464,39 @@ pub fn settings_panel<'a>(
         )
         .push(
             text("Set IP/hostname of your Ultimate 64 or Ultimate-II+ device.")
+                .size(11)
+                .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        )
+        .push(rule::horizontal(1))
+        .push(
+            text("U64 audio streaming:")
+                .size(12)
+                .color(Color::from_rgb(0.65, 0.67, 0.72)),
+        )
+        .push(
+            tool_button(
+                if config.u64_audio_enabled {
+                    "✓ Stream U64 audio to this machine"
+                } else {
+                    "✗ U64 audio streaming disabled"
+                },
+                Message::ToggleU64Audio,
+            ),
+        )
+        .push(
+            row![
+                text("UDP port:").size(11).color(Color::from_rgb(0.65, 0.67, 0.72)),
+                Space::new().width(6),
+                text_input("11001", &config.u64_audio_port.to_string())
+                    .on_input(Message::U64AudioPortChanged)
+                    .size(12)
+                    .padding(Padding::from([4, 8]))
+                    .width(Length::Fixed(80.0)),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .push(
+            text("When enabled, the U64 streams its SID audio over UDP to this machine. Use a different port to the video stream.")
                 .size(11)
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         );
