@@ -622,7 +622,40 @@ fn handle_cmd(
         }
 
         PlayerCmd::TogglePause => {
+            // For native engines (U64) we use the hardware pause/resume API so
+            // the C64 clock freezes mid-frame and resumes from exactly the same
+            // point — no song restart, no clock drift.
+            let is_native = play_ctx.as_ref().map(|c| c.is_native()).unwrap_or(false);
+
             match state {
+                PlayState::Playing if is_native => {
+                    if let Some(ref mut br) = bridge {
+                        match br.pause_machine() {
+                            Ok(()) => {
+                                *state = PlayState::Paused;
+                                eprintln!("[phosphor] U64 machine paused");
+                            }
+                            Err(e) => {
+                                *last_error = Some(e.clone());
+                                eprintln!("[phosphor] U64 pause failed: {e}");
+                            }
+                        }
+                    }
+                }
+                PlayState::Paused if is_native => {
+                    if let Some(ref mut br) = bridge {
+                        match br.resume_machine() {
+                            Ok(()) => {
+                                *state = PlayState::Playing;
+                                eprintln!("[phosphor] U64 machine resumed");
+                            }
+                            Err(e) => {
+                                *last_error = Some(e.clone());
+                                eprintln!("[phosphor] U64 resume failed: {e}");
+                            }
+                        }
+                    }
+                }
                 PlayState::Playing => *state = PlayState::Paused,
                 PlayState::Paused => *state = PlayState::Playing,
                 _ => {}
