@@ -90,6 +90,10 @@ struct App {
     default_length_text: String,
     /// Status message shown below the Songlength download button.
     download_status: String,
+    /// Combined status for auto-downloads shown in the search bar.
+    auto_download_status: String,
+    /// Number of auto-downloads still in flight (0, 1 or 2).
+    pending_auto_downloads: u8,
 
     /// Shared progress string updated by background file-loading tasks.
     loading_progress: playlist::LoadingProgress,
@@ -271,6 +275,12 @@ impl App {
         let window_width = config.window_width_saved;
         let window_height = config.window_height_saved;
 
+        // Snapshot fields needed for auto-download before config moves into app.
+        let auto_songlength_url = config.songlength_url.clone();
+        let auto_stil_url = config.stil_url.clone();
+        let auto_last_sl_file = config.last_songlength_file.clone();
+        let auto_last_stil_file = config.last_stil_file.clone();
+
         let app = Self {
             cmd_tx,
             status_rx,
@@ -295,6 +305,8 @@ impl App {
             show_settings: false,
             default_length_text,
             download_status: String::new(),
+            auto_download_status: String::new(),
+            pending_auto_downloads: 0,
             loading_progress: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             pending_entries: None,
             scroll_to_current: false,
@@ -330,7 +342,53 @@ impl App {
             Message::VersionCheckDone,
         );
 
-        (app, version_task)
+        // Auto-download missing HVSC databases on first launch (or if files are gone).
+        // Both downloads run in the background — the app is fully usable immediately.
+        let songlength_missing = auto_last_sl_file
+            .as_ref()
+            .map(|p| !std::path::Path::new(p).exists())
+            .unwrap_or(true)
+            && config::songlength_db_path()
+                .map(|p| !p.exists())
+                .unwrap_or(true);
+
+        let stil_missing = auto_last_stil_file
+            .as_ref()
+            .map(|p| !std::path::Path::new(p).exists())
+            .unwrap_or(true)
+            && stil::stil_db_path().map(|p| !p.exists()).unwrap_or(true);
+
+        let mut tasks = vec![version_task];
+        let mut auto_status_parts: Vec<&str> = vec![];
+
+        if songlength_missing {
+            eprintln!("[phosphor] Songlength DB not found — auto-downloading");
+            let url = auto_songlength_url.clone();
+            tasks.push(Task::perform(
+                config::download_songlength(url),
+                Message::SonglengthDownloaded,
+            ));
+            auto_status_parts.push("Songlengths");
+        }
+
+        if stil_missing {
+            eprintln!("[phosphor] STIL.txt not found — auto-downloading");
+            let url = auto_stil_url.clone();
+            tasks.push(Task::perform(
+                stil::download_stil(url),
+                Message::StilDownloaded,
+            ));
+            auto_status_parts.push("STIL");
+        }
+
+        let mut app = app;
+        let n = auto_status_parts.len() as u8;
+        app.pending_auto_downloads = n;
+        if n > 0 {
+            app.auto_download_status = format!("⬇ Downloading {}…", auto_status_parts.join(" & "));
+        }
+
+        (app, Task::batch(tasks))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -1032,15 +1090,20 @@ impl App {
                         );
                     }
                     self.songlength_db = Some(db);
+                    self.update_auto_download_status();
                     self.download_status = format!(
                         "Download success! Loaded {} entries from {}",
                         count,
                         path.display()
                     );
                 }
-                Err(e) => self.download_status = format!("Error loading DB: {e}"),
+                Err(e) => {
+                    self.update_auto_download_status();
+                    self.download_status = format!("Error loading DB: {e}");
+                }
             },
             Message::SonglengthDownloaded(Err(e)) => {
+                self.update_auto_download_status();
                 self.download_status = format!("Error: {e}");
                 eprintln!("[phosphor] Songlength download failed: {e}");
             }
@@ -1263,6 +1326,7 @@ impl App {
                             let count = db.count;
                             self.stil_status = format!("Loaded {} entries", count);
                             self.stil_db = Some(db);
+                            self.update_auto_download_status();
                             self.refresh_stil_entry();
                         }
                         Err(e) => self.stil_status = format!("Error loading STIL: {e}"),
@@ -1270,6 +1334,7 @@ impl App {
                 }
                 Err(e) => {
                     self.stil_status = format!("Download failed: {e}");
+                    self.update_auto_download_status();
                     eprintln!("[phosphor] STIL download failed: {e}");
                 }
             },
@@ -1403,11 +1468,27 @@ impl App {
             ]
             .into()
         } else {
-            let loading_status = self
-                .loading_progress
-                .lock()
-                .map(|s| s.clone())
-                .unwrap_or_default();
+            let loading_status = {
+                let pg = self
+                    .loading_progress
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                if !pg.is_empty() {
+                    pg
+                } else if !self.auto_download_status.is_empty() {
+                    let track_count = self.filtered_indices.len();
+                    let total = self.playlist.len();
+                    let count_part = if track_count == total {
+                        format!("{total} tracks")
+                    } else {
+                        format!("{track_count} / {total} tracks")
+                    };
+                    format!("{count_part}  {}", self.auto_download_status)
+                } else {
+                    String::new()
+                }
+            };
             let search = ui::search_bar(
                 &self.search_text,
                 self.filtered_indices.len(),
@@ -1595,6 +1676,20 @@ impl App {
             });
             // entry borrow ends here; now safe to call &mut self method.
             self.refresh_stil_entry();
+        }
+    }
+
+    /// Recompute the auto-download status line shown in the search bar.
+    /// Call after each auto-download completes.  Clears the line once both
+    /// databases are loaded so it doesn't clutter the UI permanently.
+    /// Called when an auto-download task completes (success or failure).
+    /// Decrements the in-flight counter and clears the status banner when done.
+    fn update_auto_download_status(&mut self) {
+        if self.pending_auto_downloads > 0 {
+            self.pending_auto_downloads -= 1;
+        }
+        if self.pending_auto_downloads == 0 {
+            self.auto_download_status.clear();
         }
     }
 
