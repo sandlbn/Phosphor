@@ -2,7 +2,7 @@
 
 A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hardware, software emulation, and Commodore [Ultimate 64](https://ultimate64.com/) network playback. Built with Rust and Iced.
 
-![Phosphor](assets/screenshot.png)
+![Phosphor](assets/screenshot.gif)
 
 
 ## Downloads
