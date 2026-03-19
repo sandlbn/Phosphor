@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 
 /// One cover / tune block within a STIL entry.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct StilTuneEntry {
     /// Subtune number this block applies to, or 0 for "all tunes" (global).
     pub subtune: u8,
@@ -72,6 +73,7 @@ impl StilTuneEntry {
 
 /// All STIL information for one SID file.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct StilEntry {
     /// HVSC-relative path, e.g. "/MUSICIANS/H/Hubbard_Rob/Commando.sid".
     pub hvsc_path: String,
@@ -147,6 +149,7 @@ pub struct StilDb {
     pub count: usize,
 }
 
+#[allow(dead_code)]
 impl StilDb {
     /// Parse a STIL.txt file from disk.
     ///

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use iced::widget::{column, container, rule};
+use iced::widget::{column, container, rule, Space};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 
 use config::{Config, FavoritesDb};
@@ -124,6 +124,12 @@ struct App {
     /// Height of the playlist viewport in pixels (updated by on_scroll).
     /// Falls back to `window_height` as an estimate before the first scroll event.
     playlist_viewport_height: f32,
+    /// Absolute Y position of the scrollable viewport within the window (logical px).
+    playlist_viewport_y: f32,
+    /// Physical-to-logical pixel ratio (1.0 on standard displays, 2.0 on Retina).
+    /// Derived from the first right-click by comparing raw cursor coords to known
+    /// logical row geometry.  Starts at 1.0 until calibrated.
+    pixel_ratio: f32,
 
     /// Some(_) when the right-click context menu is visible.
     context_menu: Option<ContextMenu>,
@@ -304,6 +310,8 @@ impl App {
             // Use the saved window height as a reasonable first-frame estimate;
             // the real value arrives with the first PlaylistScrolled event.
             playlist_viewport_height: window_height,
+            playlist_viewport_y: 0.0,
+            pixel_ratio: 1.0,
             context_menu: None,
             vis_expanded: false,
             vis_expanded_info: None,
@@ -329,19 +337,61 @@ impl App {
         match message {
             // ── Any interaction dismisses the context menu ────────────────
             // (handled per-message below where needed; explicit dismiss too)
-            Message::DismissContextMenu => {
-                self.context_menu = None;
-            }
 
             // ── Context menu actions ──────────────────────────────────────
             Message::ShowContextMenu(idx, x, y) => {
+                // cursor.position() in a widget's update() returns physical pixels on
+                // HiDPI/Retina displays, but iced's layout coordinates are logical.
+                // We derive the pixel ratio by comparing the raw cursor y to the
+                // known logical y of the clicked row.  Once calibrated the ratio
+                // is stored and reused for x as well.
+                //
+                // Logical row centre y =
+                //   playlist_viewport_y + display_pos*ROW_HEIGHT - scroll_offset_y + ROW_HEIGHT/2
+                //
+                // pixel_ratio = raw_cursor_y / logical_row_y
+                // We round to the nearest common value (1.0, 1.5, 2.0, 3.0) to avoid
+                // noise from the cursor not being exactly at row centre.
+
+                let display_pos = self
+                    .filtered_indices
+                    .iter()
+                    .position(|&i| i == idx)
+                    .unwrap_or(0) as f32;
+
+                // Logical y of the centre of the clicked row.
+                let logical_row_y = self.playlist_viewport_y + display_pos * ui::ROW_HEIGHT
+                    - self.playlist_scroll_offset_y
+                    + ui::ROW_HEIGHT * 0.5;
+
+                // Calibrate ratio when we have valid logical geometry.
+                if logical_row_y > 0.0 && y > 0.0 {
+                    let raw_ratio = y / logical_row_y;
+                    // Round to nearest 0.25 to absorb sub-pixel noise, then clamp to
+                    // sane values (0.5 – 4.0).
+                    let snapped = ((raw_ratio * 4.0).round() / 4.0).clamp(0.5, 4.0);
+                    self.pixel_ratio = snapped;
+                }
+
+                let ratio = self.pixel_ratio;
+                let menu_x = (x / ratio).max(0.0);
+                let menu_y = (self.playlist_viewport_y + display_pos * ui::ROW_HEIGHT
+                    - self.playlist_scroll_offset_y
+                    + ui::ROW_HEIGHT)
+                    .max(0.0);
+
+                eprintln!("[phosphor] ShowContextMenu idx={idx} raw=({x:.1},{y:.1}) ratio={ratio:.2} menu=({menu_x:.1},{menu_y:.1})");
+
                 self.context_menu = Some(ContextMenu {
                     track_idx: idx,
-                    x,
-                    y,
+                    x: menu_x,
+                    y: menu_y,
                 });
-                // Also select the row so keyboard actions target the same track
                 self.selected = Some(idx);
+            }
+
+            Message::DismissContextMenu => {
+                self.context_menu = None;
             }
 
             Message::ContextMenuPlay => {
@@ -1162,6 +1212,7 @@ impl App {
                 // can compute the visible window on the next view() call.
                 self.playlist_scroll_offset_y = viewport.absolute_offset().y;
                 self.playlist_viewport_height = viewport.bounds().height;
+                self.playlist_viewport_y = viewport.bounds().y;
             }
 
             // ── STIL overlay ──────────────────────────────────────────────
@@ -1396,9 +1447,13 @@ impl App {
                 ..Default::default()
             });
 
-        // If context menu is open, layer it over the base using stack
-        if let Some(ref cm) = self.context_menu {
-            let overlay = ui::context_menu_overlay(
+        // Always use a stack so the widget tree structure stays identical
+        // regardless of which overlay is active.  Switching between stack and
+        // non-stack causes iced to discard all internal widget state — including
+        // the scrollable's position — which makes the playlist jump to the top
+        // every time the context menu opens or closes.
+        let overlay: Element<'_, Message> = if let Some(ref cm) = self.context_menu {
+            ui::context_menu_overlay(
                 cm.x,
                 cm.y,
                 cm.track_idx,
@@ -1406,40 +1461,35 @@ impl App {
                 &self.favorites,
                 self.window_width,
                 self.window_height,
-            );
-            iced::widget::stack![base, overlay]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+            )
         } else if self.vis_expanded {
-            // Full-window concert-screen overlay — double-click again to collapse.
-            let vis_overlay = container(
+            container(
                 self.visualizer
                     .view_expanded(self.vis_expanded_info.as_ref()),
             )
             .width(Length::Fill)
-            .height(Length::Fill);
-            iced::widget::stack![base, vis_overlay]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+            .height(Length::Fill)
+            .into()
         } else if self.show_stil_overlay && self.stil_entry.is_some() {
-            // STIL info overlay — click backdrop or ✕ to dismiss.
             let current_song = self
                 .status
                 .track_info
                 .as_ref()
                 .map(|i| i.current_song)
                 .unwrap_or(1);
-            // stil_display_text lives in self, so the borrow is 'self-lived.
-            let overlay = ui::stil_overlay(&self.stil_display_text, current_song);
-            iced::widget::stack![base, overlay]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+            ui::stil_overlay(&self.stil_display_text, current_song)
         } else {
-            base.into()
-        }
+            // No overlay — empty zero-size space so the stack structure is stable.
+            Space::new()
+                .width(Length::Shrink)
+                .height(Length::Shrink)
+                .into()
+        };
+
+        iced::widget::stack![base, overlay]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
