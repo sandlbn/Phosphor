@@ -111,6 +111,20 @@ impl SidDevice for U64Device {
         eprintln!("[u64] SID file sent ({} bytes, song {})", data.len(), song);
         Ok(true)
     }
+
+    /// Freeze the C64 mid-frame — clock and SID output both pause instantly.
+    fn pause_machine(&mut self) -> Result<(), String> {
+        self.rest
+            .pause()
+            .map_err(|e| format!("U64 pause failed: {e}"))
+    }
+
+    /// Resume the C64 from exactly where it was frozen.
+    fn resume_machine(&mut self) -> Result<(), String> {
+        self.rest
+            .resume()
+            .map_err(|e| format!("U64 resume failed: {e}"))
+    }
 }
 
 impl Drop for U64Device {

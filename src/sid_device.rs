@@ -33,6 +33,18 @@ pub trait SidDevice: Send {
     fn play_sid_native(&mut self, _data: &[u8], _song: u16) -> Result<bool, String> {
         Ok(false)
     }
+
+    /// Freeze the machine mid-frame (clock + SID output paused).
+    /// Default no-op — only meaningful for native engines (U64).
+    fn pause_machine(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Resume a previously paused machine, continuing from exactly where it stopped.
+    /// Default no-op — only meaningful for native engines (U64).
+    fn resume_machine(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
