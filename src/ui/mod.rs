@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, row, rule, scrollable, text, text_input, Column, Space,
+    button, column, container, mouse_area, row, rule, scrollable, text, text_input, Column, Space,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Theme};
 
@@ -1029,18 +1029,15 @@ pub fn context_menu_overlay<'a>(
         ..Default::default()
     });
 
-    // Transparent full-screen dismiss button sits below the menu popup
-    let dismiss = button(Space::new().width(Length::Fill).height(Length::Fill))
-        .on_press(Message::DismissContextMenu)
-        .padding(0)
-        .style(|_theme: &Theme, _st| button::Style {
-            background: Some(iced::Background::Color(Color::from_rgba(
-                0.0, 0.0, 0.0, 0.0,
-            ))),
-            ..Default::default()
-        })
-        .width(Length::Fill)
-        .height(Length::Fill);
+    // Transparent full-screen dismiss area — captures clicks but NOT scroll events,
+    // so the playlist underneath can still be scrolled while the menu is open.
+    // Using mouse_area instead of button means wheel events fall through to the
+    // scrollable, keeping playlist_scroll_offset_y in sync with the visual position.
+    // on_press only — no on_right_press. If we also dismissed on right-press,
+    // the same ButtonReleased(Right) that opened the menu would immediately
+    // close it again via this backdrop in the same event dispatch cycle.
+    let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::DismissContextMenu);
 
     // Position the menu by padding a fill container from top-left
     let positioned = container(menu_box)
