@@ -45,6 +45,16 @@ pub trait SidDevice: Send {
     fn resume_machine(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Start streaming audio from the device back to this machine on `port` (UDP).
+    /// Default no-op — only meaningful for native engines (U64).
+    fn start_audio(&mut self, _port: u16) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Stop the audio stream started by `start_audio`.
+    /// Default no-op — only meaningful for native engines (U64).
+    fn stop_audio(&mut self) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
