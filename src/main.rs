@@ -573,6 +573,7 @@ impl App {
                     let next = (info.current_song + 1).min(info.songs);
                     if next != info.current_song {
                         let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next));
+                        self.update_entry_subtune(next);
                     }
                 }
             }
@@ -582,6 +583,7 @@ impl App {
                     let prev = info.current_song.saturating_sub(1).max(1);
                     if prev != info.current_song {
                         let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(prev));
+                        self.update_entry_subtune(prev);
                     }
                 }
             }
@@ -1825,6 +1827,37 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Update the current playlist entry's selected_song and duration_secs
+    /// when the user manually changes the subtune via the tune buttons.
+    fn update_entry_subtune(&mut self, song: u16) {
+        if let Some(cur_idx) = self.playlist.current {
+            let md5 = self
+                .playlist
+                .entries
+                .get(cur_idx)
+                .and_then(|e| e.md5.clone());
+            let new_dur = md5
+                .as_deref()
+                .and_then(|m| {
+                    self.songlength_db
+                        .as_ref()
+                        .and_then(|db| db.lookup(m, (song - 1) as usize))
+                })
+                .or_else(|| {
+                    let d = self.config.default_song_length_secs;
+                    if d > 0 {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
+                e.selected_song = song;
+                e.duration_secs = new_dur;
             }
         }
     }
