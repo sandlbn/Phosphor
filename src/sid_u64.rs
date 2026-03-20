@@ -128,8 +128,8 @@ type SharedRing = Arc<Mutex<AudioRing>>;
 
 struct AudioStream {
     stop: Arc<AtomicBool>,
-    _net: thread::JoinHandle<()>,
-    _audio: thread::JoinHandle<()>,
+    net: Option<thread::JoinHandle<()>>,
+    audio: Option<thread::JoinHandle<()>>,
 }
 
 impl AudioStream {
@@ -269,23 +269,10 @@ impl AudioStream {
                     }
                 }
 
-                // Send REST stop command
-                let stop_path = "/v1/streams/audio:stop";
-                let stop_req  = format!(
-                    "PUT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    stop_path, net_addr,
-                );
-                if let Ok(mut tcp) = std::net::TcpStream::connect_timeout(
-                    &format!("{net_addr}:80").parse().unwrap_or_else(|_| "0.0.0.0:80".parse().unwrap()),
-                    Duration::from_secs(2),
-                ) {
-                    use std::io::Write;
-                    let _ = tcp.write_all(stop_req.as_bytes());
-                    eprintln!("[u64-audio] REST stop sent to {net_addr}");
-                }
-
                 eprintln!("[u64-audio] Network thread stopped (gaps: {})",
                     net_ring.lock().map(|r| r.gaps).unwrap_or(0));
+                // REST stop is sent by stop_audio() in the main thread,
+                // so this thread can exit immediately without any TCP delay.
             })
             .map_err(|e| format!("spawn net thread: {e}"))?;
 
@@ -401,8 +388,8 @@ impl AudioStream {
 
         Ok(Self {
             stop,
-            _net: net_handle,
-            _audio: audio_handle,
+            net: Some(net_handle),
+            audio: Some(audio_handle),
         })
     }
 }
@@ -410,9 +397,28 @@ impl AudioStream {
 impl Drop for AudioStream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Threads are background; we don't join them — they will exit on their
-        // own once they see the stop flag, avoiding blocking the player thread.
-        eprintln!("[u64-audio] AudioStream dropped, threads will exit");
+        // Join the network thread so the UDP port is fully released before
+        // we return.  This prevents "Address already in use" when start_audio
+        // is called again immediately (e.g. on a subtune change).
+        // We give it 500 ms; if it hasn't exited by then we abandon it.
+        if let Some(handle) = self.net.take() {
+            let start = std::time::Instant::now();
+            while !handle.is_finished() {
+                if start.elapsed() > Duration::from_millis(500) {
+                    eprintln!("[u64-audio] Net thread did not exit in time — abandoning");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        // Audio thread owns the cpal stream; let it exit on its own.
+        if let Some(handle) = self.audio.take() {
+            drop(handle);
+        }
+        eprintln!("[u64-audio] AudioStream stopped");
     }
 }
 
@@ -501,7 +507,9 @@ impl SidDevice for U64Device {
     }
 
     fn mute(&mut self) {
-        self.stop_audio();
+        // Reset stops SID output on the C64.
+        // Do NOT call stop_audio() here — the audio stream is a continuous
+        // UDP flow that should survive mute (e.g. during subtune changes).
         self.reset();
     }
 
@@ -562,8 +570,8 @@ impl SidDevice for U64Device {
     /// shuts down both background threads.
     fn stop_audio(&mut self) {
         if self.audio.take().is_some() {
+            // AudioStream::drop sets the stop flag and joins the net thread.
             eprintln!("[u64] Audio stream stopped");
-            // AudioStream::drop fires automatically, sets the stop flag.
         }
     }
 }

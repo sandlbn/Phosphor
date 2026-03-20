@@ -606,9 +606,10 @@ fn handle_cmd(
                     track_info,
                     frame_count: 0,
                     next_frame: Instant::now(),
+                    audio_port,
                 });
             } else {
-                let ctx = setup_playback(
+                let mut ctx = setup_playback(
                     sid_file,
                     path,
                     song,
@@ -617,6 +618,7 @@ fn handle_cmd(
                     is_rsid,
                     bridge,
                 );
+                ctx.audio_port = audio_port;
                 *play_ctx = Some(ctx);
             }
 
@@ -679,8 +681,13 @@ fn handle_cmd(
                 let stereo = ctx.mirror_mono;
                 let is_rsid = ctx.is_rsid();
                 let was_native = ctx.is_native();
+                // Preserve the audio port so we can restart streaming after the
+                // subtune change — stop_playback kills the audio stream.
+                let saved_audio_port = ctx.audio_port;
                 let sid4 = 0;
-                stop_playback(play_ctx, bridge);
+                // Keep audio stream alive — it's a continuous UDP flow from the
+                // U64 that doesn't need to be restarted on a subtune change.
+                stop_playback_keep_audio(play_ctx, bridge);
 
                 if was_native {
                     if let Ok(data) = std::fs::read(&path) {
@@ -784,6 +791,7 @@ fn handle_cmd(
                                             track_info,
                                             frame_count: 0,
                                             next_frame: Instant::now(),
+                                            audio_port: saved_audio_port,
                                         });
                                         *state = PlayState::Playing;
                                     }
@@ -841,9 +849,26 @@ fn handle_cmd(
 }
 
 fn stop_playback(ctx: &mut Option<PlayContext>, bridge: &mut Option<Box<dyn SidDevice>>) {
+    stop_playback_inner(ctx, bridge, true);
+}
+
+fn stop_playback_keep_audio(
+    ctx: &mut Option<PlayContext>,
+    bridge: &mut Option<Box<dyn SidDevice>>,
+) {
+    stop_playback_inner(ctx, bridge, false);
+}
+
+fn stop_playback_inner(
+    ctx: &mut Option<PlayContext>,
+    bridge: &mut Option<Box<dyn SidDevice>>,
+    stop_audio: bool,
+) {
     if ctx.is_some() {
         if let Some(ref mut br) = bridge {
-            br.stop_audio(); // stop U64 audio stream before mute/reset
+            if stop_audio {
+                br.stop_audio();
+            }
             br.flush();
             br.mute();
             br.set_stereo(0);
@@ -870,6 +895,8 @@ struct PlayContext {
     track_info: TrackInfo,
     frame_count: u32,
     next_frame: Instant, // absolute deadline for next frame
+    /// UDP port for U64 audio streaming, if active. Preserved across subtune changes.
+    audio_port: Option<u16>,
 }
 
 enum PlayEngine {
@@ -1215,6 +1242,7 @@ fn setup_playback(
         track_info,
         frame_count: 0,
         next_frame: Instant::now(),
+        audio_port: None,
     }
 }
 
