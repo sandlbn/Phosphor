@@ -465,7 +465,7 @@ impl<'a> canvas::Program<Message> for TrackerCanvas<'a> {
     ) -> Vec<Geometry> {
         let n = self.num_sids.clamp(1, 4);
         let geom = self.cache.draw(renderer, bounds.size(), |frame| {
-            paint_tracker(frame, bounds, &self.history.frames, n);
+            paint_tracker_compact(frame, bounds, &self.history.frames, n);
         });
         vec![geom]
     }
@@ -475,7 +475,7 @@ impl<'a> canvas::Program<Message> for TrackerCanvas<'a> {
 //  paint_tracker — main Canvas paint routine
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn paint_tracker(
+pub fn paint_tracker_compact(
     frame: &mut Frame,
     bounds: Rectangle,
     history: &VecDeque<TrackerFrame>,

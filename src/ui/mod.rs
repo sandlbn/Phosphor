@@ -15,7 +15,7 @@ use crate::player::{PlayState, PlayerStatus};
 use crate::playlist::Playlist;
 use crate::recently_played::{format_played_at, RecentlyPlayed};
 use right_click::RightClickArea;
-use visualizer::Visualizer;
+use visualizer::{TrackerRef, Visualizer};
 
 /// Fixed scrollable ID for the playlist widget.
 pub fn playlist_scrollable_id() -> iced::widget::Id {
@@ -230,6 +230,7 @@ pub enum Message {
 pub fn track_info_bar<'a>(
     status: &'a PlayerStatus,
     visualizer: &'a Visualizer,
+    tracker: Option<TrackerRef<'a>>,
     is_now_playing_favorite: bool,
     has_track: bool,
     has_stil_info: bool,
@@ -338,7 +339,7 @@ pub fn track_info_bar<'a>(
     let content = row![
         info_col,
         now_playing_buttons,
-        container(visualizer.view())
+        container(visualizer.view(tracker))
             .width(Length::Fixed(vis_width))
             .height(Length::Fixed(vis_height)),
     ]
