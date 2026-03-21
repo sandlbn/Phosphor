@@ -15,6 +15,14 @@ use iced::widget::canvas::{self, Cache, Canvas, Frame, Geometry, Path, Stroke};
 use iced::{mouse, Color, Element, Length, Point, Rectangle, Size, Theme};
 use std::time::Instant;
 
+use super::sid_panel::TrackerHistory;
+
+/// References to the tracker state passed into the visualiser when mode == Tracker.
+pub struct TrackerRef<'a> {
+    pub history: &'a TrackerHistory,
+    pub num_sids: usize,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,14 +65,17 @@ pub enum VisMode {
     Bars,
     /// Scrolling oscilloscope lines, one lane per voice.
     Scope,
+    /// SIDdump-style tracker view (note / waveform / ADSR per voice).
+    Tracker,
 }
 
 impl VisMode {
-    /// Toggle between the two modes.
+    /// Cycle through the three modes: Bars → Scope → Tracker → Bars…
     pub fn toggle(self) -> Self {
         match self {
             Self::Bars => Self::Scope,
-            Self::Scope => Self::Bars,
+            Self::Scope => Self::Tracker,
+            Self::Tracker => Self::Bars,
         }
     }
 }
@@ -95,6 +106,10 @@ pub struct ExpandedInfo {
     pub num_sids: usize,
     pub elapsed_secs: f32,
     pub duration_secs: Option<f32>,
+    /// First non-empty line of STIL info for the current track/subtune (empty if none).
+    pub stil_text: String,
+    /// Horizontal scroll offset for the STIL demoscene ticker (advances each tick).
+    pub stil_scroll_x: f32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +240,10 @@ pub struct Visualizer {
     pub mode: VisMode,
     /// iced canvas cache — cleared whenever data changes.
     cache: Cache,
+    /// Separate cache for the full-screen expanded overlay.
+    /// Must be distinct from `cache` because the two render at different
+    /// sizes — sharing a cache between sizes causes wgpu StagingBelt panics.
+    expanded_cache: Cache,
 }
 
 impl Visualizer {
@@ -238,6 +257,7 @@ impl Visualizer {
             num_sids: 1,
             mode: VisMode::Bars,
             cache: Cache::new(),
+            expanded_cache: Cache::new(),
         }
     }
 
@@ -246,6 +266,7 @@ impl Visualizer {
     pub fn set_num_sids(&mut self, n: usize) {
         self.num_sids = n.clamp(1, 4);
         self.cache.clear();
+        self.expanded_cache.clear();
     }
 
     /// Feed a new frame of voice levels from the player.
@@ -285,12 +306,19 @@ impl Visualizer {
         self.scope_cursor = 0;
         self.num_sids = 1;
         self.cache.clear();
+        self.expanded_cache.clear();
+    }
+
+    /// Invalidate the expanded-view cache (call when scroll offset changes).
+    pub fn invalidate_expanded(&mut self) {
+        self.expanded_cache.clear();
     }
 
     /// Toggle between Bar and Scope display modes.
     pub fn toggle_mode(&mut self) {
         self.mode = self.mode.toggle();
         self.cache.clear();
+        self.expanded_cache.clear();
     }
 
     /// Number of voices (bars / lanes) to draw for the current tune.
@@ -299,12 +327,14 @@ impl Visualizer {
     }
 
     /// Compact 60 px strip for the track-info bar.
-    /// Single click toggles Bar / Scope mode; double-click expands to full window.
-    pub fn view(&self) -> Element<'_, super::Message> {
+    /// Single click cycles Bars → Scope → Tracker; double-click expands full window.
+    pub fn view<'a>(&'a self, tracker: Option<TrackerRef<'a>>) -> Element<'a, super::Message> {
         Canvas::new(VisProg {
             vis: self,
             info: None,
             expanded: false,
+            tracker,
+            cache: &self.cache,
         })
         .width(Length::Fill)
         .height(Length::Fixed(60.0))
@@ -312,15 +342,18 @@ impl Visualizer {
     }
 
     /// Full-window concert-screen overlay.
-    /// Single click still toggles Bar / Scope; double-click collapses back.
+    /// Single click still cycles modes; double-click collapses back.
     pub fn view_expanded<'a>(
         &'a self,
         info: Option<&'a ExpandedInfo>,
+        tracker: Option<TrackerRef<'a>>,
     ) -> Element<'a, super::Message> {
         Canvas::new(VisProg {
             vis: self,
             info,
             expanded: true,
+            tracker,
+            cache: &self.expanded_cache,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -336,6 +369,8 @@ struct VisProg<'v, 'i> {
     vis: &'v Visualizer,
     info: Option<&'i ExpandedInfo>,
     expanded: bool,
+    tracker: Option<TrackerRef<'v>>,
+    cache: &'v Cache,
 }
 
 impl<'v, 'i> canvas::Program<super::Message> for VisProg<'v, 'i> {
@@ -349,13 +384,33 @@ impl<'v, 'i> canvas::Program<super::Message> for VisProg<'v, 'i> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let geom = self.vis.cache.draw(renderer, bounds.size(), |frame| {
+        let geom = self.cache.draw(renderer, bounds.size(), |frame| {
             if self.expanded {
-                draw_expanded(self.vis, frame, bounds, self.info);
+                if self.vis.mode == VisMode::Tracker {
+                    if let Some(ref tr) = self.tracker {
+                        draw_tracker_expanded(tr, frame, bounds, self.info);
+                    } else {
+                        draw_expanded(self.vis, frame, bounds, self.info);
+                    }
+                } else {
+                    draw_expanded(self.vis, frame, bounds, self.info);
+                }
             } else {
                 match self.vis.mode {
                     VisMode::Bars => draw_bars(self.vis, frame, bounds),
                     VisMode::Scope => draw_scope(self.vis, frame, bounds),
+                    VisMode::Tracker => {
+                        if let Some(ref tr) = self.tracker {
+                            super::sid_panel::paint_tracker_compact(
+                                frame,
+                                bounds,
+                                &tr.history.frames,
+                                tr.num_sids,
+                            );
+                        } else {
+                            draw_bars(self.vis, frame, bounds);
+                        }
+                    }
                 }
             }
         });
@@ -835,6 +890,282 @@ fn draw_expanded(
     match vis.mode {
         VisMode::Bars => draw_bars_expanded(vis, frame, vis_bounds),
         VisMode::Scope => draw_scope_expanded(vis, frame, vis_bounds),
+        VisMode::Tracker => {} // handled by draw_tracker_expanded before this is called
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Expanded — Tracker full-screen with CRT overlay + title/progress from ExpandedInfo
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn draw_tracker_expanded(
+    tr: &TrackerRef<'_>,
+    frame: &mut Frame,
+    bounds: Rectangle,
+    info: Option<&ExpandedInfo>,
+) {
+    let w = bounds.width;
+    let h = bounds.height;
+
+    // Dark CRT background
+    frame.fill_rectangle(
+        Point::ORIGIN,
+        Size::new(w, h),
+        Color::from_rgb(0.03, 0.05, 0.04),
+    );
+
+    // CRT scanlines
+    let mut sy = 0.0_f32;
+    while sy < h {
+        frame.fill_rectangle(
+            Point::new(0.0, sy),
+            Size::new(w, 1.0),
+            Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.12,
+            },
+        );
+        sy += 4.0;
+    }
+
+    // Vignette — darken edges
+    for ring in 0..5u8 {
+        let t = ring as f32 / 5.0;
+        let alpha = 0.18 * (1.0 - t) * (1.0 - t);
+        let pad = t * w.min(h) * 0.30;
+        let v = Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: alpha,
+        };
+        frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(w, pad), v);
+        frame.fill_rectangle(Point::new(0.0, h - pad), Size::new(w, pad), v);
+        frame.fill_rectangle(Point::new(0.0, pad), Size::new(pad, h - 2.0 * pad), v);
+        frame.fill_rectangle(Point::new(w - pad, pad), Size::new(pad, h - 2.0 * pad), v);
+    }
+
+    // ── Layout ───────────────────────────────────────────────────────────────
+    // Tracker fills the top. Footer at bottom has:
+    //   Left zone  (w - 120px): two scrolling rows — wave bounce + color wave
+    //   Right zone (120px):     countdown, always visible, separated by glow line
+    //
+    // Footer height: generous so big fonts have room + wave amplitude headroom
+    let s4h = 5.0 * 4.0_f32; // scale-4 char height (row 1 — bigger!)
+    let s2h = 5.0 * 2.0_f32; // scale-2 char height (row 2)
+    let wave_amp = 6.0_f32; // max vertical displacement for sine wave
+    let row_pad = 10.0_f32;
+    let footer_h = if info.is_some() {
+        2.0 + row_pad + s4h + wave_amp + row_pad + s2h + row_pad
+    } else {
+        0.0
+    };
+    let cd_zone_w = 110.0_f32; // right panel width reserved for countdown
+
+    let tracker_bounds = Rectangle {
+        x: bounds.x,
+        y: bounds.y,
+        width: w,
+        height: (h - footer_h).max(40.0),
+    };
+
+    super::sid_panel::paint_tracker_compact(frame, tracker_bounds, &tr.history.frames, tr.num_sids);
+
+    if let Some(info) = info {
+        let foot_y = h - footer_h;
+        let scroller_w = w - cd_zone_w; // width available to the scroller rows
+
+        // ── Footer background ─────────────────────────────────────────────────
+        frame.fill_rectangle(
+            Point::new(0.0, foot_y),
+            Size::new(w, footer_h),
+            Color {
+                r: 0.015,
+                g: 0.04,
+                b: 0.02,
+                a: 0.98,
+            },
+        );
+        // Top separator — bright glow line
+        frame.fill_rectangle(
+            Point::new(0.0, foot_y),
+            Size::new(w, 1.0),
+            Color {
+                r: 0.22,
+                g: 0.88,
+                b: 0.40,
+                a: 0.70,
+            },
+        );
+        frame.fill_rectangle(
+            Point::new(0.0, foot_y + 1.0),
+            Size::new(w, 1.0),
+            Color {
+                r: 0.10,
+                g: 0.44,
+                b: 0.20,
+                a: 0.20,
+            },
+        );
+
+        // Vertical divider before countdown zone
+        frame.fill_rectangle(
+            Point::new(scroller_w, foot_y + 2.0),
+            Size::new(1.0, footer_h - 2.0),
+            Color {
+                r: 0.18,
+                g: 0.60,
+                b: 0.30,
+                a: 0.35,
+            },
+        );
+
+        // ── Countdown — right panel, big pixel font, always visible ───────────
+        if let Some(dur) = info.duration_secs {
+            let remaining = (dur - info.elapsed_secs).max(0.0);
+            let rem_u = remaining as u32;
+            let cd_str = format!("-{}:{:02}", rem_u / 60, rem_u % 60);
+            let cd_chars: Vec<char> = cd_str.chars().collect();
+            let cds = 3u32; // scale 3 for countdown — clearly readable
+            let cdcw = (3 * cds + cds) as f32;
+            let cdh = 5.0 * cds as f32;
+            let cdw = cd_chars.len() as f32 * cdcw;
+            // Centre in the right zone
+            let cd_x = scroller_w + (cd_zone_w - cdw) * 0.5;
+            let cd_y = foot_y + (footer_h - cdh) * 0.5;
+            // Pulsing amber — intensity tied to countdown urgency
+            let urgency = if dur > 0.0 {
+                1.0 - (remaining / dur).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let cd_color = Color {
+                r: 0.75 + urgency * 0.20,
+                g: 0.45 - urgency * 0.20,
+                b: 0.15,
+                a: 0.90,
+            };
+            draw_pixel_text(frame, &cd_chars, cd_x, cd_y, cds, cd_color);
+        } else {
+            // No duration — show ??? in the right panel
+            let q_chars: Vec<char> = "?:??".chars().collect();
+            let qs = 3u32;
+            let qcw = (3 * qs + qs) as f32;
+            let qh = 5.0 * qs as f32;
+            let qw = q_chars.len() as f32 * qcw;
+            draw_pixel_text(
+                frame,
+                &q_chars,
+                scroller_w + (cd_zone_w - qw) * 0.5,
+                foot_y + (footer_h - qh) * 0.5,
+                qs,
+                Color {
+                    r: 0.35,
+                    g: 0.50,
+                    b: 0.35,
+                    a: 0.45,
+                },
+            );
+        }
+
+        // ── Row 1: sine-wave bouncing title+author scroll (scale 4) ──────────
+        let row1_str = format!("{}   *   {}", info.name, info.author);
+        let row1_chars: Vec<char> = row1_str.chars().collect();
+        let r1cw = (3 * 4 + 4) as f32; // scale 4 char width
+        let row1_px_w = row1_chars.len() as f32 * r1cw;
+        let cycle1 = row1_px_w + scroller_w;
+        let start1_x = scroller_w - (info.stil_scroll_x % cycle1);
+        // Baseline y — leave room for wave_amp above and below
+        let row1_base = foot_y + row_pad + wave_amp;
+
+        // Per-character sine wave: each char has a phase offset
+        let s4 = 4.0_f32;
+        let r1cw_f = r1cw;
+        for (ci, ch) in row1_chars.iter().enumerate() {
+            let cx = start1_x + ci as f32 * r1cw_f;
+            if cx + r1cw_f < 0.0 {
+                continue;
+            }
+            if cx > scroller_w {
+                break;
+            }
+
+            // Sine wave: amplitude 6px, each char 0.4 rad out of phase
+            let phase = info.stil_scroll_x * 0.04 + ci as f32 * 0.4;
+            let bob = phase.sin() * wave_amp;
+            let char_y = row1_base + bob;
+
+            // Color wave: hue rotates along the text
+            let hue_t = ((ci as f32 * 0.15 + info.stil_scroll_x * 0.01) % 1.0).abs();
+            let color = hue_to_rgb(hue_t, 0.85, 0.92);
+
+            if let Some(rows) = glyph(*ch) {
+                for (ri, row) in rows.iter().enumerate() {
+                    for (pi, &on) in row.iter().enumerate() {
+                        if on {
+                            let px = cx + pi as f32 * s4;
+                            let py = char_y + ri as f32 * s4;
+                            if px >= 0.0 && px + s4 <= scroller_w {
+                                frame.fill_rectangle(Point::new(px, py), Size::new(s4, s4), color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Row 2: STIL / info scroll (scale 2) with color wave ──────────────
+        let row2_content = if !info.stil_text.is_empty() {
+            info.stil_text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("   *   ")
+        } else {
+            format!(
+                "{}   *   {}   *   {}",
+                info.released,
+                info.sid_type,
+                if info.is_pal { "PAL" } else { "NTSC" }
+            )
+        };
+        let row2_chars: Vec<char> = row2_content.chars().collect();
+        let r2cw = (3 * 2 + 2) as f32;
+        let row2_px_w = row2_chars.len() as f32 * r2cw;
+        let cycle2 = row2_px_w + scroller_w;
+        let start2_x = scroller_w - (info.stil_scroll_x * 0.65 % cycle2);
+        let row2_y = foot_y + row_pad + s4h + wave_amp + row_pad;
+        let s2 = 2.0_f32;
+
+        for (ci, ch) in row2_chars.iter().enumerate() {
+            let cx = start2_x + ci as f32 * r2cw;
+            if cx + r2cw < 0.0 {
+                continue;
+            }
+            if cx > scroller_w {
+                break;
+            }
+
+            // Slower colour cycle
+            let hue_t = ((ci as f32 * 0.08 + info.stil_scroll_x * 0.005) % 1.0).abs();
+            let col = hue_to_rgb(hue_t, 0.60, 0.72);
+
+            if let Some(rows) = glyph(*ch) {
+                for (ri, row) in rows.iter().enumerate() {
+                    for (pi, &on) in row.iter().enumerate() {
+                        if on {
+                            let px = cx + pi as f32 * s2;
+                            let py = row2_y + ri as f32 * s2;
+                            if px >= 0.0 && px + s2 <= scroller_w {
+                                frame.fill_rectangle(Point::new(px, py), Size::new(s2, s2), col);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1073,6 +1404,77 @@ fn draw_mode_hint(frame: &mut Frame, bounds: Rectangle) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pixel font renderer
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert a hue [0..1] with given saturation and value to an RGB Color.
+/// Classic HSV→RGB used for the colour-wave effect on the scroller text.
+fn hue_to_rgb(h: f32, s: f32, v: f32) -> Color {
+    let h6 = h * 6.0;
+    let i = h6.floor() as u32;
+    let f = h6 - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    let (r, g, b) = match i % 6 {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    Color { r, g, b, a: 1.0 }
+}
+
+/// Draw a row of pixel-font text that scrolls right-to-left across the full
+/// window width, wrapping seamlessly.  Characters whose pixels would fall
+/// entirely outside [0, window_w] are skipped so nothing bleeds outside.
+///
+/// `text_px_w`  — total pixel width of the text at the given scale
+/// `window_w`   — visible strip width (clip boundary)
+/// `scroll`     — monotonically increasing offset (px advanced per tick)
+fn draw_scrolling_pixel_row(
+    frame: &mut Frame,
+    chars: &[char],
+    text_px_w: f32,
+    window_w: f32,
+    scroll: f32,
+    y: f32,
+    scale: u32,
+    color: Color,
+) {
+    let s = scale as f32;
+    let char_w = 3.0 * s + s; // pixel char width incl. inter-char gap
+    let cycle = text_px_w + window_w; // full wrap period
+                                      // x-position of the first character; negative = scrolled left of origin
+    let start_x = window_w - (scroll % cycle);
+
+    for (ci, ch) in chars.iter().enumerate() {
+        let cx = start_x + ci as f32 * char_w;
+        // Skip characters fully off the left edge
+        if cx + char_w < 0.0 {
+            continue;
+        }
+        // Stop once fully off the right edge
+        if cx > window_w {
+            break;
+        }
+
+        if let Some(rows) = glyph(*ch) {
+            for (ri, row) in rows.iter().enumerate() {
+                for (pi, &on) in row.iter().enumerate() {
+                    if on {
+                        let px = cx + pi as f32 * s;
+                        let py = y + ri as f32 * s;
+                        // Pixel-level clip
+                        if px >= 0.0 && px + s <= window_w {
+                            frame.fill_rectangle(Point::new(px, py), Size::new(s, s), color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 fn draw_pixel_text(frame: &mut Frame, chars: &[char], x: f32, y: f32, scale: u32, color: Color) {
     let s = scale as f32;

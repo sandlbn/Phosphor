@@ -35,7 +35,7 @@ use player::{PlayState, PlayerCmd, PlayerStatus};
 use playlist::{Playlist, SonglengthDb};
 use recently_played::RecentlyPlayed;
 use ui::sid_panel::{TrackerHistory, TrackerView};
-use ui::visualizer::Visualizer;
+use ui::visualizer::{TrackerRef, Visualizer};
 use ui::{Message, SortColumn, SortDirection};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,6 +140,8 @@ struct App {
     /// Whether the visualiser is expanded to fill the whole window (overlay mode).
     /// Double-clicking the visualiser canvas toggles this.
     vis_expanded: bool,
+    /// Scroll offset for the STIL demoscene ticker in the expanded tracker view.
+    stil_scroll_x: f32,
     /// Cached metadata for the concert-screen overlay, kept in sync with track_info
     /// on every tick so the borrow checker is happy in `view()`.
     vis_expanded_info: Option<ui::visualizer::ExpandedInfo>,
@@ -326,6 +328,7 @@ impl App {
             pixel_ratio: 1.0,
             context_menu: None,
             vis_expanded: false,
+            stil_scroll_x: 0.0,
             vis_expanded_info: None,
             tracker_history: TrackerHistory::new(),
             tracker_view: TrackerView::new(),
@@ -1197,6 +1200,12 @@ impl App {
                         .push(&self.status.sid_regs, num_sids, is_pal);
                     self.tracker_view.invalidate();
                 }
+                // Advance STIL ticker when tracker is in full-screen mode.
+                if self.vis_expanded && self.visualizer.mode == ui::visualizer::VisMode::Tracker {
+                    // ~80 logical px/s at ~30 fps
+                    self.stil_scroll_x += 2.65;
+                    self.visualizer.invalidate_expanded();
+                }
                 // Keep STIL text in sync with current subtune.
                 if self.stil_entry.is_some() {
                     self.rebuild_stil_display();
@@ -1390,9 +1399,24 @@ impl App {
             .map(|m| self.favorites.is_favorite(m))
             .unwrap_or(false);
 
+        let num_sids_for_tracker = self
+            .status
+            .track_info
+            .as_ref()
+            .map(|i| i.num_sids)
+            .unwrap_or(1);
+        let tracker_ref = if self.visualizer.mode == ui::visualizer::VisMode::Tracker {
+            Some(TrackerRef {
+                history: &self.tracker_history,
+                num_sids: num_sids_for_tracker,
+            })
+        } else {
+            None
+        };
         let info_bar = ui::track_info_bar(
             &self.status,
             &self.visualizer,
+            tracker_ref,
             is_now_playing_fav,
             self.status.track_info.is_some(),
             self.stil_entry.is_some(),
@@ -1546,10 +1570,22 @@ impl App {
                 self.window_height,
             )
         } else if self.vis_expanded {
-            container(
-                self.visualizer
-                    .view_expanded(self.vis_expanded_info.as_ref()),
-            )
+            container(self.visualizer.view_expanded(
+                self.vis_expanded_info.as_ref(),
+                if self.visualizer.mode == ui::visualizer::VisMode::Tracker {
+                    Some(TrackerRef {
+                        history: &self.tracker_history,
+                        num_sids: self
+                            .status
+                            .track_info
+                            .as_ref()
+                            .map(|i| i.num_sids)
+                            .unwrap_or(1),
+                    })
+                } else {
+                    None
+                },
+            ))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1761,6 +1797,8 @@ impl App {
                 num_sids: info.num_sids,
                 elapsed_secs: self.status.elapsed.as_secs_f32(),
                 duration_secs: current_duration,
+                stil_text: self.stil_display_text.clone(),
+                stil_scroll_x: self.stil_scroll_x,
             });
         } else {
             self.vis_expanded_info = None;
@@ -2106,6 +2144,40 @@ async fn flush_frame() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> iced::Result {
+    // On macOS with iced_winit 0.14, the Cocoa event loop delivers close/resize
+    // events after iced's channel and wgpu resources are already torn down.
+    // These arrive inside a Cocoa block marked `cannot unwind`, so any panic
+    // that reaches the default hook — which calls std::backtrace — will
+    // double-panic and abort.  We replace the hook entirely to handle both:
+    //   • known shutdown panics  → suppress silently
+    //   • real panics            → print location + message ourselves, then
+    //                              abort (safe from any context)
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<unknown>");
+
+        // Suppress known iced_winit / wgpu macOS shutdown panics.
+        if msg.contains("SendError")
+            || msg.contains("Disconnected")
+            || msg.contains("Validation Error")
+            || msg.contains("wgpu error")
+            || msg.contains("StagingBelt")
+            || msg.contains("still mapped")
+        {
+            return; // silently suppress — these are expected on window close
+        }
+
+        if let Some(loc) = info.location() {
+            eprintln!("panic at {}:{}: {}", loc.file(), loc.line(), msg);
+        } else {
+            eprintln!("panic: {}", msg);
+        }
+    }));
+
     env_logger::init();
 
     let config_for_window = Config::load();
