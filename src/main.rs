@@ -28,17 +28,18 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use iced::widget::{column, container, rule, Space};
+use iced::widget::{column, container, mouse_area, rule, Space};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 
-use crate::heard_db::HeardDb;
 use config::{Config, FavoritesDb};
+use heard_db::HeardDb;
 use player::{PlayState, PlayerCmd, PlayerStatus};
 use playlist::{Playlist, SonglengthDb};
 use recently_played::RecentlyPlayed;
 use ui::sid_panel::{TrackerHistory, TrackerView};
 use ui::visualizer::{TrackerRef, Visualizer};
 use ui::{Message, SortColumn, SortDirection};
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Context menu state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +145,7 @@ struct App {
     /// Whether the visualiser is expanded to fill the whole window (overlay mode).
     /// Double-clicking the visualiser canvas toggles this.
     vis_expanded: bool,
+    show_help: bool,
     /// Scroll offset for the STIL demoscene ticker in the expanded tracker view.
     stil_scroll_x: f32,
     /// Cached metadata for the concert-screen overlay, kept in sync with track_info
@@ -335,6 +337,7 @@ impl App {
             pixel_ratio: 1.0,
             context_menu: None,
             vis_expanded: false,
+            show_help: false,
             stil_scroll_x: 0.0,
             vis_expanded_info: None,
             tracker_history: TrackerHistory::new(),
@@ -1286,6 +1289,53 @@ impl App {
                 self.vis_expanded = !self.vis_expanded;
             }
 
+            Message::Noop => {}
+
+            // Context-sensitive key handlers — resolved here where self is available
+            Message::KeyEscape => {
+                if self.show_help {
+                    self.show_help = false;
+                } else if self.vis_expanded {
+                    self.vis_expanded = false;
+                } else {
+                    self.context_menu = None;
+                }
+            }
+
+            Message::KeyArrowLeft => {
+                return self.update(Message::PrevTrack);
+            }
+
+            Message::KeyArrowRight => {
+                return self.update(Message::NextTrack);
+            }
+
+            Message::ShowHelp => {
+                self.show_help = !self.show_help;
+            }
+
+            Message::DismissHelp => {
+                self.show_help = false;
+            }
+
+            Message::ToggleFavoriteCurrent => {
+                if let Some(cur_idx) = self.playlist.current {
+                    let md5 = self
+                        .playlist
+                        .entries
+                        .get(cur_idx)
+                        .and_then(|e| e.md5.clone());
+                    if let Some(ref md5) = md5 {
+                        let is_fav = self.favorites.toggle(md5);
+                        self.favorites.save();
+                        eprintln!(
+                            "[phosphor] {} current track",
+                            if is_fav { "♥" } else { "♡" }
+                        );
+                    }
+                }
+            }
+
             Message::ToggleSidPanel => {
                 self.show_sid_panel = !self.show_sid_panel;
                 // Mutually exclusive with other panels
@@ -1588,25 +1638,33 @@ impl App {
                 self.window_height,
             )
         } else if self.vis_expanded {
-            container(self.visualizer.view_expanded(
-                self.vis_expanded_info.as_ref(),
-                if self.visualizer.mode == ui::visualizer::VisMode::Tracker {
-                    Some(TrackerRef {
-                        history: &self.tracker_history,
-                        num_sids: self
-                            .status
-                            .track_info
-                            .as_ref()
-                            .map(|i| i.num_sids)
-                            .unwrap_or(1),
-                    })
-                } else {
-                    None
-                },
-            ))
-            .width(Length::Fill)
-            .height(Length::Fill)
+            // Wrap in mouse_area to capture all clicks — prevents click-through
+            // to the playlist underneath when the overlay is active.
+            mouse_area(
+                container(self.visualizer.view_expanded(
+                    self.vis_expanded_info.as_ref(),
+                    if self.visualizer.mode == ui::visualizer::VisMode::Tracker {
+                        Some(TrackerRef {
+                            history: &self.tracker_history,
+                            num_sids: self
+                                .status
+                                .track_info
+                                .as_ref()
+                                .map(|i| i.num_sids)
+                                .unwrap_or(1),
+                        })
+                    } else {
+                        None
+                    },
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
+            .on_press(Message::Noop)
+            .on_right_press(Message::Noop)
             .into()
+        } else if self.show_help {
+            ui::help_overlay()
         } else if self.show_stil_overlay && self.stil_entry.is_some() {
             let current_song = self
                 .status
@@ -1647,17 +1705,37 @@ impl App {
                 use iced::keyboard::key::Named;
                 use iced::keyboard::Key;
                 match key {
-                    // Space only fires when no widget has captured the event —
-                    // prevents stopping playback while typing in the search box.
+                    // Escape — context-sensitive, resolved in update()
+                    Key::Named(Named::Escape) => Some(Message::KeyEscape),
+                    // Space — play/pause (not when typing)
                     Key::Named(Named::Space) if status != Status::Captured => {
                         Some(Message::PlayPause)
                     }
-                    Key::Named(Named::ArrowLeft) => Some(Message::PrevTrack),
-                    Key::Named(Named::ArrowRight) => Some(Message::NextTrack),
+                    // V — cycle visualiser mode
+                    Key::Character(ref c) if c.as_str() == "v" && status != Status::Captured => {
+                        Some(Message::ToggleVisMode)
+                    }
+                    // F — toggle full-screen visualiser
+                    Key::Character(ref c)
+                        if c.as_str() == "f"
+                            && !modifiers.control()
+                            && status != Status::Captured =>
+                    {
+                        Some(Message::ToggleVisFull)
+                    }
+                    // H — toggle favourite for currently playing track
+                    Key::Character(ref c) if c.as_str() == "h" && status != Status::Captured => {
+                        Some(Message::ToggleFavoriteCurrent)
+                    }
+                    // ? — show/hide help overlay
+                    Key::Character(ref c) if c.as_str() == "?" => Some(Message::ShowHelp),
+                    // Arrow keys — context-sensitive, resolved in update()
+                    Key::Named(Named::ArrowLeft) => Some(Message::KeyArrowLeft),
+                    Key::Named(Named::ArrowRight) => Some(Message::KeyArrowRight),
                     Key::Named(Named::ArrowUp) => Some(Message::SelectPrev),
                     Key::Named(Named::ArrowDown) => Some(Message::SelectNext),
                     Key::Named(Named::Delete) => Some(Message::RemoveSelected),
-                    Key::Named(Named::Escape) => Some(Message::DismissContextMenu),
+                    // Ctrl+F — focus search
                     Key::Character(ref c) if c.as_str() == "f" && modifiers.control() => {
                         Some(Message::FocusSearch)
                     }

@@ -33,6 +33,8 @@ https://github.com/sandlbn/Phosphor/releases
 
 ## Keyboard Shortcuts
 
+## Keyboard Shortcuts
+ 
 | Key | Action |
 |-----|--------|
 | `Space` | Play / Pause |
@@ -40,8 +42,13 @@ https://github.com/sandlbn/Phosphor/releases
 | `→` | Next track |
 | `↑` | Select previous track in playlist |
 | `↓` | Select next track in playlist |
+| `F` | Toggle full-screen visualiser |
+| `V` | Cycle visualiser mode (Bars → Scope → Tracker) |
+| `H` | Toggle favourite for currently playing track |
+| `?` | Show keyboard shortcuts & about |
 | `Delete` | Remove selected track |
 | `Ctrl+F` | Focus search |
+| `Escape` | Close overlay / exit full-screen |
 
 ## Playback Engines
 
