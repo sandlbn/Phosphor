@@ -29,6 +29,7 @@ https://github.com/sandlbn/Phosphor/releases
 - **U64 audio streaming** — stream SID audio from the Ultimate 64 back to the host machine over UDP
 - **Keyboard shortcuts** — full keyboard control (see below)
 - **Window geometry** — size and position are remembered between sessions
+- **HVSC completion tracking** — persistent log of every unique SID heard; status bar shows your progress against the full HVSC collection (e.g. *42 of 50127 HVSC SIDs heard (0.08%)*)
 
 ## Keyboard Shortcuts
 
@@ -127,6 +128,7 @@ Files stored there:
 | `recently_played.json` | Last 100 played tracks with timestamps |
 | `Songlengths.md5` | Cached HVSC Songlength database |
 | `STIL.txt` | Cached HVSC SID Tune Information List |
+| `heard.txt` | MD5 hashes of every SID ever played (one per line) |
 
 ## HVSC Integration
 
