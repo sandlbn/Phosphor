@@ -188,6 +188,14 @@ pub enum Message {
     // Visualiser
     /// Toggle between Bar and Scope display modes.
     ToggleVisMode,
+    ToggleFavoriteCurrent, // keyboard shortcut H — fav current track
+    ShowHelp,
+    DismissHelp,
+    Noop,
+    /// Raw key events — resolved to context-sensitive actions in update()
+    KeyEscape,
+    KeyArrowLeft,
+    KeyArrowRight,
     /// Toggle fullscreen mode (triggered by double-clicking the visualiser).
     ToggleVisFull,
 
@@ -1925,8 +1933,23 @@ pub fn filter_playlist(
 /// Thin right-aligned footer bar showing HVSC completion stats.
 /// Mimics the foobar2000 status bar style.
 pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
+    let help_btn = button(text("?").size(10))
+        .on_press(Message::ShowHelp)
+        .padding(Padding::from([1, 6]))
+        .style(|_theme: &Theme, st| button::Style {
+            background: Some(iced::Background::Color(match st {
+                button::Status::Hovered => Color::from_rgb(0.18, 0.20, 0.24),
+                _ => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+            })),
+            text_color: Color::from_rgb(0.38, 0.40, 0.50),
+            border: iced::Border::default(),
+            ..Default::default()
+        });
+
     container(
         row![
+            Space::new().width(Length::Fixed(4.0)),
+            help_btn,
             Space::new().width(Length::Fill),
             text(heard_text)
                 .size(11)
@@ -1936,10 +1959,101 @@ pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding(Padding::from([2, 0]))
+    .padding(Padding::from([1, 0]))
     .style(|_theme: &Theme| container::Style {
         background: Some(iced::Background::Color(Color::from_rgb(0.08, 0.09, 0.11))),
         ..Default::default()
     })
     .into()
+}
+
+/// Full-screen keyboard shortcut reference + author notice.
+/// Dismissed by clicking anywhere or pressing Escape / ?.
+pub fn help_overlay<'a>() -> Element<'a, Message> {
+    let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::DismissHelp);
+
+    let shortcuts: &[(&str, &str)] = &[
+        ("Space", "Play / Pause"),
+        ("← →", "Previous / Next track"),
+        ("↑ ↓", "Select track in playlist"),
+        ("F", "Toggle full-screen visualiser"),
+        ("V", "Cycle visualiser mode (Bars / Scope / Tracker)"),
+        ("H", "Toggle favourite for current track"),
+        ("Ctrl+F", "Focus search"),
+        ("Delete", "Remove selected track"),
+        ("Escape / ?", "Close this overlay"),
+    ];
+
+    let row_height = 22.0_f32;
+    let mut rows: Vec<Element<'_, Message>> = Vec::new();
+
+    // Title
+    rows.push(
+        text("Phosphor — Keyboard Shortcuts")
+            .size(15)
+            .color(Color::from_rgb(0.35, 0.90, 0.60))
+            .into(),
+    );
+    rows.push(Space::new().height(Length::Fixed(10.0)).into());
+
+    for (key, action) in shortcuts {
+        rows.push(
+            row![
+                container(text(*key).size(12).color(Color::from_rgb(0.80, 0.82, 0.90)))
+                    .width(Length::Fixed(180.0)),
+                text(*action)
+                    .size(12)
+                    .color(Color::from_rgb(0.60, 0.62, 0.70)),
+            ]
+            .height(Length::Fixed(row_height))
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
+
+    rows.push(Space::new().height(Length::Fixed(16.0)).into());
+
+    // Author notice
+    rows.push(
+        text("Phosphor — SID music player")
+            .size(11)
+            .color(Color::from_rgb(0.35, 0.37, 0.45))
+            .into(),
+    );
+    rows.push(
+        text("Built with Rust + Iced  •  USBSID-Pico / reSID / Ultimate 64")
+            .size(11)
+            .color(Color::from_rgb(0.30, 0.32, 0.40))
+            .into(),
+    );
+
+    let panel = container(
+        iced::widget::Column::with_children(rows)
+            .spacing(0)
+            .padding(Padding::from([24, 32])),
+    )
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(
+            0.07, 0.08, 0.12, 0.97,
+        ))),
+        border: iced::Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: Color::from_rgb(0.20, 0.22, 0.30),
+        },
+        ..Default::default()
+    });
+
+    // Centre the panel with fixed width
+    let centred = container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+
+    iced::widget::stack![dismiss, centred]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
