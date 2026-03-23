@@ -1917,3 +1917,29 @@ pub fn filter_playlist(
         .map(|(i, _)| i)
         .collect()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Status bar — thin footer strip shown at the very bottom of the main window
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Thin right-aligned footer bar showing HVSC completion stats.
+/// Mimics the foobar2000 status bar style.
+pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
+    container(
+        row![
+            Space::new().width(Length::Fill),
+            text(heard_text)
+                .size(11)
+                .color(Color::from_rgb(0.42, 0.44, 0.52)),
+            Space::new().width(Length::Fixed(12.0)),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([2, 0]))
+    .style(|_theme: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.08, 0.09, 0.11))),
+        ..Default::default()
+    })
+    .into()
+}

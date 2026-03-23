@@ -1117,6 +1117,7 @@ fn draw_tracker_expanded(
         }
 
         // ── Row 2: STIL / info scroll (scale 2) with color wave ──────────────
+        // Row 2 content: STIL text if available, else released/type/system
         let row2_content = if !info.stil_text.is_empty() {
             info.stil_text
                 .lines()
@@ -1423,57 +1424,6 @@ fn hue_to_rgb(h: f32, s: f32, v: f32) -> Color {
         _ => (v, p, q),
     };
     Color { r, g, b, a: 1.0 }
-}
-
-/// Draw a row of pixel-font text that scrolls right-to-left across the full
-/// window width, wrapping seamlessly.  Characters whose pixels would fall
-/// entirely outside [0, window_w] are skipped so nothing bleeds outside.
-///
-/// `text_px_w`  — total pixel width of the text at the given scale
-/// `window_w`   — visible strip width (clip boundary)
-/// `scroll`     — monotonically increasing offset (px advanced per tick)
-fn draw_scrolling_pixel_row(
-    frame: &mut Frame,
-    chars: &[char],
-    text_px_w: f32,
-    window_w: f32,
-    scroll: f32,
-    y: f32,
-    scale: u32,
-    color: Color,
-) {
-    let s = scale as f32;
-    let char_w = 3.0 * s + s; // pixel char width incl. inter-char gap
-    let cycle = text_px_w + window_w; // full wrap period
-                                      // x-position of the first character; negative = scrolled left of origin
-    let start_x = window_w - (scroll % cycle);
-
-    for (ci, ch) in chars.iter().enumerate() {
-        let cx = start_x + ci as f32 * char_w;
-        // Skip characters fully off the left edge
-        if cx + char_w < 0.0 {
-            continue;
-        }
-        // Stop once fully off the right edge
-        if cx > window_w {
-            break;
-        }
-
-        if let Some(rows) = glyph(*ch) {
-            for (ri, row) in rows.iter().enumerate() {
-                for (pi, &on) in row.iter().enumerate() {
-                    if on {
-                        let px = cx + pi as f32 * s;
-                        let py = y + ri as f32 * s;
-                        // Pixel-level clip
-                        if px >= 0.0 && px + s <= window_w {
-                            frame.fill_rectangle(Point::new(px, py), Size::new(s, s), color);
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn draw_pixel_text(frame: &mut Frame, chars: &[char], x: f32, y: f32, scale: u32, color: Color) {

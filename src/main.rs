@@ -3,6 +3,7 @@
 #[allow(dead_code)]
 mod c64_emu;
 mod config;
+mod heard_db;
 mod player;
 mod playlist;
 mod recently_played;
@@ -30,6 +31,7 @@ use crossbeam_channel::{Receiver, Sender};
 use iced::widget::{column, container, rule, Space};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 
+use crate::heard_db::HeardDb;
 use config::{Config, FavoritesDb};
 use player::{PlayState, PlayerCmd, PlayerStatus};
 use playlist::{Playlist, SonglengthDb};
@@ -37,7 +39,6 @@ use recently_played::RecentlyPlayed;
 use ui::sid_panel::{TrackerHistory, TrackerView};
 use ui::visualizer::{TrackerRef, Visualizer};
 use ui::{Message, SortColumn, SortDirection};
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Context menu state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +118,9 @@ struct App {
 
     /// Recently played history (last 100 unique tracks).
     recently_played: RecentlyPlayed,
+    heard_db: HeardDb,
+    /// Pre-formatted HVSC completion string for the status bar.
+    heard_text: String,
     /// Whether the recently played panel is visible instead of the playlist.
     show_recently_played: bool,
     /// Whether the SID register info panel is visible instead of the playlist.
@@ -274,6 +278,7 @@ impl App {
 
         let favorites = FavoritesDb::load();
         let recently_played = RecentlyPlayed::load();
+        let heard_db = HeardDb::load();
         let window_width = config.window_width_saved;
         let window_height = config.window_height_saved;
 
@@ -318,6 +323,8 @@ impl App {
             window_width,
             window_height,
             recently_played,
+            heard_db,
+            heard_text: String::new(),
             show_recently_played: false,
             show_sid_panel: false,
             playlist_scroll_offset_y: 0.0,
@@ -1200,6 +1207,15 @@ impl App {
                         .push(&self.status.sid_regs, num_sids, is_pal);
                     self.tracker_view.invalidate();
                 }
+                // Refresh HVSC completion string for status bar.
+                {
+                    let total = self
+                        .songlength_db
+                        .as_ref()
+                        .map(|db| db.entries.len())
+                        .unwrap_or(0);
+                    self.heard_text = self.heard_db.format_completion(total);
+                }
                 // Advance STIL ticker when tracker is in full-screen mode.
                 if self.vis_expanded && self.visualizer.mode == ui::visualizer::VisMode::Tracker {
                     // ~80 logical px/s at ~30 fps
@@ -1541,7 +1557,9 @@ impl App {
                 rule::horizontal(1),
                 search,
                 rule::horizontal(1),
-                playlist_widget
+                playlist_widget,
+                rule::horizontal(1),
+                ui::status_bar(&self.heard_text),
             ]
             .into()
         };
@@ -1684,6 +1702,10 @@ impl App {
                     &entry.path,
                 );
                 self.recently_played.save();
+                // Record in the heard-set for HVSC completion tracking.
+                // save() is deferred — only writes when dirty.
+                self.heard_db.record(md5);
+                self.heard_db.save();
             }
 
             self.playlist.current = Some(idx);
@@ -1994,6 +2016,7 @@ fn clear_default_lengths(playlist: &mut Playlist) {
 impl Drop for App {
     fn drop(&mut self) {
         eprintln!("[phosphor] App closing, stopping playback...");
+        self.heard_db.save();
         let _ = self.cmd_tx.send(PlayerCmd::Stop);
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = self.cmd_tx.send(PlayerCmd::Quit);
