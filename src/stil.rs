@@ -147,6 +147,8 @@ pub struct StilDb {
     by_filename: HashMap<String, Vec<String>>,
     /// Number of entries loaded.
     pub count: usize,
+    /// HVSC version parsed from the STIL header, e.g. 84.
+    pub hvsc_version: Option<u32>,
 }
 
 #[allow(dead_code)]
@@ -164,7 +166,16 @@ impl StilDb {
             by_path: HashMap::new(),
             by_filename: HashMap::new(),
             count: 0,
+            hvsc_version: None,
         };
+
+        // Parse version from header lines like "# STIL v84 - SID Tune Information..."
+        for line in content.lines().take(10) {
+            if let Some(v) = parse_stil_version(line) {
+                db.hvsc_version = Some(v);
+                break;
+            }
+        }
 
         db.parse(&content);
         db.count = db.by_path.len();
@@ -500,4 +511,100 @@ pub async fn download_stil(url: String) -> Result<PathBuf, String> {
 /// Default path for STIL.txt in the config directory.
 pub fn stil_db_path() -> Option<PathBuf> {
     crate::config::config_dir().map(|d| d.join("STIL.txt"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HVSC version parsing and update check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse an HVSC version number from a STIL header comment line.
+/// Matches patterns like:
+///   "#  STIL v84 - SID Tune Information List ..."
+///   "#  HVSC #84 - ..."
+///   "# STIL v84"
+/// Returns the numeric version (e.g. 84) or None if not found.
+pub fn parse_stil_version(line: &str) -> Option<u32> {
+    let line = line.trim_start_matches(|c| c == '#' || c == ' ');
+    // Match "STIL v84" or "STIL vN"
+    if let Some(rest) = line.strip_prefix("STIL v") {
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num.is_empty() {
+            return num.parse().ok();
+        }
+    }
+    // Match "HVSC #84"
+    if let Some(rest) = line.strip_prefix("HVSC #") {
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num.is_empty() {
+            return num.parse().ok();
+        }
+    }
+    None
+}
+
+/// Result of an HVSC update check.
+#[derive(Debug, Clone)]
+pub struct HvscUpdateInfo {
+    /// Version number of the remote STIL.
+    pub remote_version: u32,
+    /// Version number of the local STIL (None if not loaded).
+    pub local_version: Option<u32>,
+}
+
+impl HvscUpdateInfo {
+    pub fn is_newer(&self) -> bool {
+        match self.local_version {
+            Some(local) => self.remote_version > local,
+            None => true, // no local copy → always newer
+        }
+    }
+
+    pub fn description(&self) -> String {
+        match self.local_version {
+            Some(local) if self.remote_version > local => format!(
+                "HVSC v{} available (you have v{})",
+                self.remote_version, local
+            ),
+            Some(local) => format!("HVSC v{} is up to date", local),
+            None => format!("HVSC v{} available", self.remote_version),
+        }
+    }
+}
+
+/// Fetch the first 1 KB of the remote STIL.txt and parse the version from the header.
+/// This is a minimal request — we never download the full file just to check.
+pub async fn check_hvsc_update(stil_url: &str) -> Result<HvscUpdateInfo, String> {
+    use std::process::Command;
+
+    // Use curl with --range 0-1023 to fetch only the first 1 KB
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--range",
+            "0-1023",
+            "--max-time",
+            "10",
+            "--location",
+            stil_url,
+        ])
+        .output()
+        .map_err(|e| format!("curl failed: {e}"))?;
+
+    if !output.status.success() && output.stdout.is_empty() {
+        return Err(format!("HTTP error checking HVSC version"));
+    }
+
+    // Parse header as ISO-8859-1 (same as STIL loader)
+    let snippet: String = output.stdout.iter().map(|&b| b as char).collect();
+
+    for line in snippet.lines().take(15) {
+        if let Some(v) = parse_stil_version(line) {
+            return Ok(HvscUpdateInfo {
+                remote_version: v,
+                local_version: None, // caller fills this in
+            });
+        }
+    }
+
+    Err("Could not parse HVSC version from remote header".to_string())
 }
