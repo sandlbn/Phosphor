@@ -191,6 +191,8 @@ pub enum Message {
     ToggleFavoriteCurrent, // keyboard shortcut H — fav current track
     ShowHelp,
     DismissHelp,
+    HvscUpdateAvailable(String), // description string e.g. "HVSC v85 available"
+    HvscCheckDone(Result<u32, String>), // remote version result
     Noop,
     /// Raw key events — resolved to context-sensitive actions in update()
     KeyEscape,

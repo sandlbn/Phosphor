@@ -355,6 +355,19 @@ impl App {
             Message::VersionCheckDone,
         );
 
+        // Kick off HVSC version check using the STIL URL.
+        // We only fetch the first 1 KB of the remote STIL so this is cheap.
+        let hvsc_check_url = auto_stil_url.clone();
+        let hvsc_task = Task::perform(
+            async move {
+                match stil::check_hvsc_update(&hvsc_check_url).await {
+                    Ok(info) => Ok(info.remote_version),
+                    Err(e) => Err(e),
+                }
+            },
+            Message::HvscCheckDone,
+        );
+
         // Auto-download missing HVSC databases on first launch (or if files are gone).
         // Both downloads run in the background — the app is fully usable immediately.
         let songlength_missing = auto_last_sl_file
@@ -371,7 +384,7 @@ impl App {
             .unwrap_or(true)
             && stil::stil_db_path().map(|p| !p.exists()).unwrap_or(true);
 
-        let mut tasks = vec![version_task];
+        let mut tasks = vec![version_task, hvsc_task];
         let mut auto_status_parts: Vec<&str> = vec![];
 
         if songlength_missing {
@@ -1289,6 +1302,41 @@ impl App {
                 self.vis_expanded = !self.vis_expanded;
             }
 
+            Message::HvscCheckDone(Ok(remote_ver)) => {
+                let local_ver = self.stil_db.as_ref().and_then(|db| db.hvsc_version);
+                let info = stil::HvscUpdateInfo {
+                    remote_version: remote_ver,
+                    local_version: local_ver,
+                };
+                if info.is_newer() {
+                    eprintln!("[phosphor] {}", info.description());
+                    // Auto-download both updated databases — same as first-launch flow.
+                    // Show status while in flight.
+                    self.auto_download_status =
+                        format!("⬆ {} — updating databases…", info.description());
+                    self.pending_auto_downloads = 2;
+                    let sl_url = self.config.songlength_url.clone();
+                    let stil_url = self.config.stil_url.clone();
+                    return Task::batch([
+                        Task::perform(
+                            config::download_songlength(sl_url),
+                            Message::SonglengthDownloaded,
+                        ),
+                        Task::perform(stil::download_stil(stil_url), Message::StilDownloaded),
+                    ]);
+                } else {
+                    eprintln!("[phosphor] HVSC is up to date (v{remote_ver})");
+                    self.config.hvsc_known_version = Some(format!("v{remote_ver}"));
+                    self.config.save();
+                }
+            }
+
+            Message::HvscCheckDone(Err(e)) => {
+                eprintln!("[phosphor] HVSC version check failed: {e}");
+            }
+
+            Message::HvscUpdateAvailable(_) => {}
+
             Message::Noop => {}
 
             // Context-sensitive key handlers — resolved here where self is available
@@ -1828,6 +1876,13 @@ impl App {
         }
         if self.pending_auto_downloads == 0 {
             self.auto_download_status.clear();
+            // Both databases are now current — record the confirmed HVSC version
+            // so we don't re-download on the next launch.
+            if let Some(ver) = self.stil_db.as_ref().and_then(|db| db.hvsc_version) {
+                self.config.hvsc_known_version = Some(format!("v{ver}"));
+                self.config.save();
+                eprintln!("[phosphor] HVSC databases updated to v{ver}");
+            }
         }
     }
 
