@@ -44,6 +44,9 @@ pub struct Config {
     pub last_stil_file: Option<String>,
     /// Optional HVSC root directory — used to compute HVSC-relative paths for STIL lookup.
     pub hvsc_root: Option<String>,
+    /// Last HVSC version string fetched from the CDN (e.g. "HVSC #80").
+    /// Used to detect when a new release is available.
+    pub hvsc_known_version: Option<String>,
     /// Stream audio from the Ultimate 64 back to this machine via UDP.
     /// When enabled, Phosphor starts a UDP listener and asks the U64 to stream
     /// its audio output to us — letting you hear playback on the host computer.
@@ -77,6 +80,7 @@ impl Default for Config {
             stil_url: DEFAULT_STIL_URL.to_string(),
             last_stil_file: None,
             hvsc_root: None,
+            hvsc_known_version: None,
             u64_audio_enabled: false,
             u64_audio_port: 11001,
             force_stereo_2sid: false,
@@ -204,6 +208,11 @@ impl Config {
                 if val != "null" {
                     config.hvsc_root = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"hvsc_known_version\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.hvsc_known_version = strip_json_string(val);
+                }
             } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.u64_audio_enabled = val == "true";
@@ -276,6 +285,7 @@ impl Config {
                 "  \"stil_url\": \"{}\",\n",
                 "  \"last_stil_file\": {},\n",
                 "  \"hvsc_root\": {},\n",
+                "  \"hvsc_known_version\": {},\n",
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
@@ -298,6 +308,7 @@ impl Config {
             self.stil_url,
             fmt_opt_str(&self.last_stil_file),
             fmt_opt_str(&self.hvsc_root),
+            fmt_opt_str(&self.hvsc_known_version),
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,
