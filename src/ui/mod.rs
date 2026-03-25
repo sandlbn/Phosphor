@@ -182,7 +182,7 @@ pub enum Message {
     FileDropped(PathBuf),
 
     // Window
-    WindowResized(f32, f32),
+    WindowResized(iced::window::Id, f32, f32),
     WindowMoved(i32, i32),
 
     // Visualiser
@@ -198,6 +198,7 @@ pub enum Message {
     KeyEscape,
     KeyArrowLeft,
     KeyArrowRight,
+    ToggleMiniPlayer,
     /// Toggle fullscreen mode (triggered by double-clicking the visualiser).
     ToggleVisFull,
 
@@ -1982,6 +1983,7 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
         ("F", "Toggle full-screen visualiser"),
         ("V", "Cycle visualiser mode (Bars / Scope / Tracker)"),
         ("H", "Toggle favourite for current track"),
+        ("M", "Toggle mini player"),
         ("Ctrl+F", "Focus search"),
         ("Delete", "Remove selected track"),
         ("Escape / ?", "Close this overlay"),
@@ -2057,5 +2059,151 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
     iced::widget::stack![dismiss, centred]
         .width(Length::Fill)
         .height(Length::Fill)
+        .into()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Mini player view — compact 420×90 window
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const MINI_WIDTH: f32 = 420.0;
+pub const MINI_HEIGHT: f32 = 90.0;
+
+/// Compact single-window view shown in mini-player mode.
+/// Fits in 420×90 logical pixels — just title, author, transport + progress.
+pub fn mini_player_view<'a>(
+    status: &'a PlayerStatus,
+    current_duration: Option<u32>,
+    is_favorite: bool,
+) -> Element<'a, Message> {
+    // ── Transport buttons ─────────────────────────────────────────────────────
+    let mk_btn = |label: &'a str, msg: Message| -> Element<'a, Message> {
+        button(text(label).size(13))
+            .on_press(msg)
+            .padding(Padding::from([4, 10]))
+            .style(|_theme: &Theme, st| button::Style {
+                background: Some(iced::Background::Color(match st {
+                    button::Status::Hovered => Color::from_rgb(0.22, 0.24, 0.30),
+                    button::Status::Pressed => Color::from_rgb(0.16, 0.18, 0.22),
+                    _ => Color::from_rgb(0.15, 0.16, 0.20),
+                })),
+                text_color: Color::from_rgb(0.85, 0.87, 0.92),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.32),
+                },
+                ..Default::default()
+            })
+            .into()
+    };
+
+    let play_label = match status.state {
+        PlayState::Playing => "❚❚",
+        _ => "▶",
+    };
+
+    let fav_label = if is_favorite { "♥" } else { "♡" };
+    let fav_color = if is_favorite {
+        Color::from_rgb(0.95, 0.35, 0.45)
+    } else {
+        Color::from_rgb(0.55, 0.58, 0.65)
+    };
+
+    let transport = row![
+        mk_btn("◀◀", Message::PrevTrack),
+        mk_btn(play_label, Message::PlayPause),
+        mk_btn("■", Message::Stop),
+        mk_btn("▶▶", Message::NextTrack),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+
+    // ── Title + author ────────────────────────────────────────────────────────
+    let (title, author) = match &status.track_info {
+        Some(info) => (info.name.as_str(), info.author.as_str()),
+        None => ("No track loaded", "—"),
+    };
+
+    let song_info = column![
+        text(title)
+            .size(13)
+            .color(Color::from_rgb(0.88, 0.90, 0.95)),
+        text(author)
+            .size(11)
+            .color(Color::from_rgb(0.52, 0.55, 0.65)),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+
+    // ── Progress bar (thin strip) ─────────────────────────────────────────────
+    let elapsed_secs = status.elapsed.as_secs();
+    let total_secs = current_duration.unwrap_or(0) as u64;
+    let fraction = if total_secs > 0 {
+        (elapsed_secs as f32 / total_secs as f32).min(1.0)
+    } else {
+        0.0
+    };
+    let bar_pct = (fraction * 100.0) as u16;
+
+    let progress_strip = row![
+        container(Space::new().height(Length::Fixed(3.0)))
+            .width(Length::FillPortion(bar_pct.max(1)))
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.30, 0.70, 0.50))),
+                ..Default::default()
+            }),
+        container(Space::new().height(Length::Fixed(3.0)))
+            .width(Length::FillPortion(100u16.saturating_sub(bar_pct).max(1)))
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.20, 0.24))),
+                ..Default::default()
+            }),
+    ]
+    .width(Length::Fill);
+
+    // ── Expand + fav buttons ──────────────────────────────────────────────────
+    let expand_btn = button(text("⤢").size(12))
+        .on_press(Message::ToggleMiniPlayer)
+        .padding(Padding::from([4, 8]))
+        .style(|_theme: &Theme, st| button::Style {
+            background: Some(iced::Background::Color(match st {
+                button::Status::Hovered => Color::from_rgb(0.22, 0.24, 0.30),
+                _ => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+            })),
+            text_color: Color::from_rgb(0.45, 0.48, 0.58),
+            border: iced::Border::default(),
+            ..Default::default()
+        });
+
+    let fav_btn = button(text(fav_label).size(12))
+        .on_press(Message::ToggleFavoriteCurrent)
+        .padding(Padding::from([4, 8]))
+        .style(move |_theme: &Theme, _st| button::Style {
+            background: None,
+            text_color: fav_color,
+            border: iced::Border::default(),
+            ..Default::default()
+        });
+
+    // ── Main row ──────────────────────────────────────────────────────────────
+    let main_row = row![
+        transport,
+        Space::new().width(Length::Fixed(8.0)),
+        song_info,
+        fav_btn,
+        expand_btn,
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([8, 10]));
+
+    container(column![main_row, progress_strip,])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+            ..Default::default()
+        })
         .into()
 }

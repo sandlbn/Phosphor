@@ -146,6 +146,9 @@ struct App {
     /// Double-clicking the visualiser canvas toggles this.
     vis_expanded: bool,
     show_help: bool,
+    mini_mode: bool,
+    /// Primary window ID — captured from the first window event for resize.
+    window_id: Option<iced::window::Id>,
     /// Scroll offset for the STIL demoscene ticker in the expanded tracker view.
     stil_scroll_x: f32,
     /// Cached metadata for the concert-screen overlay, kept in sync with track_info
@@ -338,6 +341,8 @@ impl App {
             context_menu: None,
             vis_expanded: false,
             show_help: false,
+            mini_mode: false,
+            window_id: None,
             stil_scroll_x: 0.0,
             vis_expanded_info: None,
             tracker_history: TrackerHistory::new(),
@@ -1280,12 +1285,17 @@ impl App {
             }
 
             // ── Window ────────────────────────────────────────────────────
-            Message::WindowResized(w, h) => {
+            Message::WindowResized(wid, w, h) => {
+                self.window_id = Some(wid);
                 self.window_width = w;
                 self.window_height = h;
-                self.config.window_width_saved = w;
-                self.config.window_height_saved = h;
-                self.config.save();
+                // Don't overwrite saved size while in mini mode — we want to
+                // restore the full window dimensions when exiting mini mode.
+                if !self.mini_mode {
+                    self.config.window_width_saved = w;
+                    self.config.window_height_saved = h;
+                    self.config.save();
+                }
             }
 
             Message::WindowMoved(x, y) => {
@@ -1336,6 +1346,21 @@ impl App {
             }
 
             Message::HvscUpdateAvailable(_) => {}
+
+            Message::ToggleMiniPlayer => {
+                self.mini_mode = !self.mini_mode;
+                let size = if self.mini_mode {
+                    iced::Size::new(ui::MINI_WIDTH, ui::MINI_HEIGHT)
+                } else {
+                    iced::Size::new(
+                        self.config.window_width_saved.max(400.0),
+                        self.config.window_height_saved.max(300.0),
+                    )
+                };
+                if let Some(wid) = self.window_id {
+                    return iced::window::resize(wid, size);
+                }
+            }
 
             Message::Noop => {}
 
@@ -1506,6 +1531,18 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // ── Mini player mode ─────────────────────────────────────────────────
+        if self.mini_mode {
+            let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
+            let is_fav = self
+                .playlist
+                .current_entry()
+                .and_then(|e| e.md5.as_deref())
+                .map(|m| self.favorites.is_favorite(m))
+                .unwrap_or(false);
+            return ui::mini_player_view(&self.status, current_duration, is_fav);
+        }
+
         let is_now_playing_fav = self
             .playlist
             .current_entry()
@@ -1738,14 +1775,17 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let tick = time::every(Duration::from_millis(33)).map(|_| Message::Tick);
 
-        let window_events = event::listen_with(|event, status, _id| match event {
+        let window_events = event::listen_with(|event, status, id| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
             }
             iced::Event::Window(iced::window::Event::Resized(size)) => {
-                Some(Message::WindowResized(size.width, size.height))
+                Some(Message::WindowResized(id, size.width, size.height))
             }
             iced::Event::Window(iced::window::Event::Moved(point)) => {
+                // Piggyback window ID capture on the Moved event —
+                // this fires at startup when the saved position is restored.
+                // We'll handle both WindowMoved and store the ID.
                 Some(Message::WindowMoved(point.x as i32, point.y as i32))
             }
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
@@ -1774,6 +1814,10 @@ impl App {
                     // H — toggle favourite for currently playing track
                     Key::Character(ref c) if c.as_str() == "h" && status != Status::Captured => {
                         Some(Message::ToggleFavoriteCurrent)
+                    }
+                    // M — toggle mini player
+                    Key::Character(ref c) if c.as_str() == "m" && status != Status::Captured => {
+                        Some(Message::ToggleMiniPlayer)
                     }
                     // ? — show/hide help overlay
                     Key::Character(ref c) if c.as_str() == "?" => Some(Message::ShowHelp),
@@ -2327,6 +2371,9 @@ fn main() -> iced::Result {
             return; // silently suppress — these are expected on window close
         }
 
+        // For real panics, print a minimal message and let the runtime abort.
+        // We do NOT call the default hook because that uses std::backtrace which
+        // is itself not unwind-safe and can double-panic in a Cocoa block context.
         if let Some(loc) = info.location() {
             eprintln!("panic at {}:{}: {}", loc.file(), loc.line(), msg);
         } else {
