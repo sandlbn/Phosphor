@@ -162,7 +162,6 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
 
                 let dev_name = device.name().unwrap_or_else(|_| "unknown".into());
 
-                // Query the device's preferred config to get the REAL sample rate.
                 let default_config = device
                     .default_output_config()
                     .map_err(|e| format!("No default output config: {e}"))?;
@@ -173,7 +172,19 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                     dev_name, actual_rate,
                 );
 
-                // Build stream at the device's native rate to avoid resampling.
+                // Pre-fill the ring buffer with ~40ms of silence so the audio
+                // callback has samples to consume while the emulation ramps up.
+                // Without this, early callbacks get underruns (silence gaps
+                // interleaved with real audio) which sounds like vinyl crackle,
+                // especially on Windows where cpal requests larger buffers.
+                {
+                    let prefill = (actual_rate as usize * 40) / 1000; // ~40ms
+                    let mut ring = audio_buf.lock().unwrap();
+                    for _ in 0..prefill {
+                        ring.push_back((0, 0));
+                    }
+                }
+
                 let config = cpal::StreamConfig {
                     channels: 2,
                     sample_rate: cpal::SampleRate(actual_rate),
