@@ -3690,7 +3690,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phosphor"
-version = "0.2.10"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -4662,18 +4662,18 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sidlite-sys"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d60128e21eb4e04989abc6baaabf7f82eb36e65125a0569dffda544b44686880"
+checksum = "d9b3ed93e6333a90f91fab46d8dabcb29356b365ccdf55aa39a3617067e5373a"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "sidplayfp-sys"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21afd3f52ff78e39c89247ed7ef4ca09e43066de276d940773d1e9053e7242e1"
+checksum = "a54baf8f9a68337e004d13f36b49ad40bc70b46f9d2978a7d97b9c08de75408e"
 dependencies = [
  "cc",
 ]

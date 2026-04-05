@@ -11,11 +11,9 @@ Prebuilt binaries for macOS, Linux and Windows are available on the GitHub **Rel
 
 https://github.com/sandlbn/Phosphor/releases
 
-> **⚠️ Work in progress.** PSID playback works well. RSID support is experimental and many tunes won't play correctly yet.
-
 ## Features
 
-- **Three playback engines** — USB hardware, software emulation, or Commodore Ultimate 64 over the network
+- **Four playback engines** — USB hardware, software emulation (reSID or SIDLite), or Commodore Ultimate 64 over the network
 - **Playlist management** — add files and folders, drag & drop, save/load M3U playlists
 - **Sortable columns** — click any column header to sort by title, author, released, duration, type, or SID count
 - **Search & filter** — real-time search across title, author, released year, and file path
@@ -56,7 +54,8 @@ Selectable in Settings (⚙):
 
 - **Auto** — tries USB first, falls back to software emulation
 - **USB** — USBSID-Pico hardware via register-level writes
-- **Emulated** — software SID via resid-rs + cpal audio output
+- **Emulated (reSID)** — software SID via resid-rs + cpal audio output
+- **SIDLite (libsidplayfp)** — lightweight SID emulation from libsidplayfp + cpal audio output
 - **Ultimate 64** — native playback on Ultimate 64 / Elite II via REST API (firmware 3.14+ required)
 
 ## Requirements
