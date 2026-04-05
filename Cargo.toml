@@ -1,6 +1,6 @@
 [package]
 name = "phosphor"
-version = "0.2.10"
+version = "0.3.0"
 edition = "2021"
 description = "Phosphor — a SID player for USBSID-Pico / Ultimate 64"
 
@@ -20,6 +20,12 @@ usbsid-pico = { version = "0.1.5", features = ["usb"] }
 # Software SID emulation
 resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
 cpal = "0.15"
+
+# SIDLite emulation from libsidplayfp
+sidlite-sys = "0.1.1"
+
+# Full libsidplayfp player (cycle-accurate CPU for RSID)
+sidplayfp-sys = "0.1.1"
 
 # Ultimate 64 REST API
 ultimate64 = "0.5"

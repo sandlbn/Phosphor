@@ -63,7 +63,7 @@ pub trait SidDevice: Send {
 
 /// List of engine names available at runtime.
 pub fn available_engines() -> Vec<&'static str> {
-    vec!["usb", "emulated", "u64"]
+    vec!["usb", "emulated", "sidlite", "u64"]
 }
 
 /// Create a SidDevice for the given engine name.
@@ -78,6 +78,7 @@ pub fn create_engine(
         "auto" => create_auto(u64_address, u64_password),
         "usb" => create_usb(),
         "emulated" => create_emulated(),
+        "sidlite" => create_sidlite(),
         "u64" => create_u64(u64_address, u64_password),
         other => Err(format!(
             "Unknown engine '{}'. Available: {:?}",
@@ -132,6 +133,13 @@ fn create_usb() -> Result<Box<dyn SidDevice>, String> {
 fn create_emulated() -> Result<Box<dyn SidDevice>, String> {
     eprintln!("[phosphor] Opening software SID (resid-rs + cpal)…");
     let dev = crate::sid_emulated::EmulatedDevice::open()?;
+    Ok(Box::new(dev))
+}
+
+/// SIDLite emulation from libsidplayfp (sidlite-sys + cpal).
+fn create_sidlite() -> Result<Box<dyn SidDevice>, String> {
+    eprintln!("[phosphor] Opening SIDLite engine (libsidplayfp + cpal)...");
+    let dev = crate::sid_sidlite::SidLiteDevice::open()?;
     Ok(Box::new(dev))
 }
 

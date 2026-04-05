@@ -2,6 +2,7 @@
 // with the GUI via crossbeam channels. USB I/O goes through the
 // setuid usbsid-bridge helper (fixed-size protocol, async ring buffer).
 pub mod hacks;
+pub mod libsidplayfp;
 pub mod memory;
 pub mod rsid_bus;
 pub mod sid_file;
@@ -176,8 +177,10 @@ fn run_until(cpu: &mut CPU<C64Memory, Nmos6502>, halt: u16, max_steps: u32) {
         if cpu.registers.program_counter == halt {
             return;
         }
-        let cycles = opcode_cycles_banked(&cpu.memory, cpu.registers.program_counter);
+        let old_pc = cpu.registers.program_counter;
         cpu.single_step();
+        let new_pc = cpu.registers.program_counter;
+        let cycles = opcode_cycles_banked(&cpu.memory, old_pc, new_pc);
         cpu.memory.frame_cycle += cycles;
     }
 }
@@ -301,6 +304,19 @@ fn player_loop(
                                     send_sid_writes(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
+                                        ctx.mirror_mono,
+                                        ctx.cycles_per_frame,
+                                    );
+                                }
+                            }
+                            PlayEngine::SidPlayFp(fp) => {
+                                // ── libsidplayfp cycle-accurate emulation ────
+                                fp.run_frame(ctx.cycles_per_frame);
+
+                                if let Some(ref mut br) = bridge {
+                                    send_sid_writes(
+                                        br.as_mut(),
+                                        &fp.sid_writes,
                                         ctx.mirror_mono,
                                         ctx.cycles_per_frame,
                                     );
@@ -905,6 +921,9 @@ enum PlayEngine {
         cpu: CPU<RsidBus, Nmos6502>,
         prev_nmi: bool,
     },
+    /// Cycle-accurate emulation via libsidplayfp.
+    /// Uses libsidplayfp's MOS6510 + CIA + VIC-II for proper per-cycle timing.
+    SidPlayFp(libsidplayfp::LibSidPlayFp),
     /// U64 native playback — real C64 handles SID output.
     /// Shadow CPU runs locally for visualization only.
     Native {
@@ -927,7 +946,10 @@ enum NativeShadow {
 #[allow(dead_code)]
 impl PlayContext {
     fn is_rsid(&self) -> bool {
-        matches!(self.engine, PlayEngine::Rsid { .. })
+        matches!(
+            self.engine,
+            PlayEngine::Rsid { .. } | PlayEngine::SidPlayFp(_)
+        )
     }
 
     fn is_native(&self) -> bool {
@@ -938,6 +960,7 @@ impl PlayContext {
         match &self.engine {
             PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
             PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
+            PlayEngine::SidPlayFp(fp) => &fp.sid_writes,
             PlayEngine::Native { shadow } => match shadow {
                 NativeShadow::Psid { cpu, .. } => &cpu.memory.sid_writes,
                 NativeShadow::Rsid { cpu, .. } => &cpu.memory.sid_writes,
@@ -949,6 +972,7 @@ impl PlayContext {
         match &self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.voice_levels(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.voice_levels(),
+            PlayEngine::SidPlayFp(fp) => fp.voice_levels(),
             PlayEngine::Native { shadow } => match shadow {
                 NativeShadow::Psid { cpu, .. } => cpu.memory.voice_levels(),
                 NativeShadow::Rsid { cpu, .. } => cpu.memory.voice_levels(),
@@ -961,6 +985,7 @@ impl PlayContext {
         match &self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.sid_shadow.to_vec(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.sid_shadow.to_vec(),
+            PlayEngine::SidPlayFp(fp) => fp.sid_shadow.to_vec(),
             PlayEngine::Native { shadow } => match shadow {
                 NativeShadow::Psid { cpu, .. } => cpu.memory.sid_shadow.to_vec(),
                 NativeShadow::Rsid { cpu, .. } => cpu.memory.sid_shadow.to_vec(),
@@ -972,6 +997,7 @@ impl PlayContext {
         match &mut self.engine {
             PlayEngine::Psid(cpu) => cpu.memory.clear_writes(),
             PlayEngine::Rsid { cpu, .. } => cpu.memory.clear_writes(),
+            PlayEngine::SidPlayFp(fp) => fp.clear_writes(),
             PlayEngine::Native { shadow } => match shadow {
                 NativeShadow::Psid { cpu, .. } => cpu.memory.clear_writes(),
                 NativeShadow::Rsid { cpu, .. } => cpu.memory.clear_writes(),
@@ -1088,18 +1114,32 @@ fn setup_playback(
     let trampoline: u16 = 0x0300;
     let halt_pc = trampoline + 3;
 
-    let engine = if is_rsid {
-        setup_rsid_engine(
-            &sid_file,
-            song,
-            &mapper,
-            mono_mode,
-            cycles_per_frame,
-            trampoline,
-            halt_pc,
-        )
-    } else {
-        setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc)
+    // Route all tunes through libsidplayfp for cycle-accurate emulation.
+    // Fall back to the built-in mos6502 engine only if libsidplayfp fails.
+    let engine = match libsidplayfp::LibSidPlayFp::new(&sid_file.raw, song) {
+        Ok(fp) => {
+            eprintln!(
+                "[phosphor] Using libsidplayfp for {} (cycle-accurate)",
+                if is_rsid { "RSID" } else { "PSID" },
+            );
+            PlayEngine::SidPlayFp(fp)
+        }
+        Err(e) => {
+            eprintln!("[phosphor] libsidplayfp failed: {e}, falling back to built-in CPU");
+            if is_rsid {
+                setup_rsid_engine(
+                    &sid_file,
+                    song,
+                    &mapper,
+                    mono_mode,
+                    cycles_per_frame,
+                    trampoline,
+                    halt_pc,
+                )
+            } else {
+                setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc)
+            }
+        }
     };
 
     // Send INIT writes to hardware
@@ -1107,6 +1147,7 @@ fn setup_playback(
     let init_writes = match &engine {
         PlayEngine::Psid(cpu) => &cpu.memory.sid_writes,
         PlayEngine::Rsid { cpu, .. } => &cpu.memory.sid_writes,
+        PlayEngine::SidPlayFp(_) => &empty_writes, // libsidplayfp handles INIT internally
         PlayEngine::Native { .. } => &empty_writes,
     };
 
@@ -1221,6 +1262,40 @@ fn setup_playback(
 
             cpu.memory.clear_writes();
             PlayEngine::Rsid { cpu, prev_nmi }
+        }
+        PlayEngine::SidPlayFp(fp) => {
+            // libsidplayfp handles CIA timing internally.
+            // Read the CIA latch so we can pace frames correctly on the host side.
+            let cia_latch = fp.cia1_timer_a as u64;
+            let clock: u64 = if header.is_pal { 985_248 } else { 1_022_727 };
+            let default_frame_cycles: u64 = if header.is_pal {
+                PAL_CYCLES_PER_FRAME as u64
+            } else {
+                NTSC_CYCLES_PER_FRAME as u64
+            };
+
+            if cia_latch > 0 && cia_latch < 0xFFFF {
+                let cia_us = (cia_latch * 1_000_000) / clock;
+                let cia_hz = clock as f64 / cia_latch as f64;
+                let ratio = cia_latch as f64 / default_frame_cycles as f64;
+
+                eprintln!(
+                    "[phosphor] libsidplayfp CIA1 Timer A latch={} → {}µs ({:.1}Hz)",
+                    cia_latch, cia_us, cia_hz,
+                );
+
+                if cia_us > 0 && (ratio < 0.95 || ratio > 1.05) && cia_hz >= 20.0 && cia_hz <= 300.0
+                {
+                    frame_us = cia_us;
+                    cycles_per_frame = cia_latch as u32;
+                    eprintln!(
+                        "[phosphor] libsidplayfp frame rate adjusted to {}µs ({:.1}Hz)",
+                        frame_us, cia_hz,
+                    );
+                }
+            }
+
+            PlayEngine::SidPlayFp(fp)
         }
         n @ PlayEngine::Native { .. } => n,
     };
@@ -1451,15 +1526,27 @@ fn run_rsid_init_emu(
 ) -> (bool, bool) {
     let mut cycles_done: u32 = 0;
     let mut prev_nmi = false;
+    let mut pending_ticks: u32 = 0;
 
     while cycles_done < max_cycles {
+        // ── Flush deferred ticks from the previous instruction ────────
+        if pending_ticks > 0 {
+            for _ in 0..pending_ticks {
+                cpu.memory.c64.tick_peripherals();
+            }
+            cycles_done += pending_ticks;
+            pending_ticks = 0;
+
+            if cpu.memory.c64.vic.new_frame {
+                cpu.memory.c64.vic.new_frame = false;
+                cpu.memory.tick_jiffy_clock();
+            }
+        }
+
         if cpu.registers.program_counter == idle_pc {
             return (true, prev_nmi);
         }
 
-        // ── Fix #1: BA stun — honour VIC bus-not-available ────────────────
-        // When BA is low the CPU cannot access the bus; only peripherals tick.
-        // Insert stun cycles until BA goes high again.
         if !hack_flags.disable_badline_stun {
             while cpu.memory.c64.is_cpu_jammed() {
                 cpu.memory.c64.tick_peripherals();
@@ -1470,9 +1557,6 @@ fn run_rsid_init_emu(
             }
         }
 
-        // ── Fix #2: Check IRQ BEFORE stepping the CPU ─────────────────────
-        // Delivering before single_step() eliminates the "last instruction
-        // already ran" window that caused systematic cycle timing errors.
         let irq_cycles = if cpu.memory.irq_pending()
             && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS)
         {
@@ -1485,10 +1569,6 @@ fn run_rsid_init_emu(
             0
         };
 
-        // ── Fix #2 (NMI): Check NMI BEFORE stepping the CPU ──────────────
-        // NMI gate mirrors reference: ciaNMI() && (_no_nmi_hack || _no_flag_i)
-        // When nmi_needs_i_flag_clear is set (_no_nmi_hack=0), NMI may only
-        // fire if the CPU I-flag is currently CLEAR (_no_flag_i=1).
         let cur_nmi = cpu.memory.nmi_pending();
         let i_flag_clear = !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS);
         let nmi_allowed = !hack_flags.nmi_needs_i_flag_clear || i_flag_clear;
@@ -1506,21 +1586,18 @@ fn run_rsid_init_emu(
 
         cycles_done += irq_cycles + nmi_cycles;
 
-        // Execute next instruction (only if no interrupt was delivered)
         if irq_cycles == 0 && nmi_cycles == 0 {
-            let inst_cycles = cpu.memory.opcode_cycles(cpu.registers.program_counter);
+            let old_pc = cpu.registers.program_counter;
             cpu.single_step();
-            cycles_done += inst_cycles;
-
-            for _ in 0..inst_cycles {
-                cpu.memory.c64.tick_peripherals();
-            }
+            let new_pc = cpu.registers.program_counter;
+            pending_ticks = cpu.memory.opcode_cycles(old_pc, new_pc);
         }
+    }
 
-        // Jiffy clock on VIC frame boundary
-        if cpu.memory.c64.vic.new_frame {
-            cpu.memory.c64.vic.new_frame = false;
-            cpu.memory.tick_jiffy_clock();
+    // Flush remaining ticks
+    if pending_ticks > 0 {
+        for _ in 0..pending_ticks {
+            cpu.memory.c64.tick_peripherals();
         }
     }
 
@@ -1533,43 +1610,50 @@ fn run_rsid_init_emu(
 /// 1. BA stun — CPU pauses when VIC holds bus (badlines / sprite DMA).
 /// 2. IRQ/NMI delivered BEFORE single_step(), eliminating timing drift.
 /// 3. NMI-during-RTI guard honoured when hack flag is set.
+/// Run RSID emulation for `cycles` cycles with per-cycle peripheral ticking.
+///
+/// Key design: peripheral ticks are DEFERRED to the start of the NEXT
+/// instruction.  This prevents CIA register writes during an instruction
+/// from getting "free" ticks in the same instruction — matching real
+/// hardware where the write happens on the last cycle and the timer
+/// only starts counting from the next cycle onward.
 fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mut bool) {
     let mut cycles_done: u32 = 0;
     let hack_flags = cpu.memory.hack_flags.clone();
 
-    // Maximum extra cycles we run past the frame boundary to let an IRQ handler
-    // (the tune's player routine) finish after it was triggered right at or near
-    // the end of the frame.
-    //
-    // Why this is needed:
-    //   CIA1 Timer A is set to exactly `cycles` (the frame length), so it fires
-    //   on the very last cycle of the frame.  We deliver the IRQ (7 cycles),
-    //   which pushes cycles_done past `cycles`.  Without overflow budget, the
-    //   loop exits immediately and the player never runs.  On the next frame the
-    //   CPU's PC is still inside the IRQ vector so the player executes at the
-    //   START of that frame — one frame late — causing every other frame to
-    //   receive a double player call and the audio to be badly out of sync.
-    //
-    //   On real hardware the player routine runs, then the CPU sits in a CLI idle
-    //   loop until the next CIA fire.  We replicate that: run up to
-    //   `cycles + PLAYER_OVERFLOW` cycles so the player can always complete, then
-    //   the idle loop will trigger the cycle-count exit naturally on the next frame.
-    //
-    //   4096 is well above any known SID player routine (typically 100–500 cycles).
-    //   SID writes that occur in the overflow are stamped with frame_cycle values
-    //   slightly above `cycles`; flush()/send_sid_writes() handles this correctly
-    //   via saturating_sub (remaining = 0 if last_write > cycles_per_frame).
     const PLAYER_OVERFLOW: u32 = 4096;
     let hard_limit = cycles + PLAYER_OVERFLOW;
 
-    // true while the CPU is executing an IRQ or NMI handler (I-flag set by us).
-    // We track this so the loop does not exit mid-handler when cycles_done >= cycles.
     let mut in_interrupt: bool = false;
 
+    // Deferred tick count from the previous instruction.  Flushed at the
+    // TOP of the next iteration so that CIA/VIC state is up-to-date for
+    // interrupt sampling, but writes during single_step() don't get
+    // premature peripheral ticks.
+    let mut pending_ticks: u32 = 0;
+
     while cycles_done < hard_limit {
+        // ── Flush deferred ticks from the previous instruction ────────
+        // Must happen BEFORE interrupt checks so CIA IRQ flags are current.
+        if pending_ticks > 0 {
+            for _ in 0..pending_ticks {
+                cpu.memory.c64.tick_peripherals();
+            }
+            cpu.memory.frame_cycle += pending_ticks;
+            cycles_done += pending_ticks;
+            pending_ticks = 0;
+
+            if cpu.memory.c64.vic.new_frame {
+                cpu.memory.c64.vic.new_frame = false;
+                cpu.memory.tick_jiffy_clock();
+            }
+        }
+
         // Exit once we've run the full frame AND we're not inside an interrupt handler.
-        // This lets a player that was triggered right at the frame boundary finish.
         if cycles_done >= cycles && !in_interrupt {
+            break;
+        }
+        if cycles_done >= hard_limit {
             break;
         }
 
@@ -1629,27 +1713,29 @@ fn run_rsid_sub_emu(cpu: &mut CPU<RsidBus, Nmos6502>, cycles: u32, prev_nmi: &mu
         }
 
         // ── Execute one instruction ───────────────────────────────────────
-        let inst_cycles = cpu.memory.opcode_cycles(cpu.registers.program_counter);
+        // Peripheral ticks are NOT applied here — they are deferred to the
+        // top of the next iteration.  This way, CIA register writes during
+        // single_step() (e.g. STA $DC0E starting a timer) take effect
+        // cleanly: the timer sees its first PHI2 tick on the next instruction,
+        // just like real hardware where the write lands on the last cycle.
+        let old_pc = cpu.registers.program_counter;
         cpu.single_step();
-        cycles_done += inst_cycles;
-        cpu.memory.frame_cycle += inst_cycles;
-
-        for _ in 0..inst_cycles {
-            cpu.memory.c64.tick_peripherals();
-        }
+        let new_pc = cpu.registers.program_counter;
+        pending_ticks = cpu.memory.opcode_cycles(old_pc, new_pc);
 
         // Detect RTI: if I-flag was set (we're in an interrupt) and the CPU
         // just executed RTI ($40), the interrupt handler has returned.
-        // The CPU restored the status register from the stack, which will have
-        // cleared the I-flag (most SID players run with I clear in the main loop).
         if in_interrupt && !cpu.registers.status.contains(Status::PS_DISABLE_INTERRUPTS) {
             in_interrupt = false;
         }
+    }
 
-        if cpu.memory.c64.vic.new_frame {
-            cpu.memory.c64.vic.new_frame = false;
-            cpu.memory.tick_jiffy_clock();
+    // Flush any remaining deferred ticks from the last instruction.
+    if pending_ticks > 0 {
+        for _ in 0..pending_ticks {
+            cpu.memory.c64.tick_peripherals();
         }
+        cpu.memory.frame_cycle += pending_ticks;
     }
 }
 
