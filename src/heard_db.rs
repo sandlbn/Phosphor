@@ -74,20 +74,6 @@ impl HeardDb {
         }
     }
 
-    /// Total number of unique tracks ever heard.
-    pub fn heard_count(&self) -> usize {
-        self.heard.len()
-    }
-
-    /// Completion percentage of HVSC given the total number of unique SID files
-    /// in the songlength database.  Returns None if total is 0.
-    pub fn completion_pct(&self, hvsc_total: usize) -> Option<f64> {
-        if hvsc_total == 0 {
-            return None;
-        }
-        Some(self.heard.len() as f64 / hvsc_total as f64 * 100.0)
-    }
-
     /// Format the completion as a human-readable string.
     /// e.g. "1337 / 50127 SIDs heard (2.67%)"
     pub fn format_completion(&self, hvsc_total: usize) -> String {

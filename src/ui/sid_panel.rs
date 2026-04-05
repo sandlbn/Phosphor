@@ -53,9 +53,6 @@ const ROW_H: f32 = 13.0;
 /// Width of the row-number gutter on the left.
 const GUTTER_W: f32 = 38.0;
 
-/// Logical pixels allocated to each voice column.
-const COL_W: f32 = 108.0;
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Phosphor colour palette
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,6 +279,7 @@ fn intern_str(s: String) -> &'static str {
 
 /// Decoded voice state for one SID voice in one frame.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TrackerVoice {
     pub note: &'static str, // "C-4", "A#3", "---"
     pub wave: &'static str, // "SAW", "TRI", "---" …
@@ -302,6 +300,7 @@ impl Default for TrackerVoice {
 
 /// One complete frame snapshot: 12 voices (4 SIDs × 3 voices) + frame index.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TrackerFrame {
     /// `voices[sid * 3 + voice_index]`
     pub voices: [TrackerVoice; 12],

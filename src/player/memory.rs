@@ -602,21 +602,41 @@ static OPCODE_CYCLES: [u8; 256] = [
 ];
 
 /// Read an opcode byte through the banking layer (same view as CPU).
-/// This is critical for correct cycle counting when code executes in
-/// KERNAL ROM ($E000-$FFFF) — raw RAM may contain tune data there,
-/// but the CPU sees kernal_rom stubs instead.
-pub fn opcode_cycles_banked(mem: &C64Memory, pc: u16) -> u32 {
+fn read_opcode_banked(mem: &C64Memory, pc: u16) -> u8 {
     let port = mem.ram[0x0001];
-    let byte = if pc >= 0xE000 && kernal_visible(port) {
+    if pc >= 0xE000 && kernal_visible(port) {
         mem.kernal_rom[(pc - 0xE000) as usize]
     } else if pc >= 0xD000 && pc <= 0xDFFF && io_visible(port) {
-        // Code executing in I/O area — shouldn't normally happen,
-        // but return RAM as fallback
         mem.ram[pc as usize]
     } else {
         mem.ram[pc as usize]
-    };
-    OPCODE_CYCLES[byte as usize] as u32
+    }
+}
+
+/// Compute accurate cycle count for the instruction at `old_pc`,
+/// given that the CPU has already executed it and is now at `new_pc`.
+///
+/// Corrects the static table for taken branches (+1) and
+/// branch page crossing (+1 additional).
+pub fn opcode_cycles_banked(mem: &C64Memory, old_pc: u16, new_pc: u16) -> u32 {
+    let opcode = read_opcode_banked(mem, old_pc);
+    let base = OPCODE_CYCLES[opcode as usize] as u32;
+
+    match opcode {
+        // Branches: $10 BPL, $30 BMI, $50 BVC, $70 BVS,
+        //           $90 BCC, $B0 BCS, $D0 BNE, $F0 BEQ
+        0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xB0 | 0xD0 | 0xF0 => {
+            let next_pc = old_pc.wrapping_add(2); // PC if branch not taken
+            if new_pc == next_pc {
+                2 // not taken
+            } else if (new_pc & 0xFF00) != (next_pc & 0xFF00) {
+                4 // taken + page crossing
+            } else {
+                3 // taken, same page
+            }
+        }
+        _ => base,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

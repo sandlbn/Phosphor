@@ -80,6 +80,7 @@ impl SortDirection {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum Message {
     // Transport
     PlayPause,
@@ -1427,6 +1428,7 @@ pub fn settings_panel<'a>(
         let display = match name {
             "usb" => "🔌 USB Hardware (USBSID-Pico)",
             "emulated" => "🎵 Software Emulation (reSID)",
+            "sidlite" => "🎶 SIDLite Emulation (libsidplayfp)",
             "u64" => "🌐 Ultimate 64 (Network)",
             other => other,
         };

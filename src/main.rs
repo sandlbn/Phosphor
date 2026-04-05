@@ -22,6 +22,7 @@ mod daemon_installer;
 mod sid_direct;
 
 mod sid_emulated;
+mod sid_sidlite;
 mod sid_u64;
 
 use std::path::PathBuf;
