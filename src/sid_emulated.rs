@@ -329,6 +329,17 @@ impl EmulatedDevice {
         })
     }
 
+    /// Pre-fill the audio ring buffer with silence to prevent underruns
+    /// when the audio callback starts draining before emulation produces data.
+    fn prefill_silence(&self) {
+        let prefill = (self.sample_rate as usize * 40) / 1000; // ~40ms
+        if let Ok(mut ring) = self.audio_buf.lock() {
+            for _ in 0..prefill {
+                ring.push_back((0, 0));
+            }
+        }
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn make_sid(&self) -> SendSid {
@@ -554,6 +565,7 @@ impl SidDevice for EmulatedDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
+        self.prefill_silence();
     }
 
     fn set_stereo(&mut self, mode: i32) {
@@ -653,6 +665,7 @@ impl SidDevice for EmulatedDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
+        self.prefill_silence();
     }
 
     fn close(&mut self) {

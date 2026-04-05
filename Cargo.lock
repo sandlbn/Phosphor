@@ -4663,17 +4663,15 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sidlite-sys"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9b3ed93e6333a90f91fab46d8dabcb29356b365ccdf55aa39a3617067e5373a"
+source = "git+https://github.com/sandlbn/sidlite-sys#514b60ca7050737505570d0bee104d0e070a9dae"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "sidplayfp-sys"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a54baf8f9a68337e004d13f36b49ad40bc70b46f9d2978a7d97b9c08de75408e"
+version = "0.1.2"
+source = "git+https://github.com/sandlbn/sidplayfp-sys#b755fc29fc117b76ce650ccf2a98f99769a88c13"
 dependencies = [
  "cc",
 ]

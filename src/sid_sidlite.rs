@@ -249,6 +249,15 @@ impl SidLiteDevice {
         })
     }
 
+    fn prefill_silence(&self) {
+        let prefill = (self.sample_rate as usize * 40) / 1000;
+        if let Ok(mut ring) = self.audio_buf.lock() {
+            for _ in 0..prefill {
+                ring.push_back((0, 0));
+            }
+        }
+    }
+
     fn make_sid(&self) -> Sid {
         let mut sid = Sid::new(self.chip_model);
         sid.set_sampling_parameters(self.clock_freq, self.sample_rate as u16);
@@ -423,6 +432,7 @@ impl SidDevice for SidLiteDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
+        self.prefill_silence();
     }
 
     fn set_stereo(&mut self, mode: i32) {
@@ -511,6 +521,7 @@ impl SidDevice for SidLiteDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
+        self.prefill_silence();
     }
 
     fn close(&mut self) {
