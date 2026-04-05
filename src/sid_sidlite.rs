@@ -108,6 +108,15 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                     dev_name, actual_rate,
                 );
 
+                // Pre-fill ring buffer with ~40ms silence to avoid startup crackle.
+                {
+                    let prefill = (actual_rate as usize * 40) / 1000;
+                    let mut ring = audio_buf.lock().unwrap();
+                    for _ in 0..prefill {
+                        ring.push_back((0, 0));
+                    }
+                }
+
                 let config = cpal::StreamConfig {
                     channels: 2,
                     sample_rate: cpal::SampleRate(actual_rate),
