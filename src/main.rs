@@ -1573,6 +1573,7 @@ impl App {
             self.status.track_info.is_some(),
             self.stil_entry.is_some(),
             self.window_width,
+            &self.config.output_engine,
         );
         let controls = ui::controls_bar(
             &self.status,
