@@ -182,23 +182,41 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
 
                 let buf = audio_buf;
 
+                let mut local: Vec<(i16, i16)> = Vec::new();
+
                 let stream = device
                     .build_output_stream(
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            let mut ring = buf.lock().unwrap();
-                            // data is interleaved [L, R, L, R, ...]
                             let frames = data.len() / 2;
-                            for f in 0..frames {
-                                let idx = f * 2;
-                                if let Some((l, r)) = ring.pop_front() {
-                                    data[idx] = l as f32 / 32768.0;
-                                    data[idx + 1] = r as f32 / 32768.0;
-                                } else {
-                                    // Underrun: silence
-                                    data[idx] = 0.0;
-                                    data[idx + 1] = 0.0;
+
+                            // Drain ring buffer under lock as fast as possible,
+                            // then release before doing the f32 conversion.
+                            // This minimises contention with the producer thread.
+                            local.clear();
+                            local.reserve(frames);
+                            {
+                                let mut ring = buf.lock().unwrap();
+                                for _ in 0..frames {
+                                    if let Some(s) = ring.pop_front() {
+                                        local.push(s);
+                                    } else {
+                                        break;
+                                    }
                                 }
+                            } // lock released
+
+                            // Convert to f32 without holding the lock.
+                            for (f, &(l, r)) in local.iter().enumerate() {
+                                let idx = f * 2;
+                                data[idx] = l as f32 / 32768.0;
+                                data[idx + 1] = r as f32 / 32768.0;
+                            }
+                            // Fill remainder with silence if underrun.
+                            for f in local.len()..frames {
+                                let idx = f * 2;
+                                data[idx] = 0.0;
+                                data[idx + 1] = 0.0;
                             }
                         },
                         move |err| {
