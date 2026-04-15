@@ -229,6 +229,11 @@ impl App {
             }
         }
 
+        // If no files were provided via CLI args, restore the previous session playlist
+        if playlist.is_empty() {
+            playlist.load_session();
+        }
+
         let songlength_db = config
             .last_songlength_file
             .as_ref()
@@ -1573,6 +1578,7 @@ impl App {
             self.status.track_info.is_some(),
             self.stil_entry.is_some(),
             self.window_width,
+            &self.config.output_engine,
         );
         let controls = ui::controls_bar(
             &self.status,
@@ -2194,6 +2200,7 @@ fn clear_default_lengths(playlist: &mut Playlist) {
 impl Drop for App {
     fn drop(&mut self) {
         eprintln!("[phosphor] App closing, stopping playback...");
+        self.playlist.save_session();
         self.heard_db.save();
         let _ = self.cmd_tx.send(PlayerCmd::Stop);
         std::thread::sleep(std::time::Duration::from_millis(100));

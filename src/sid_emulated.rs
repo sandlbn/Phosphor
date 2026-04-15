@@ -36,8 +36,8 @@ const NTSC_CYCLES_PER_FRAME: u32 = 17_095; // 263 lines × 65 cycles
 const SID_REGS: u8 = 0x20;
 
 /// Max ring buffer capacity in stereo pairs.
-/// ~170ms at 48kHz - enough to absorb jitter.
-const MAX_BUFFER_SAMPLES: usize = 8192;
+/// ~256ms at 48kHz - must be larger than the prefill to leave room for audio frames.
+const MAX_BUFFER_SAMPLES: usize = 12288;
 
 /// Scratch buffer for resid sample() output.
 const SCRATCH_SIZE: usize = 2048;
@@ -162,7 +162,6 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
 
                 let dev_name = device.name().unwrap_or_else(|_| "unknown".into());
 
-                // Query the device's preferred config to get the REAL sample rate.
                 let default_config = device
                     .default_output_config()
                     .map_err(|e| format!("No default output config: {e}"))?;
@@ -173,7 +172,22 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                     dev_name, actual_rate,
                 );
 
-                // Build stream at the device's native rate to avoid resampling.
+                // Pre-fill the ring buffer with ~150ms of silence so the audio
+                // callback has samples to consume while the emulation ramps up.
+                // The player calls reset() and then sleeps for 50ms + runs setup
+                // code before the first ring_cycled() call. On Windows (WASAPI),
+                // underruns are immediately audible as crackle because WASAPI
+                // has stricter real-time requirements than CoreAudio/PulseAudio.
+                // 150ms > 50ms sleep + ~50ms setup overhead, so the buffer never
+                // runs dry before the first audio frame arrives.
+                {
+                    let prefill = (actual_rate as usize * 150) / 1000; // ~150ms
+                    let mut ring = audio_buf.lock().unwrap();
+                    for _ in 0..prefill {
+                        ring.push_back((0, 0));
+                    }
+                }
+
                 let config = cpal::StreamConfig {
                     channels: 2,
                     sample_rate: cpal::SampleRate(actual_rate),
@@ -316,6 +330,19 @@ impl EmulatedDevice {
             audio_shutdown,
             frame_counter: 0,
         })
+    }
+
+    /// Pre-fill the audio ring buffer with silence to prevent underruns
+    /// when the audio callback starts draining before emulation produces data.
+    /// Must be larger than the longest possible gap between reset() and the
+    /// first ring_cycled() call (sleep 50ms + setup overhead ≈ 100ms total).
+    fn prefill_silence(&self) {
+        let prefill = (self.sample_rate as usize * 150) / 1000; // ~150ms
+        if let Ok(mut ring) = self.audio_buf.lock() {
+            for _ in 0..prefill {
+                ring.push_back((0, 0));
+            }
+        }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -543,6 +570,7 @@ impl SidDevice for EmulatedDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
+        self.prefill_silence();
     }
 
     fn set_stereo(&mut self, mode: i32) {
@@ -642,6 +670,7 @@ impl SidDevice for EmulatedDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
+        self.prefill_silence();
     }
 
     fn close(&mut self) {

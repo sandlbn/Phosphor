@@ -247,6 +247,7 @@ pub fn track_info_bar<'a>(
     has_track: bool,
     has_stil_info: bool,
     window_width: f32,
+    engine_name: &str,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let title_size = if compact { 15.0_f32 } else { 18.0 };
@@ -254,6 +255,15 @@ pub fn track_info_bar<'a>(
     let extra_size = if compact { 10.0_f32 } else { 12.0 };
     let vis_width = if compact { 200.0_f32 } else { 300.0 };
     let vis_height = if compact { 48.0_f32 } else { 60.0 };
+
+    let engine_label = match engine_name {
+        "usb" => "USB Hardware (USBSID-Pico)",
+        "emulated" => "Software Emulation (reSID)",
+        "sidlite" => "SIDLite Emulation (libsidplayfp)",
+        "u64" => "Ultimate 64 (Network)",
+        "auto" => "Auto",
+        other => other,
+    };
 
     let (title, author, extra) = match &status.track_info {
         Some(info) => (
@@ -286,6 +296,9 @@ pub fn track_info_bar<'a>(
         text(extra)
             .size(extra_size)
             .color(Color::from_rgb(0.5, 0.5, 0.6)),
+        text(format!("Engine: {engine_label}"))
+            .size(extra_size)
+            .color(Color::from_rgb(0.4, 0.55, 0.45)),
     ]
     .spacing(2)
     .width(Length::Fill);

@@ -311,14 +311,19 @@ fn player_loop(
                             }
                             PlayEngine::SidPlayFp(fp) => {
                                 // ── libsidplayfp cycle-accurate emulation ────
-                                fp.run_frame(ctx.cycles_per_frame);
+                                // play() returns actual CPU cycles elapsed, which
+                                // may be less than requested due to event scheduler
+                                // interleaving.  Use actual for send/flush so the
+                                // SID engine doesn't pad silence at frame end.
+                                let actual = fp.run_frame(ctx.cycles_per_frame);
 
                                 if let Some(ref mut br) = bridge {
+                                    br.set_cycles_per_frame(actual);
                                     send_sid_writes(
                                         br.as_mut(),
                                         &fp.sid_writes,
                                         ctx.mirror_mono,
-                                        ctx.cycles_per_frame,
+                                        actual,
                                     );
                                 }
                             }
