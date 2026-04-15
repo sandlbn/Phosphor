@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::config;
 use crate::player::sid_file;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +245,51 @@ impl Playlist {
             path.display()
         );
         Ok(())
+    }
+
+    /// Save the current playlist as a session file so it can be restored on next launch.
+    /// Saved to `<config_dir>/session_playlist.m3u`.
+    pub fn save_session(&self) {
+        if self.entries.is_empty() {
+            // Remove stale session file when playlist is empty
+            if let Some(p) = Self::session_path() {
+                let _ = std::fs::remove_file(p);
+            }
+            return;
+        }
+        if let Some(path) = Self::session_path() {
+            if let Err(e) = self.save_m3u(&path) {
+                eprintln!("[phosphor] Failed to save session playlist: {e}");
+            } else {
+                eprintln!(
+                    "[phosphor] Session playlist saved ({} tracks)",
+                    self.entries.len()
+                );
+            }
+        }
+    }
+
+    /// Restore the playlist from the session file saved on last exit.
+    /// Returns the number of tracks loaded, or 0 if no session exists.
+    pub fn load_session(&mut self) -> usize {
+        let path = match Self::session_path() {
+            Some(p) if p.exists() => p,
+            _ => return 0,
+        };
+        match self.load_playlist_file(&path) {
+            Ok(n) => {
+                eprintln!("[phosphor] Restored {n} tracks from session playlist");
+                n
+            }
+            Err(e) => {
+                eprintln!("[phosphor] Failed to restore session playlist: {e}");
+                0
+            }
+        }
+    }
+
+    fn session_path() -> Option<PathBuf> {
+        config::config_dir().map(|d| d.join("session_playlist.m3u"))
     }
 
     /// Load tracks from an M3U or PLS playlist file.
