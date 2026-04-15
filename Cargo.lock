@@ -4663,7 +4663,8 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sidlite-sys"
 version = "0.1.1"
-source = "git+https://github.com/sandlbn/sidlite-sys#514b60ca7050737505570d0bee104d0e070a9dae"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9b3ed93e6333a90f91fab46d8dabcb29356b365ccdf55aa39a3617067e5373a"
 dependencies = [
  "cc",
 ]
@@ -4671,7 +4672,8 @@ dependencies = [
 [[package]]
 name = "sidplayfp-sys"
 version = "0.1.2"
-source = "git+https://github.com/sandlbn/sidplayfp-sys#b755fc29fc117b76ce650ccf2a98f99769a88c13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cd5fb81b48e6e8fa0124cc8e297b3c98dd014e978121f58d3cfb7f30eb45964"
 dependencies = [
  "cc",
 ]
@@ -5427,6 +5429,8 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 [[package]]
 name = "usbsid-pico"
 version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3826bab20f401e0b5dd36c5240c80d05132335b12103d82380bfb26cb7d99ce2"
 dependencies = [
  "log",
  "rusb",

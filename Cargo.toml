@@ -15,17 +15,17 @@ rfd = "0.15"
 
 # 6502 emulation + USBSID hardware
 mos6502 = "0.8"
-usbsid-pico = { path = "../Usbsid", features = ["usb"] }
+usbsid-pico = { version = "0.1.7", features = ["usb"] }
 
 # Software SID emulation
 resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
 cpal = "0.15"
 
 # SIDLite emulation from libsidplayfp
-sidlite-sys = { git = "https://github.com/sandlbn/sidlite-sys" }
+sidlite-sys = "0.1.1"
 
 # Full libsidplayfp player (cycle-accurate CPU for RSID)
-sidplayfp-sys = { git = "https://github.com/sandlbn/sidplayfp-sys" }
+sidplayfp-sys = "0.1.2"
 
 # Ultimate 64 REST API
 ultimate64 = "0.5"
