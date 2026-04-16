@@ -14,7 +14,9 @@ https://github.com/sandlbn/Phosphor/releases
 ## Features
 
 - **Four playback engines** — USB hardware, software emulation (reSID or SIDLite), or Commodore Ultimate 64 over the network
-- **Playlist management** — add files and folders, drag & drop, save/load M3U playlists
+- **HTTP remote control** — built-in web server for controlling playback from any browser on the network (phone, tablet, another PC)
+- **Playlist management** — add files and folders, drag & drop, save/load M3U playlists; duplicate detection on import
+- **Session restore** — playlist automatically saved on exit and restored on next launch
 - **Sortable columns** — click any column header to sort by title, author, released, duration, type, or SID count
 - **Search & filter** — real-time search across title, author, released year, and file path
 - **Favorites** — heart any tune; filter playlist to favorites only
@@ -26,6 +28,7 @@ https://github.com/sandlbn/Phosphor/releases
 - **SID register panel** — real-time scrolling tracker view (note, waveform, ADSR per voice) plus live register readout for all active SID chips
 - **U64 audio streaming** — stream SID audio from the Ultimate 64 back to the host machine over UDP
 - **Keyboard shortcuts** — full keyboard control (see below)
+- **Mini player mode** — compact window mode for background listening
 - **Window geometry** — size and position are remembered between sessions
 - **HVSC completion tracking** — persistent log of every unique SID heard; status bar shows your progress against the full HVSC collection (e.g. *42 of 50127 HVSC SIDs heard (0.08%)*)
 
@@ -57,6 +60,16 @@ Selectable in Settings (⚙):
 - **Emulated (reSID)** — software SID via resid-rs + cpal audio output
 - **SIDLite (libsidplayfp)** — lightweight SID emulation from libsidplayfp + cpal audio output
 - **Ultimate 64** — native playback on Ultimate 64 / Elite II via REST API (firmware 3.14+ required)
+
+## HTTP Remote Control
+
+Phosphor includes a built-in web server for controlling playback from any device on the same network.
+
+1. Open Settings (⚙) → **Remote control (HTTP)** → click **Start remote server**
+2. Open the displayed URL (e.g. `http://192.168.1.42:8364`) on your phone or another computer
+3. Browse the playlist, search, play/pause/skip — all from the browser
+
+The web UI supports server-side search across large collections with paginated loading. Port is configurable (default 8364). The setting persists across restarts.
 
 ## Requirements
 
@@ -135,6 +148,7 @@ Files stored there:
 | `Songlengths.md5` | Cached HVSC Songlength database |
 | `STIL.txt` | Cached HVSC SID Tune Information List |
 | `heard.txt` | MD5 hashes of every SID ever played (one per line) |
+| `session_playlist.m3u` | Auto-saved playlist restored on next launch |
 
 ## HVSC Integration
 
@@ -154,4 +168,8 @@ Enable it in Settings (⚙) under **U64 audio streaming**. Set the UDP port (def
 
 When a tune starts playing, Phosphor sends a REST command to the U64 asking it to stream audio as UDP unicast packets to your machine's IP on the configured port. A local receiver resamples from the C64's native PAL/NTSC clock rate to your audio device's sample rate and plays through your default output device with a short jitter buffer to absorb network timing variation.
 
-> **Requires Ultimate 64 firmware 3.14 or later.** Earlier firmware versions had a bug in the audio streaming API. A wired network connection to U64 machine is required. 
+> **Requires Ultimate 64 firmware 3.14 or later.** Earlier firmware versions had a bug in the audio streaming API. A wired network connection to U64 machine is required.
+
+## Thanks
+
+Huge thanks to **Adam Kazmierski** for countless hours of testing, breaking things, and helping fix them. From catching audio glitches to spotting swapped stereo channels — this project sounds way better because of him.

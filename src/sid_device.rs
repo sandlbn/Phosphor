@@ -22,6 +22,13 @@ pub trait SidDevice: Send {
     fn close(&mut self);
     fn shutdown(&mut self);
 
+    /// Close and reopen the USB connection, clearing stale device state.
+    /// Used on macOS to reset the USBSID-Pico when loading a new file.
+    /// Default no-op — only meaningful for USB-backed engines.
+    fn reinit(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Override cycles-per-frame for flush() audio generation.
     /// Only meaningful for emulated engine; hardware devices ignore this.
     fn set_cycles_per_frame(&mut self, _cycles: u32) {}

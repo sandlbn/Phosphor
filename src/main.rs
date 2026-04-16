@@ -21,6 +21,7 @@ mod daemon_installer;
 #[cfg(all(feature = "usb", not(target_os = "macos")))]
 mod sid_direct;
 
+mod remote;
 mod sid_emulated;
 mod sid_sidlite;
 mod sid_u64;
@@ -28,7 +29,9 @@ mod sid_u64;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+use crossbeam_channel::{self, Receiver, Sender};
 use iced::widget::{column, container, mouse_area, rule, Space};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 
@@ -172,6 +175,22 @@ struct App {
     /// Pre-formatted STIL text for the currently playing tune + subtune.
     /// Kept in App so view() can borrow it without a local String lifetime issue.
     stil_display_text: String,
+    /// Set once the background session load finishes.
+    /// Guards save_session in Drop against nuking the file
+    /// before loading completes.
+    session_loaded: bool,
+    /// Monotonic frame counter — drives loading animation redraw.
+    tick: u32,
+    /// Shared state for the HTTP remote control server.
+    remote_state: Arc<Mutex<remote::SharedRemoteState>>,
+    /// Commands from the HTTP remote control server.
+    remote_cmd_rx: Receiver<remote::RemoteCmd>,
+    /// Sender kept to start new servers on the fly.
+    remote_cmd_tx: Sender<remote::RemoteCmd>,
+    /// Whether the HTTP server is currently running.
+    http_remote_running: bool,
+    /// Editable text for the HTTP port field in settings.
+    http_port_text: String,
 }
 
 impl App {
@@ -199,40 +218,14 @@ impl App {
             config.u64_password.clone(),
         );
 
-        let mut playlist = Playlist::new();
+        let playlist = Playlist::new();
 
-        let args: Vec<String> = std::env::args().collect();
-        for arg in args.iter().skip(1) {
-            if arg.starts_with("--") {
-                continue;
-            }
-            let path = PathBuf::from(arg);
-            if path.is_dir() {
-                playlist.add_directory(&path);
-            } else {
-                let ext = path
-                    .extension()
-                    .map(|e| e.to_ascii_lowercase().to_string_lossy().to_string())
-                    .unwrap_or_default();
-                match ext.as_str() {
-                    "sid" => {
-                        let _ = playlist.add_file(&path);
-                    }
-                    "m3u" | "m3u8" | "pls" => match playlist.load_playlist_file(&path) {
-                        Ok(n) => eprintln!("[phosphor] Loaded {n} tracks from {}", path.display()),
-                        Err(e) => eprintln!("[phosphor] Failed to load playlist: {e}"),
-                    },
-                    _ => {
-                        let _ = playlist.add_file(&path);
-                    }
-                }
-            }
-        }
-
-        // If no files were provided via CLI args, restore the previous session playlist
-        if playlist.is_empty() {
-            playlist.load_session();
-        }
+        // Collect CLI file/dir args for background loading.
+        let cli_paths: Vec<PathBuf> = std::env::args()
+            .skip(1)
+            .filter(|a| !a.starts_with("--"))
+            .map(PathBuf::from)
+            .collect();
 
         let songlength_db = config
             .last_songlength_file
@@ -256,10 +249,6 @@ impl App {
             })
             .or_else(|| SonglengthDb::auto_load());
 
-        if let Some(ref db) = songlength_db {
-            db.apply_to_playlist(&mut playlist);
-        }
-
         // Load STIL database from remembered path, then from default config path.
         let stil_db = config
             .last_stil_file
@@ -276,10 +265,6 @@ impl App {
                     stil::StilDb::load(&p).ok()
                 })
             });
-        if config.default_song_length_secs > 0 {
-            apply_default_length(&mut playlist, config.default_song_length_secs);
-        }
-
         let filtered_indices: Vec<usize> = (0..playlist.len()).collect();
         let default_length_text = if config.default_song_length_secs > 0 {
             config.default_song_length_secs.to_string()
@@ -292,6 +277,20 @@ impl App {
         let heard_db = HeardDb::load();
         let window_width = config.window_width_saved;
         let window_height = config.window_height_saved;
+
+        // Remote control HTTP server.
+        let remote_state = Arc::new(Mutex::new(remote::SharedRemoteState::default()));
+        let (remote_cmd_tx, remote_cmd_rx) = crossbeam_channel::bounded(32);
+        let http_port_text = config.http_remote_port.to_string();
+        let mut http_remote_running = false;
+        if config.http_remote_enabled {
+            remote::start_server(
+                config.http_remote_port,
+                Arc::clone(&remote_state),
+                remote_cmd_tx.clone(),
+            );
+            http_remote_running = true;
+        }
 
         // Snapshot fields needed for auto-download before config moves into app.
         let auto_songlength_url = config.songlength_url.clone();
@@ -358,6 +357,13 @@ impl App {
             show_stil_overlay: false,
             stil_status: String::new(),
             stil_display_text: String::new(),
+            session_loaded: false,
+            tick: 0,
+            remote_state,
+            remote_cmd_rx,
+            remote_cmd_tx,
+            http_remote_running,
+            http_port_text,
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -395,7 +401,39 @@ impl App {
             .unwrap_or(true)
             && stil::stil_db_path().map(|p| !p.exists()).unwrap_or(true);
 
-        let mut tasks = vec![version_task, hvsc_task];
+        // Load session playlist / CLI args in the background so the UI
+        // appears immediately even with tens of thousands of entries.
+        // Set progress text NOW so the first rendered frame shows the indicator.
+        let has_startup_work = if !cli_paths.is_empty() {
+            if let Ok(mut pg) = app.loading_progress.lock() {
+                *pg = "⏳ Loading files…".to_string();
+            }
+            true
+        } else {
+            // Check if a session file exists to restore.
+            let session_exists = config::config_dir()
+                .map(|d| d.join("session_playlist.m3u"))
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if session_exists {
+                if let Ok(mut pg) = app.loading_progress.lock() {
+                    *pg = "⏳ Restoring session…".to_string();
+                }
+            }
+            session_exists
+        };
+        let startup_progress = app.loading_progress.clone();
+        let session_task = if has_startup_work {
+            Task::perform(
+                async move { playlist::parse_startup(cli_paths, startup_progress) },
+                Message::SessionLoaded,
+            )
+        } else {
+            // Nothing to load — mark session as loaded immediately.
+            Task::perform(async { Vec::new() }, Message::SessionLoaded)
+        };
+
+        let mut tasks = vec![version_task, hvsc_task, session_task];
         let mut auto_status_parts: Vec<&str> = vec![];
 
         if songlength_missing {
@@ -786,6 +824,23 @@ impl App {
                 }
             }
 
+            Message::SessionLoaded(entries) => {
+                self.session_loaded = true;
+                if entries.is_empty() {
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        pg.clear();
+                    }
+                } else {
+                    let n = entries.len();
+                    eprintln!("[phosphor] Session loaded: {n} tracks (background)");
+                    self.pending_entries = Some(entries);
+                    if let Ok(mut pg) = self.loading_progress.lock() {
+                        *pg = format!("⏳ Adding {} tracks…", n);
+                    }
+                    return Task::perform(flush_frame(), |_| Message::ProcessPendingEntries);
+                }
+            }
+
             Message::FileDropped(path) => {
                 self.context_menu = None;
                 let ext = path
@@ -908,6 +963,7 @@ impl App {
                 }
             }
             Message::FinalizePendingEntries => {
+                self.session_loaded = true;
                 self.apply_songlengths();
                 self.rebuild_filter();
                 if let Ok(mut pg) = self.loading_progress.lock() {
@@ -1083,11 +1139,20 @@ impl App {
                 if engine != self.config.output_engine {
                     self.config.output_engine = engine.clone();
                     self.config.save();
+                    // Remember if something was playing so we can resume.
+                    let was_playing = self.status.state == PlayState::Playing;
+                    let cur_idx = self.playlist.current;
                     let _ = self.cmd_tx.try_send(PlayerCmd::SetEngine(
                         engine,
                         self.config.u64_address.clone(),
                         self.config.u64_password.clone(),
                     ));
+                    // Auto-resume on the new engine.
+                    if was_playing {
+                        if let Some(idx) = cur_idx {
+                            self.play_track(idx);
+                        }
+                    }
                 }
             }
 
@@ -1214,6 +1279,7 @@ impl App {
 
             // ── Tick ──────────────────────────────────────────────────────
             Message::Tick => {
+                self.tick = self.tick.wrapping_add(1);
                 self.poll_status();
 
                 // Feed tracker history every tick while playing.
@@ -1270,6 +1336,12 @@ impl App {
                             }
                         }
                     }
+                }
+
+                // ── Remote control ──────────────────────────────────────
+                if self.http_remote_running {
+                    self.update_remote_state();
+                    self.poll_remote_commands();
                 }
             }
 
@@ -1530,6 +1602,45 @@ impl App {
                 }
             }
 
+            Message::ToggleHttpRemote => {
+                if self.http_remote_running {
+                    // Can't stop tiny_http gracefully, but we can flag it.
+                    // The server thread will keep running but commands will
+                    // be ignored because we won't poll them.
+                    self.http_remote_running = false;
+                    self.config.http_remote_enabled = false;
+                    self.config.save();
+                    eprintln!("[phosphor] Remote control disabled (restart app to free the port)");
+                } else {
+                    remote::start_server(
+                        self.config.http_remote_port,
+                        Arc::clone(&self.remote_state),
+                        self.remote_cmd_tx.clone(),
+                    );
+                    self.http_remote_running = true;
+                    self.config.http_remote_enabled = true;
+                    self.config.save();
+                }
+            }
+
+            Message::HttpRemotePortChanged(val) => {
+                self.http_port_text = val.clone();
+                if let Ok(port) = val.trim().parse::<u16>() {
+                    if port > 0 {
+                        self.config.http_remote_port = port;
+                        self.config.save();
+                        // Restart server on the new port if running.
+                        if self.http_remote_running {
+                            remote::start_server(
+                                port,
+                                Arc::clone(&self.remote_state),
+                                self.remote_cmd_tx.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+
             Message::None => {}
         }
 
@@ -1598,6 +1709,8 @@ impl App {
                 &self.default_length_text,
                 &self.download_status,
                 &self.stil_status,
+                self.http_remote_running,
+                &self.http_port_text,
             );
             column![
                 info_bar,
@@ -1690,6 +1803,8 @@ impl App {
                 self.sort_direction,
                 self.playlist_scroll_offset_y,
                 self.playlist_viewport_height,
+                &loading_status,
+                self.tick,
             );
             column![
                 info_bar,
@@ -1910,6 +2025,7 @@ impl App {
                 force_stereo,
                 sid4_addr,
                 audio_port,
+                restart_usb_on_load: self.config.restart_usb_on_load,
             });
             // entry borrow ends here; now safe to call &mut self method.
             self.refresh_stil_entry();
@@ -2009,7 +2125,20 @@ impl App {
         } else {
             self.vis_expanded_info = None;
         }
-        self.visualizer.update(&self.status.voice_levels);
+        // On USB hardware, the USBSID-Pico's stereo output has SID1 on
+        // the right channel and SID2 on the left.  Swap the voice level
+        // groups so the visualizer matches what you actually hear.
+        let levels = if self.config.output_engine == "usb" && self.status.voice_levels.len() == 6 {
+            let mut swapped = self.status.voice_levels.clone();
+            // Swap SID1 voices (0-2) with SID2 voices (3-5)
+            swapped.swap(0, 3);
+            swapped.swap(1, 4);
+            swapped.swap(2, 5);
+            swapped
+        } else {
+            self.status.voice_levels.clone()
+        };
+        self.visualizer.update(&levels);
 
         if self.status.state == PlayState::Playing {
             if let Some(cur_idx) = self.playlist.current {
@@ -2102,6 +2231,91 @@ impl App {
             if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
                 e.selected_song = song;
                 e.duration_secs = new_dur;
+            }
+        }
+    }
+
+    /// Push current status + playlist snapshot to the remote HTTP server.
+    fn update_remote_state(&self) {
+        if let Ok(mut rs) = self.remote_state.try_lock() {
+            let info = self.status.track_info.as_ref();
+            rs.status = remote::RemoteStatus {
+                state: match self.status.state {
+                    PlayState::Playing => "playing",
+                    PlayState::Paused => "paused",
+                    PlayState::Stopped => "stopped",
+                }
+                .to_string(),
+                title: info.map(|i| i.name.clone()).unwrap_or_default(),
+                author: info.map(|i| i.author.clone()).unwrap_or_default(),
+                released: info.map(|i| i.released.clone()).unwrap_or_default(),
+                current_song: info.map(|i| i.current_song).unwrap_or(0),
+                songs: info.map(|i| i.songs).unwrap_or(0),
+                elapsed_secs: self.status.elapsed.as_secs_f32(),
+                duration_secs: self
+                    .playlist
+                    .current_entry()
+                    .and_then(|e| e.duration_secs)
+                    .map(|d| d as f32),
+                current_index: self.playlist.current,
+                num_sids: info.map(|i| i.num_sids).unwrap_or(1),
+                sid_type: info.map(|i| i.sid_type.clone()).unwrap_or_default(),
+                is_pal: info.map(|i| i.is_pal).unwrap_or(true),
+                engine: self.config.output_engine.clone(),
+            };
+
+            // Only rebuild playlist snapshot when entries change.
+            let version = self.playlist.len() as u64;
+            if rs.playlist_version != version {
+                rs.playlist = self
+                    .playlist
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| remote::RemotePlaylistEntry {
+                        index: i,
+                        title: e.title.clone(),
+                        author: e.author.clone(),
+                        duration: e.duration_secs,
+                        num_sids: e.num_sids,
+                        is_rsid: e.is_rsid,
+                    })
+                    .collect();
+                rs.playlist_version = version;
+            }
+        }
+    }
+
+    /// Process commands from the HTTP remote control server.
+    fn poll_remote_commands(&mut self) {
+        while let Ok(cmd) = self.remote_cmd_rx.try_recv() {
+            match cmd {
+                remote::RemoteCmd::PlayTrack(idx) => {
+                    self.play_track(idx);
+                }
+                remote::RemoteCmd::Stop => {
+                    let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                }
+                remote::RemoteCmd::TogglePause => {
+                    let _ = self.cmd_tx.send(PlayerCmd::TogglePause);
+                }
+                remote::RemoteCmd::NextTrack => {
+                    if let Some(cur) = self.playlist.current {
+                        if cur + 1 < self.playlist.len() {
+                            self.play_track(cur + 1);
+                        }
+                    }
+                }
+                remote::RemoteCmd::PrevTrack => {
+                    if let Some(cur) = self.playlist.current {
+                        if cur > 0 {
+                            self.play_track(cur - 1);
+                        }
+                    }
+                }
+                remote::RemoteCmd::SetSubtune(n) => {
+                    let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(n));
+                }
             }
         }
     }
@@ -2200,7 +2414,12 @@ fn clear_default_lengths(playlist: &mut Playlist) {
 impl Drop for App {
     fn drop(&mut self) {
         eprintln!("[phosphor] App closing, stopping playback...");
-        self.playlist.save_session();
+        // Only save session if the background load completed.
+        // Otherwise the playlist is empty and we'd delete the
+        // existing session file.
+        if self.session_loaded {
+            self.playlist.save_session();
+        }
         self.heard_db.save();
         let _ = self.cmd_tx.send(PlayerCmd::Stop);
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -1,8 +1,10 @@
 // macOS only: connects to the usbsid-bridge LaunchDaemon
 // via a Unix domain socket. Fixed-size protocol.
 //
-// CMD_RING writes are buffered by the daemon and flushed as
-// bulk USB packets on CMD_FLUSH — one transfer per 31 reg/val pairs.
+// CMD_RING writes are collected locally in the daemon and pushed to the
+// driver's ring buffer in a single batch on CMD_FLUSH — one mutex lock
+// instead of hundreds.  The daemon blocks until the writer thread has
+// drained all writes to USB, then sends RESP_OK back (backpressure).
 
 use crate::sid_device::SidDevice;
 use std::io::{Read, Write};
@@ -132,6 +134,18 @@ impl SidDevice for BridgeDevice {
     fn flush(&mut self) {
         let _ = self.stream.write_all(&[CMD_FLUSH]);
         let _ = self.stream.flush();
+        // Non-blocking: daemon batches writes and signals the writer
+        // thread to drain asynchronously.  No response expected — the
+        // player's frame pacing (wait_until) provides natural flow control.
+    }
+
+    fn reinit(&mut self) -> Result<(), String> {
+        // Close the USB device on the daemon side, then reopen it.
+        // This clears any stale firmware/driver state between tunes.
+        self.send_cmd(&[CMD_CLOSE]);
+        let _ = self.read_response();
+        self.send_cmd(&[CMD_INIT]);
+        self.read_response()
     }
 
     fn mute(&mut self) {
