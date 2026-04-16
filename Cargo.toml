@@ -1,6 +1,6 @@
 [package]
 name = "phosphor"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Phosphor — a SID player for USBSID-Pico / Ultimate 64"
 
@@ -15,7 +15,7 @@ rfd = "0.15"
 
 # 6502 emulation + USBSID hardware
 mos6502 = "0.8"
-usbsid-pico = { version = "0.1.7", features = ["usb"] }
+usbsid-pico = { version = "0.1.8", features = ["usb"] }
 
 # Software SID emulation
 resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }

@@ -41,11 +41,6 @@ impl PlaylistEntry {
         let h = &sid.header;
 
         let md5 = sid_file::compute_hvsc_md5(&sid);
-        eprintln!(
-            "[phosphor] {} → MD5: {}",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            md5,
-        );
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -65,6 +60,41 @@ impl PlaylistEntry {
             is_rsid: h.is_rsid,
             md5: Some(md5),
             duration_secs: None,
+        })
+    }
+
+    /// Create an entry from cached M3U metadata without reading the SID file.
+    /// Falls back to from_path() if essential fields are missing.
+    pub fn from_m3u_cache(
+        path: &Path,
+        title: Option<&str>,
+        author: Option<&str>,
+        released: Option<&str>,
+        songs: Option<u16>,
+        selected_song: Option<u16>,
+        is_pal: Option<bool>,
+        num_sids: Option<usize>,
+        is_rsid: Option<bool>,
+        md5: Option<&str>,
+        duration_secs: Option<u32>,
+    ) -> Result<Self, String> {
+        // Need at least title to consider the cache valid.
+        let title = match title {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => return Self::from_path(path),
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            title,
+            author: author.unwrap_or("").to_string(),
+            released: released.unwrap_or("").to_string(),
+            songs: songs.unwrap_or(1),
+            selected_song: selected_song.unwrap_or(1),
+            is_pal: is_pal.unwrap_or(true),
+            num_sids: num_sids.unwrap_or(1),
+            is_rsid: is_rsid.unwrap_or(false),
+            md5: md5.map(|s| s.to_string()),
+            duration_secs,
         })
     }
 
@@ -136,6 +166,11 @@ impl Playlist {
 
     /// Add a single .sid file.
     pub fn add_file(&mut self, path: &Path) -> Result<(), String> {
+        // Skip if already in the playlist.
+        let dominated = self.entries.iter().any(|e| e.path == path);
+        if dominated {
+            return Ok(());
+        }
         let entry = PlaylistEntry::from_path(path)?;
         self.entries.push(entry);
         self.rebuild_shuffle();
@@ -163,7 +198,11 @@ impl Playlist {
 
     /// Bulk-add pre-parsed entries (used by background loading tasks).
     pub fn add_entries(&mut self, entries: Vec<PlaylistEntry>) {
-        self.entries.extend(entries);
+        // Deduplicate by file path — skip entries already in the playlist.
+        let existing: std::collections::HashSet<PathBuf> =
+            self.entries.iter().map(|e| e.path.clone()).collect();
+        self.entries
+            .extend(entries.into_iter().filter(|e| !existing.contains(&e.path)));
         self.rebuild_shuffle();
     }
 
@@ -231,10 +270,24 @@ impl Playlist {
             };
             writeln!(f, "#EXTINF:{},{}", duration, display)
                 .map_err(|e| format!("Write error: {e}"))?;
-            // Persist selected sub-tune so it survives reload
-            if entry.selected_song != 1 || entry.songs > 1 {
-                writeln!(f, "#PHOSPHOR:song={}", entry.selected_song)
-                    .map_err(|e| format!("Write error: {e}"))?;
+            // Persist full metadata so session restore skips SID file I/O.
+            {
+                let md5_str = entry.md5.as_deref().unwrap_or("");
+                writeln!(
+                    f,
+                    "#PHOSPHOR:song={},songs={},pal={},sids={},rsid={},md5={}",
+                    entry.selected_song,
+                    entry.songs,
+                    if entry.is_pal { 1 } else { 0 },
+                    entry.num_sids,
+                    if entry.is_rsid { 1 } else { 0 },
+                    md5_str,
+                )
+                .map_err(|e| format!("Write error: {e}"))?;
+                if !entry.released.is_empty() {
+                    writeln!(f, "#PHOSPHOR:released={}", entry.released)
+                        .map_err(|e| format!("Write error: {e}"))?;
+                }
             }
             writeln!(f, "{}", entry.path.display()).map_err(|e| format!("Write error: {e}"))?;
         }
@@ -271,6 +324,7 @@ impl Playlist {
 
     /// Restore the playlist from the session file saved on last exit.
     /// Returns the number of tracks loaded, or 0 if no session exists.
+    #[allow(dead_code)]
     pub fn load_session(&mut self) -> usize {
         let path = match Self::session_path() {
             Some(p) if p.exists() => p,
@@ -598,11 +652,6 @@ impl SonglengthDb {
                 if let Some(dur) = self.lookup(md5, subtune) {
                     entry.duration_secs = Some(dur);
                     applied += 1;
-                } else {
-                    eprintln!(
-                        "[phosphor] Songlength MISS: \"{}\" md5={} subtune={}",
-                        entry.title, md5, subtune,
-                    );
                 }
             }
         }
@@ -639,12 +688,29 @@ struct M3uMeta {
     path: PathBuf,
     duration_secs: Option<u32>,
     selected_song: Option<u16>,
+    // Extended metadata from #PHOSPHOR: lines (session restore fast-path).
+    title: Option<String>,
+    author: Option<String>,
+    released: Option<String>,
+    songs: Option<u16>,
+    is_pal: Option<bool>,
+    num_sids: Option<usize>,
+    is_rsid: Option<bool>,
+    md5: Option<String>,
 }
 
 fn parse_m3u(content: &str, base_dir: &Path) -> Vec<M3uMeta> {
     let mut results = Vec::new();
     let mut pending_duration: Option<u32> = None;
     let mut pending_song: Option<u16> = None;
+    let mut pending_title: Option<String> = None;
+    let mut pending_author: Option<String> = None;
+    let mut pending_released: Option<String> = None;
+    let mut pending_songs: Option<u16> = None;
+    let mut pending_pal: Option<bool> = None;
+    let mut pending_sids: Option<usize> = None;
+    let mut pending_rsid: Option<bool> = None;
+    let mut pending_md5: Option<String> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -652,26 +718,46 @@ fn parse_m3u(content: &str, base_dir: &Path) -> Vec<M3uMeta> {
             continue;
         }
 
-        // Parse #EXTINF:duration,title
+        // Parse #EXTINF:duration,Artist - Title  (or just Title)
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            if let Some((dur_str, _title)) = rest.split_once(',') {
+            if let Some((dur_str, display)) = rest.split_once(',') {
                 if let Ok(dur) = dur_str.trim().parse::<i64>() {
                     if dur > 0 {
                         pending_duration = Some(dur as u32);
                     }
                 }
+                // Split "Author - Title" display string
+                let display = display.trim();
+                if let Some((author, title)) = display.split_once(" - ") {
+                    pending_author = Some(author.to_string());
+                    pending_title = Some(title.to_string());
+                } else {
+                    pending_title = Some(display.to_string());
+                }
             }
             continue;
         }
 
-        // Parse #PHOSPHOR:song=N
+        // Parse #PHOSPHOR:key=val,key=val,...
         if let Some(rest) = line.strip_prefix("#PHOSPHOR:") {
             for part in rest.split(',') {
                 let part = part.trim();
                 if let Some(val) = part.strip_prefix("song=") {
-                    if let Ok(s) = val.parse::<u16>() {
-                        pending_song = Some(s);
+                    pending_song = val.parse().ok();
+                } else if let Some(val) = part.strip_prefix("songs=") {
+                    pending_songs = val.parse().ok();
+                } else if let Some(val) = part.strip_prefix("pal=") {
+                    pending_pal = Some(val == "1");
+                } else if let Some(val) = part.strip_prefix("sids=") {
+                    pending_sids = val.parse().ok();
+                } else if let Some(val) = part.strip_prefix("rsid=") {
+                    pending_rsid = Some(val == "1");
+                } else if let Some(val) = part.strip_prefix("md5=") {
+                    if !val.is_empty() {
+                        pending_md5 = Some(val.to_string());
                     }
+                } else if let Some(val) = part.strip_prefix("released=") {
+                    pending_released = Some(val.to_string());
                 }
             }
             continue;
@@ -690,6 +776,14 @@ fn parse_m3u(content: &str, base_dir: &Path) -> Vec<M3uMeta> {
             path: resolved,
             duration_secs: pending_duration.take(),
             selected_song: pending_song.take(),
+            title: pending_title.take(),
+            author: pending_author.take(),
+            released: pending_released.take(),
+            songs: pending_songs.take(),
+            is_pal: pending_pal.take(),
+            num_sids: pending_sids.take(),
+            is_rsid: pending_rsid.take(),
+            md5: pending_md5.take(),
         });
     }
 
@@ -830,35 +924,113 @@ pub fn parse_playlist_file(
                 entries.extend(parse_directory(item.path, progress.clone()));
             } else {
                 count += 1;
-                if let Ok(mut pg) = progress.lock() {
-                    *pg = format!("⏳ Loading playlist: {} / {}", count, total);
+                // Fast path: if the M3U has cached metadata (from a
+                // Phosphor session save), create the entry directly
+                // without reading the SID file from disk.
+                let has_cache = item.title.is_some();
+                if count % 50 == 0 || count == 1 {
+                    if let Ok(mut pg) = progress.lock() {
+                        let mode = if has_cache { "cached" } else { "reading SID" };
+                        *pg = format!("⏳ Loading: {} / {} ({})", count, total, mode);
+                    }
                 }
-                if let Ok(mut e) = PlaylistEntry::from_path(&item.path) {
-                    // Restore saved metadata from the M3U
-                    if let Some(dur) = item.duration_secs {
-                        e.duration_secs = Some(dur);
-                    }
-                    if let Some(song) = item.selected_song {
-                        if song >= 1 && song <= e.songs {
-                            e.selected_song = song;
-                        }
-                    }
-                    entries.push(e);
+                let result = if has_cache {
+                    PlaylistEntry::from_m3u_cache(
+                        &item.path,
+                        item.title.as_deref(),
+                        item.author.as_deref(),
+                        item.released.as_deref(),
+                        item.songs,
+                        item.selected_song,
+                        item.is_pal,
+                        item.num_sids,
+                        item.is_rsid,
+                        item.md5.as_deref(),
+                        item.duration_secs,
+                    )
                 } else {
+                    // No cache — read SID file the slow way.
+                    PlaylistEntry::from_path(&item.path).map(|mut e| {
+                        if let Some(dur) = item.duration_secs {
+                            e.duration_secs = Some(dur);
+                        }
+                        if let Some(song) = item.selected_song {
+                            if song >= 1 && song <= e.songs {
+                                e.selected_song = song;
+                            }
+                        }
+                        e
+                    })
+                };
+                match result {
+                    Ok(e) => entries.push(e),
+                    Err(_) => {
+                        eprintln!(
+                            "[phosphor] Playlist: skipping {} (not a valid SID)",
+                            item.path.display()
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[phosphor] Loaded {} entries from {}",
+            entries.len(),
+            path.display(),
+        );
+    }
+    // Don't clear — main thread handler clears after post-processing.
+    Ok(entries)
+}
+
+/// Load the session playlist (and/or CLI args) in a background thread.
+/// Returns the parsed entries ready for insertion into the playlist.
+pub fn parse_startup(cli_args: Vec<PathBuf>, progress: LoadingProgress) -> Vec<PlaylistEntry> {
+    let mut entries = Vec::new();
+
+    // Process CLI arguments first.
+    for path in &cli_args {
+        if path.is_dir() {
+            entries.extend(parse_directory(path.clone(), progress.clone()));
+        } else {
+            let ext = path
+                .extension()
+                .map(|e| e.to_ascii_lowercase().to_string_lossy().to_string())
+                .unwrap_or_default();
+            match ext.as_str() {
+                "m3u" | "m3u8" | "pls" => {
+                    if let Ok(parsed) = parse_playlist_file(path.clone(), progress.clone()) {
+                        entries.extend(parsed);
+                    }
+                }
+                _ => {
+                    if let Ok(e) = PlaylistEntry::from_path(path) {
+                        entries.push(e);
+                    }
+                }
+            }
+        }
+    }
+
+    // If no CLI files were provided, restore previous session playlist.
+    if entries.is_empty() {
+        if let Some(session_path) =
+            crate::config::config_dir().map(|d| d.join("session_playlist.m3u"))
+        {
+            if session_path.exists() {
+                if let Ok(mut pg) = progress.lock() {
+                    *pg = "⏳ Restoring session…".to_string();
+                }
+                if let Ok(parsed) = parse_playlist_file(session_path, progress.clone()) {
+                    entries = parsed;
                     eprintln!(
-                        "[phosphor] Playlist: skipping {} (not a valid SID)",
-                        item.path.display()
+                        "[phosphor] Restored {} tracks from session playlist",
+                        entries.len()
                     );
                 }
             }
         }
     }
 
-    eprintln!(
-        "[phosphor] Loaded {} entries from {}",
-        entries.len(),
-        path.display()
-    );
-    // Don't clear — main thread handler clears after post-processing.
-    Ok(entries)
+    entries
 }

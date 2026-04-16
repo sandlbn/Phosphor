@@ -5,10 +5,12 @@ pub mod visualizer;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use iced::widget::canvas::{self, Frame, Geometry};
 use iced::widget::{
-    button, column, container, mouse_area, row, rule, scrollable, text, text_input, Column, Space,
+    button, column, container, mouse_area, row, rule, scrollable, text, text_input, Canvas, Column,
+    Space,
 };
-use iced::{Alignment, Color, Element, Length, Padding, Theme};
+use iced::{mouse, Alignment, Color, Element, Length, Padding, Point, Rectangle, Size, Theme};
 
 use crate::config::{Config, FavoritesDb};
 use crate::player::{PlayState, PlayerStatus};
@@ -156,6 +158,7 @@ pub enum Message {
     FilesLoaded(Vec<crate::playlist::PlaylistEntry>),
     FolderLoaded(Vec<crate::playlist::PlaylistEntry>),
     PlaylistLoaded(Result<Vec<crate::playlist::PlaylistEntry>, String>),
+    SessionLoaded(Vec<crate::playlist::PlaylistEntry>),
 
     // Chained post-processing
     ProcessPendingEntries,
@@ -836,6 +839,8 @@ pub fn playlist_view<'a>(
     sort_dir: SortDirection,
     scroll_offset_y: f32,
     viewport_height: f32,
+    loading_text: &str,
+    tick: u32,
 ) -> Element<'a, Message> {
     let header_btn = move |label: &'static str, col: SortColumn| -> Element<'a, Message> {
         let is_active = sort_col == col;
@@ -898,16 +903,34 @@ pub fn playlist_view<'a>(
     let mut rows = Column::new().spacing(0);
 
     if filtered_indices.is_empty() {
-        let msg = if playlist.is_empty() {
-            "Drag .sid files here or click \"+ Files\" / \"+ Folder\""
+        if !loading_text.is_empty() {
+            // ── Demoscene-style loading scroller (Canvas) ────────────────
+            // Uses the same chunky C64 pixel font and sine-wave colour
+            // cycling as the expanded visualiser.
+            let loading_owned = loading_text.to_string();
+            let scroller = Canvas::new(LoadingScroller {
+                text: loading_owned,
+                tick,
+            })
+            .width(Length::Fill)
+            .height(Length::Fixed(120.0));
+            rows = rows.push(
+                container(scroller)
+                    .width(Length::Fill)
+                    .padding(Padding::from([40, 0])),
+            );
         } else {
-            "No matching tracks"
-        };
-        rows = rows.push(
-            container(text(msg).size(14).color(Color::from_rgb(0.4, 0.4, 0.5)))
-                .padding(40)
-                .center_x(Length::Fill),
-        );
+            let msg = if playlist.is_empty() {
+                "Drag .sid files here or click \"+ Files\" / \"+ Folder\""
+            } else {
+                "No matching tracks"
+            };
+            rows = rows.push(
+                container(text(msg).size(14).color(Color::from_rgb(0.4, 0.4, 0.5)))
+                    .padding(40)
+                    .center_x(Length::Fill),
+            );
+        }
     } else {
         let total_rows = filtered_indices.len();
 
@@ -1462,7 +1485,7 @@ pub fn settings_panel<'a>(
 
     engine_col = engine_col
         .push(
-            text("Changes take effect when next song starts playing.")
+            text("Playback will restart automatically on the new engine.")
                 .size(11)
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         )
@@ -2221,4 +2244,211 @@ pub fn mini_player_view<'a>(
             ..Default::default()
         })
         .into()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Demoscene-style loading scroller (Canvas program)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Demoscene-style loading screen with rainbow pixel text and a spinning cube.
+/// The `tick` field changes every frame (33ms) which forces iced to redraw.
+struct LoadingScroller {
+    text: String,
+    tick: u32,
+}
+
+impl<Message> canvas::Program<Message> for LoadingScroller {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let w = bounds.width;
+        let h = bounds.height;
+        let t = self.tick as f32;
+
+        // ── Spinning wireframe cube (left side) ─────────────────────────
+        let cube_cx = 50.0;
+        let cube_cy = h * 0.5;
+        let cube_r = 18.0;
+        let angle = t * 0.06;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let angle_b = t * 0.04;
+        let cos_b = angle_b.cos();
+        let sin_b = angle_b.sin();
+
+        // 8 cube vertices, 3D → 2D projection with two-axis rotation
+        let verts: Vec<(f32, f32)> = [
+            (-1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        ]
+        .iter()
+        .map(|&(x, y, z)| {
+            // Rotate Y axis
+            let x2 = x * cos_a - z * sin_a;
+            let z2 = x * sin_a + z * cos_a;
+            // Rotate X axis
+            let y2 = y * cos_b - z2 * sin_b;
+            let z3 = y * sin_b + z2 * cos_b;
+            // Simple perspective
+            let scale = 1.0 / (3.0 - z3);
+            (
+                cube_cx + x2 * cube_r * scale * 2.0,
+                cube_cy + y2 * cube_r * scale * 2.0,
+            )
+        })
+        .collect();
+
+        let edges = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0), // front
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4), // back
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7), // connecting
+        ];
+        let cube_hue = (t * 0.008 % 1.0).abs();
+        let cube_color = visualizer::hue_to_rgb(cube_hue, 0.85, 0.90);
+        let stroke = iced::widget::canvas::Stroke::default()
+            .with_color(cube_color)
+            .with_width(1.5);
+        for &(a, b) in &edges {
+            let path = iced::widget::canvas::Path::line(
+                Point::new(verts[a].0, verts[a].1),
+                Point::new(verts[b].0, verts[b].1),
+            );
+            frame.stroke(&path, stroke.clone());
+        }
+
+        // ── Row 1: status text with sine-wave bounce (scale 4, rainbow) ─
+        let clean = self
+            .text
+            .trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        let row1_str = clean.to_uppercase();
+        let row1_chars: Vec<char> = row1_str.chars().collect();
+        let scale1: f32 = 4.0;
+        let char_w1 = 3.0 * scale1 + scale1;
+        let row1_total_w = row1_chars.len() as f32 * char_w1;
+        let row1_x = (w - row1_total_w) * 0.5;
+        let row1_y = 10.0;
+        let wave_amp = 5.0;
+
+        for (ci, ch) in row1_chars.iter().enumerate() {
+            let cx = row1_x + ci as f32 * char_w1;
+            let phase = t * 0.08 + ci as f32 * 0.4;
+            let bob = phase.sin() * wave_amp;
+            let hue_t = ((ci as f32 * 0.06 + t * 0.005) % 1.0).abs();
+            let color = visualizer::hue_to_rgb(hue_t, 0.90, 0.95);
+
+            if let Some(rows) = visualizer::glyph(*ch) {
+                for (ri, row) in rows.iter().enumerate() {
+                    for (pi, &on) in row.iter().enumerate() {
+                        if on {
+                            let px = cx + pi as f32 * scale1;
+                            let py = row1_y + bob + ri as f32 * scale1;
+                            if px >= 0.0 && px + scale1 <= w {
+                                frame.fill_rectangle(
+                                    Point::new(px, py),
+                                    Size::new(scale1, scale1),
+                                    color,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Row 2: subtitle (scale 2, rainbow) ─────────────────────────
+        let row2_str = "PLEASE WAIT . . .  LOADING SID FILES";
+        let row2_chars: Vec<char> = row2_str.chars().collect();
+        let scale2: f32 = 2.0;
+        let char_w2 = 3.0 * scale2 + scale2;
+        let row2_total_w = row2_chars.len() as f32 * char_w2;
+        let row2_x = (w - row2_total_w) * 0.5;
+        let row2_y = row1_y + 5.0 * scale1 + wave_amp + 16.0;
+
+        for (ci, ch) in row2_chars.iter().enumerate() {
+            let cx = row2_x + ci as f32 * char_w2;
+            let hue_t = ((ci as f32 * 0.04 + t * 0.007) % 1.0).abs();
+            let color = visualizer::hue_to_rgb(hue_t, 0.80, 0.82);
+
+            if let Some(rows) = visualizer::glyph(*ch) {
+                for (ri, row) in rows.iter().enumerate() {
+                    for (pi, &on) in row.iter().enumerate() {
+                        if on {
+                            let px = cx + pi as f32 * scale2;
+                            let py = row2_y + ri as f32 * scale2;
+                            if px >= 0.0 && px + scale2 <= w {
+                                frame.fill_rectangle(
+                                    Point::new(px, py),
+                                    Size::new(scale2, scale2),
+                                    color,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Spinning wireframe cube (right side, mirrored) ──────────────
+        let cube_cx2 = w - 50.0;
+        let cube_hue2 = ((t * 0.008 + 0.5) % 1.0).abs();
+        let cube_color2 = visualizer::hue_to_rgb(cube_hue2, 0.85, 0.90);
+        let stroke2 = iced::widget::canvas::Stroke::default()
+            .with_color(cube_color2)
+            .with_width(1.5);
+        let verts2: Vec<(f32, f32)> = [
+            (-1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        ]
+        .iter()
+        .map(|&(x, y, z)| {
+            let x2 = x * cos_a + z * sin_a; // opposite rotation
+            let z2 = -x * sin_a + z * cos_a;
+            let y2 = y * cos_b - z2 * sin_b;
+            let z3 = y * sin_b + z2 * cos_b;
+            let scale = 1.0 / (3.0 - z3);
+            (
+                cube_cx2 + x2 * cube_r * scale * 2.0,
+                cube_cy + y2 * cube_r * scale * 2.0,
+            )
+        })
+        .collect();
+        for &(a, b) in &edges {
+            let path = iced::widget::canvas::Path::line(
+                Point::new(verts2[a].0, verts2[a].1),
+                Point::new(verts2[b].0, verts2[b].1),
+            );
+            frame.stroke(&path, stroke2.clone());
+        }
+
+        vec![frame.into_geometry()]
+    }
 }

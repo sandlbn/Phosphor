@@ -56,6 +56,11 @@ pub struct Config {
     /// Force stereo mirroring for 2SID tunes (duplicate SID1 writes to SID2).
     /// When enabled, 2SID tunes play in mono-stereo mode instead of true dual-SID.
     pub force_stereo_2sid: bool,
+    /// Restart the USB device when loading a new SID file (macOS only).
+    /// This closes and reopens the USB connection to the USBSID-Pico,
+    /// clearing any stale state from the previous tune. Useful if playback
+    /// becomes distorted or voices go missing after switching tunes.
+    pub restart_usb_on_load: bool,
     /// Last known window position — restored on next launch.
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -84,6 +89,7 @@ impl Default for Config {
             u64_audio_enabled: false,
             u64_audio_port: 11001,
             force_stereo_2sid: false,
+            restart_usb_on_load: false,
             window_x: None,
             window_y: None,
             window_width_saved: DEFAULT_WINDOW_WIDTH,
@@ -224,6 +230,9 @@ impl Config {
             } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.force_stereo_2sid = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"restart_usb_on_load\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.restart_usb_on_load = val == "true";
             } else if let Some(rest) = line.strip_prefix("\"window_x\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if val != "null" {
@@ -289,6 +298,7 @@ impl Config {
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
+                "  \"restart_usb_on_load\": {},\n",
                 "  \"window_x\": {},\n",
                 "  \"window_y\": {},\n",
                 "  \"window_width_saved\": {},\n",
@@ -312,6 +322,7 @@ impl Config {
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,
+            self.restart_usb_on_load,
             fmt_opt_i32(self.window_x),
             fmt_opt_i32(self.window_y),
             self.window_width_saved,

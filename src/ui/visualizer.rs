@@ -1408,7 +1408,7 @@ fn draw_mode_hint(frame: &mut Frame, bounds: Rectangle) {
 
 /// Convert a hue [0..1] with given saturation and value to an RGB Color.
 /// Classic HSV→RGB used for the colour-wave effect on the scroller text.
-fn hue_to_rgb(h: f32, s: f32, v: f32) -> Color {
+pub(crate) fn hue_to_rgb(h: f32, s: f32, v: f32) -> Color {
     let h6 = h * 6.0;
     let i = h6.floor() as u32;
     let f = h6 - i as f32;
@@ -1426,7 +1426,14 @@ fn hue_to_rgb(h: f32, s: f32, v: f32) -> Color {
     Color { r, g, b, a: 1.0 }
 }
 
-fn draw_pixel_text(frame: &mut Frame, chars: &[char], x: f32, y: f32, scale: u32, color: Color) {
+pub(crate) fn draw_pixel_text(
+    frame: &mut Frame,
+    chars: &[char],
+    x: f32,
+    y: f32,
+    scale: u32,
+    color: Color,
+) {
     let s = scale as f32;
     let char_w = 3.0 * s + s;
     for (ci, ch) in chars.iter().enumerate() {
@@ -1447,7 +1454,7 @@ fn draw_pixel_text(frame: &mut Frame, chars: &[char], x: f32, y: f32, scale: u32
     }
 }
 
-fn glyph(c: char) -> Option<[[bool; 3]; 5]> {
+pub(crate) fn glyph(c: char) -> Option<[[bool; 3]; 5]> {
     const fn b(v: u8) -> [bool; 3] {
         [v & 4 != 0, v & 2 != 0, v & 1 != 0]
     }

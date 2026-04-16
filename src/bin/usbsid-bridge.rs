@@ -70,6 +70,12 @@ mod unix_main {
         let mut dev: Option<UsbSid> = None;
         let mut cmd = [0u8; 1];
 
+        // Pending ring writes — collected locally and pushed to the driver
+        // in one batch when CMD_FLUSH arrives.  This eliminates per-write
+        // mutex contention (one lock instead of hundreds) and prevents the
+        // writer thread from sending partial USB packets mid-frame.
+        let mut pending_writes: Vec<(u8, u8, u16)> = Vec::with_capacity(512);
+
         eprintln!("[usbsid-bridge] client connected");
 
         loop {
@@ -115,6 +121,7 @@ mod unix_main {
                 }
 
                 CMD_RESET => {
+                    pending_writes.clear();
                     if let Some(ref mut d) = dev {
                         d.reset();
                     }
@@ -146,25 +153,33 @@ mod unix_main {
                 }
 
                 CMD_RING => {
-                    // Push to driver's ring buffer: reg, val, cycles_hi, cycles_lo
+                    // Collect writes locally — they will be pushed to the
+                    // driver in a single batch when CMD_FLUSH arrives.
                     let mut b = [0u8; 4];
                     if stream.read_exact(&mut b).is_err() {
                         break;
                     }
-                    if let Some(ref d) = dev {
-                        let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
-                        let _ = d.write_ring_cycled(b[0], b[1], cycles);
-                    }
+                    let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
+                    pending_writes.push((b[0], b[1], cycles));
                 }
 
                 CMD_FLUSH => {
-                    // Signal end-of-frame — driver's writer thread drains the ring.
+                    // Push all collected writes in one batch (single mutex
+                    // lock + single condvar notification), then signal the
+                    // writer thread to drain.  Non-blocking — the writer
+                    // thread drains asynchronously while the player prepares
+                    // the next frame.
                     if let Some(ref mut d) = dev {
-                        d.set_flush();
+                        if !pending_writes.is_empty() {
+                            let _ = d.write_ring_cycled_batch(&pending_writes);
+                            pending_writes.clear();
+                        }
+                        d.set_flush(); // non-blocking — writer thread drains async
                     }
                 }
 
                 CMD_MUTE => {
+                    pending_writes.clear();
                     if let Some(ref mut d) = dev {
                         d.mute();
                     }
@@ -172,8 +187,9 @@ mod unix_main {
                 }
 
                 CMD_CLOSE => {
+                    pending_writes.clear();
                     if let Some(ref mut d) = dev {
-                        d.set_flush();
+                        d.flush();
                         d.mute();
                         d.reset();
                         d.close();
@@ -183,8 +199,9 @@ mod unix_main {
                 }
 
                 CMD_QUIT => {
+                    pending_writes.clear();
                     if let Some(ref mut d) = dev {
-                        d.set_flush();
+                        d.flush();
                         d.mute();
                         d.reset();
                         d.close();

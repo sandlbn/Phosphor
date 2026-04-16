@@ -37,6 +37,8 @@ pub enum PlayerCmd {
         sid4_addr: u16,
         /// Some(port) → start U64 audio stream on this port after native playback begins.
         audio_port: Option<u16>,
+        /// Close and reopen the USB device before loading (macOS).
+        restart_usb_on_load: bool,
     },
     Stop,
     TogglePause,
@@ -361,16 +363,7 @@ fn player_loop(
 
                         let now = Instant::now();
                         if ctx.next_frame < now {
-                            // Frame overrun — log it periodically
-                            let overrun = now - ctx.next_frame;
-                            if ctx.frame_count % 250 == 0 {
-                                eprintln!(
-                                    "[phosphor] frame {} overrun by {}µs (sids={})",
-                                    ctx.frame_count,
-                                    overrun.as_micros(),
-                                    ctx.track_info.num_sids,
-                                );
-                            }
+                            // Frame overrun — reset to avoid cascading drift
                             ctx.next_frame = now;
                         }
 
@@ -464,9 +457,20 @@ fn handle_cmd(
             force_stereo,
             sid4_addr,
             audio_port,
+            restart_usb_on_load,
         } => {
             *last_error = None;
             stop_playback(play_ctx, bridge);
+
+            // Restart USB device if configured (macOS: close + reopen via daemon).
+            if restart_usb_on_load {
+                if let Some(ref mut br) = bridge {
+                    eprintln!("[phosphor] Restarting USB device before load");
+                    if let Err(e) = br.reinit() {
+                        eprintln!("[phosphor] USB reinit failed: {e}");
+                    }
+                }
+            }
 
             if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
                 *last_error = Some(e);
