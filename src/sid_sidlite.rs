@@ -225,7 +225,7 @@ impl SidLiteDevice {
         sid1.set_sampling_parameters(clock_freq, effective_rate);
 
         let mut ext1 = ExternalFilter::new();
-        ext1.set_clock_frequency(clock_freq as f64);
+        ext1.set_clock_frequency(sample_rate as f64);
 
         eprintln!(
             "[sidlite] SID opened: MOS6581, clock={}Hz, output={}Hz (device={}Hz), ExternalFilter=ON",
@@ -390,11 +390,11 @@ impl SidDevice for SidLiteDevice {
             s.set_sampling_parameters(self.clock_freq, rate);
         }
 
-        let freq = self.clock_freq as f64;
-        self.ext1.set_clock_frequency(freq);
-        self.ext2.set_clock_frequency(freq);
-        self.ext3.set_clock_frequency(freq);
-        self.ext4.set_clock_frequency(freq);
+        let rate = self.sample_rate as f64;
+        self.ext1.set_clock_frequency(rate);
+        self.ext2.set_clock_frequency(rate);
+        self.ext3.set_clock_frequency(rate);
+        self.ext4.set_clock_frequency(rate);
 
         eprintln!(
             "[sidlite] Clock: {} {}Hz, {}/frame, output={}Hz",

@@ -299,13 +299,16 @@ impl EmulatedDevice {
         sid1.inner()
             .set_sampling_parameters(SamplingMethod::Fast, clock_freq, sample_rate);
 
-        // Build ExternalFilter for the initial clock rate.
+        // Build ExternalFilter for the audio output rate (NOT the C64 clock rate).
+        // The filter is applied per-sample at the audio rate, so coefficients
+        // must match that rate.  Using the C64 clock rate (985kHz) here would
+        // give a ~780Hz cutoff instead of ~15.9kHz — killing all treble.
         let mut ext1 = ExternalFilter::new();
         let mut ext2 = ExternalFilter::new();
         let mut ext3 = ExternalFilter::new();
-        ext1.set_clock_frequency(clock_freq as f64);
-        ext2.set_clock_frequency(clock_freq as f64);
-        ext3.set_clock_frequency(clock_freq as f64);
+        ext1.set_clock_frequency(sample_rate as f64);
+        ext2.set_clock_frequency(sample_rate as f64);
+        ext3.set_clock_frequency(sample_rate as f64);
 
         eprintln!(
             "[emulated] SID opened: MOS6581, clock={}Hz, output={}Hz, ExternalFilter=ON",
@@ -525,11 +528,12 @@ impl SidDevice for EmulatedDevice {
             );
         }
 
-        let freq = self.clock_freq as f64;
-        self.ext1.set_clock_frequency(freq);
-        self.ext2.set_clock_frequency(freq);
-        self.ext3.set_clock_frequency(freq);
-        self.ext4.set_clock_frequency(freq);
+        // ExternalFilter runs at the audio rate, not the C64 clock rate.
+        let rate = self.sample_rate as f64;
+        self.ext1.set_clock_frequency(rate);
+        self.ext2.set_clock_frequency(rate);
+        self.ext3.set_clock_frequency(rate);
+        self.ext4.set_clock_frequency(rate);
 
         eprintln!(
             "[emulated] Clock: {} {}Hz, {}/frame, output={}Hz",
