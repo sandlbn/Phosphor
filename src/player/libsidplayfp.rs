@@ -123,15 +123,14 @@ impl LibSidPlayFp {
 
     /// Run one frame of emulation (cycles CPU cycles).
     /// Populates `self.sid_writes` with cycle-accurate SID writes.
-    /// Returns the actual number of CPU cycles elapsed (may differ from requested).
-    pub fn run_frame(&mut self, cycles: u32) -> u32 {
+    pub fn run_frame(&mut self, cycles: u32) {
         self.sid_writes.clear();
 
         let actual_cycles = match self.player.play(cycles) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[libsidplayfp] play error: {e}");
-                return cycles;
+                return;
             }
         };
 
@@ -142,8 +141,8 @@ impl LibSidPlayFp {
             // Map sid_num + reg to the unified register space:
             // SID0: 0x00-0x1F, SID1: 0x20-0x3F, SID2: 0x40-0x5F
             let mapped_reg = (w.sid_num as u8) * 0x20 + w.reg;
-            // Clamp cycle timestamp to actual frame size.
-            let clamped_cycle = w.cycle.min(actual_cycles);
+            // Clamp to requested frame size so downstream flush doesn't overshoot.
+            let clamped_cycle = w.cycle.min(cycles);
             self.sid_writes.push((clamped_cycle, mapped_reg, w.val));
 
             // Update shadow.
@@ -161,8 +160,6 @@ impl LibSidPlayFp {
             );
         }
         self.frame_diag = (self.frame_diag + 1) % 250;
-
-        actual_cycles
     }
 
     /// Clear writes and reset shadow.

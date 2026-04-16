@@ -23,7 +23,7 @@ const PAL_CYCLES_PER_FRAME: u32 = 19_656;
 const NTSC_CYCLES_PER_FRAME: u32 = 17_095;
 
 const SID_REGS: u8 = 0x20;
-const MAX_BUFFER_SAMPLES: usize = 12288;
+const MAX_BUFFER_SAMPLES: usize = 8192;
 const SCRATCH_SIZE: usize = 2048;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,18 +107,6 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                     "[sidlite] Audio device: '{}', native rate: {}Hz",
                     dev_name, actual_rate,
                 );
-
-                // Pre-fill ring buffer with ~150ms silence to avoid startup crackle.
-                // The player sleeps 50ms after reset() plus runs setup code before
-                // the first ring_cycled() call. Windows WASAPI makes underruns
-                // immediately audible; 150ms covers the full startup window.
-                {
-                    let prefill = (actual_rate as usize * 150) / 1000;
-                    let mut ring = audio_buf.lock().unwrap();
-                    for _ in 0..prefill {
-                        ring.push_back((0, 0));
-                    }
-                }
 
                 let config = cpal::StreamConfig {
                     channels: 2,
@@ -250,15 +238,6 @@ impl SidLiteDevice {
             audio_shutdown,
             frame_counter: 0,
         })
-    }
-
-    fn prefill_silence(&self) {
-        let prefill = (self.sample_rate as usize * 150) / 1000; // ~150ms
-        if let Ok(mut ring) = self.audio_buf.lock() {
-            for _ in 0..prefill {
-                ring.push_back((0, 0));
-            }
-        }
     }
 
     fn make_sid(&self) -> Sid {
@@ -435,7 +414,6 @@ impl SidDevice for SidLiteDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
-        self.prefill_silence();
     }
 
     fn set_stereo(&mut self, mode: i32) {
@@ -524,7 +502,6 @@ impl SidDevice for SidLiteDevice {
         if let Ok(mut buf) = self.audio_buf.lock() {
             buf.clear();
         }
-        self.prefill_silence();
     }
 
     fn close(&mut self) {
