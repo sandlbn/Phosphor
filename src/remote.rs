@@ -105,11 +105,59 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                         respond_json(request, &json);
                     }
 
-                    // ── API: playlist ────────────────────────────────────
+                    // ── API: playlist (paginated, server-side search) ────
+                    // /api/playlist?q=search&offset=0&limit=100
                     ("GET", p) if p.starts_with("/api/playlist") => {
+                        let query_str = p.split('?').nth(1).unwrap_or("");
+                        let mut q = String::new();
+                        let mut offset: usize = 0;
+                        let mut limit: usize = 100;
+                        for part in query_str.split('&') {
+                            if let Some(v) = part.strip_prefix("q=") {
+                                q = urldecode(v).to_lowercase();
+                            } else if let Some(v) = part.strip_prefix("offset=") {
+                                offset = v.parse().unwrap_or(0);
+                            } else if let Some(v) = part.strip_prefix("limit=") {
+                                limit = v.parse().unwrap_or(100).min(500);
+                            }
+                        }
                         let json = {
                             let s = state.lock().unwrap();
-                            serde_json::to_string(&s.playlist).unwrap_or_default()
+                            let total = s.playlist.len();
+                            let (matched, filtered): (usize, Vec<&RemotePlaylistEntry>) =
+                                if q.is_empty() {
+                                    (
+                                        total,
+                                        s.playlist.iter().skip(offset).take(limit).collect(),
+                                    )
+                                } else {
+                                    let all_matches: Vec<&RemotePlaylistEntry> = s
+                                        .playlist
+                                        .iter()
+                                        .filter(|e| {
+                                            e.title.to_lowercase().contains(&q)
+                                                || e.author.to_lowercase().contains(&q)
+                                        })
+                                        .collect();
+                                    let m = all_matches.len();
+                                    (
+                                        m,
+                                        all_matches
+                                            .into_iter()
+                                            .skip(offset)
+                                            .take(limit)
+                                            .collect(),
+                                    )
+                                };
+                            let count = filtered.len();
+                            format!(
+                                r#"{{"total":{},"matched":{},"offset":{},"count":{},"entries":{}}}"#,
+                                total,
+                                matched,
+                                offset,
+                                count,
+                                serde_json::to_string(&filtered).unwrap_or_default(),
+                            )
                         };
                         respond_json(request, &json);
                     }
@@ -194,6 +242,25 @@ fn respond_error(request: tiny_http::Request, code: u16, msg: &str) {
     let _ = request.respond(resp);
 }
 
+/// Minimal percent-decoding for query parameter values.
+fn urldecode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                out.push(byte as char);
+            }
+        } else if c == '+' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Embedded Web UI
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,13 +326,14 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button onclick="cmd('next')" title="Next">&#9197;</button>
 </div>
 
-<div class="search"><input id="q" placeholder="Search playlist..." oninput="filterList()"></div>
+<div class="search"><input id="q" placeholder="Search playlist..." oninput="onSearch()"></div>
+<div id="pl-info" style="padding:2px 16px;font-size:11px;color:#506070;"></div>
 <div class="playlist" id="pl"></div>
 
 <script>
-let playlist=[], filtered=[], status={}, curIdx=null;
+let entries=[], status={}, curIdx=null, total=0, loading=false, searchTimer=null;
 
-async function cmd(c,body){
+async function cmd(c){
   await fetch('/api/'+c,{method:'POST'});
   setTimeout(poll,150);
 }
@@ -274,50 +342,56 @@ async function poll(){
   try{
     const r=await fetch('/api/status');
     status=await r.json();
-    const t=document.getElementById('np-title');
-    const a=document.getElementById('np-author');
-    const i=document.getElementById('np-info');
-    t.textContent=status.title||'—';
-    a.textContent=status.author||'';
+    document.getElementById('np-title').textContent=status.title||'—';
+    document.getElementById('np-author').textContent=status.author||'';
     const elapsed=fmtTime(status.elapsed_secs||0);
     const dur=status.duration_secs?fmtTime(status.duration_secs):'--:--';
     const parts=[elapsed+' / '+dur];
     if(status.sid_type)parts.push(status.sid_type);
     if(status.is_pal!==undefined)parts.push(status.is_pal?'PAL':'NTSC');
     if(status.engine)parts.push(status.engine);
-    i.innerHTML='<span class="state-dot '+status.state+'"></span>'+parts.join(' · ');
-    // progress
+    document.getElementById('np-info').innerHTML=
+      '<span class="state-dot '+status.state+'"></span>'+parts.join(' \u00b7 ');
     const pct=(status.duration_secs&&status.duration_secs>0)?
       Math.min(100,(status.elapsed_secs/status.duration_secs)*100):0;
     document.getElementById('prog').style.width=pct+'%';
-    const pp=document.getElementById('pp-btn');
-    pp.innerHTML=status.state==='playing'?'&#9208;':'&#9654;';
+    document.getElementById('pp-btn').innerHTML=
+      status.state==='playing'?'\u23F8':'\u25B6';
     if(status.current_index!==curIdx){curIdx=status.current_index;highlightCurrent();}
   }catch(e){}
 }
 
-function fmtTime(s){
-  s=Math.floor(s);
-  return Math.floor(s/60)+':'+(s%60<10?'0':'')+s%60;
-}
+function fmtTime(s){s=Math.floor(s);return Math.floor(s/60)+':'+(s%60<10?'0':'')+s%60;}
+function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;'):'';}
 
-async function loadPlaylist(){
+async function loadPlaylist(append){
+  if(loading)return;
+  loading=true;
+  const q=encodeURIComponent(document.getElementById('q').value);
+  const offset=append?entries.length:0;
   try{
-    const r=await fetch('/api/playlist');
-    playlist=await r.json();
-    filterList();
+    const r=await fetch('/api/playlist?q='+q+'&offset='+offset+'&limit=100');
+    const data=await r.json();
+    total=data.matched;
+    if(append){entries=entries.concat(data.entries);}
+    else{entries=data.entries;}
+    renderList(data.total);
   }catch(e){}
+  loading=false;
 }
 
-function filterList(){
-  const q=document.getElementById('q').value.toLowerCase();
-  filtered=q?playlist.filter(t=>t.title.toLowerCase().includes(q)||t.author.toLowerCase().includes(q)):playlist;
-  renderList();
+function onSearch(){
+  clearTimeout(searchTimer);
+  searchTimer=setTimeout(()=>loadPlaylist(false),200);
 }
 
-function renderList(){
+function renderList(totalAll){
   const el=document.getElementById('pl');
-  el.innerHTML=filtered.map(t=>{
+  const info=document.getElementById('pl-info');
+  const q=document.getElementById('q').value;
+  if(q){info.textContent=total+' matches (showing '+entries.length+') of '+totalAll+' total';}
+  else{info.textContent=entries.length+' of '+total+' tracks';}
+  el.innerHTML=entries.map(t=>{
     const active=t.index===curIdx?'active':'';
     const dur=t.duration?fmtTime(t.duration):'';
     return '<div class="track '+active+'" onclick="cmd(\'play/'+t.index+'\')">'+
@@ -326,26 +400,33 @@ function renderList(){
       '<div class="t-author">'+esc(t.author)+'</div></div>'+
       '<span class="dur">'+dur+'</span></div>';
   }).join('');
+  // Show "load more" if there are more results
+  if(entries.length<total){
+    el.innerHTML+='<div class="track" onclick="loadPlaylist(true)" '+
+      'style="justify-content:center;color:#5cb870;font-size:13px;">'+
+      '\u25bc Load more ('+entries.length+'/'+total+')</div>';
+  }
 }
 
 function highlightCurrent(){
   document.querySelectorAll('.track').forEach(el=>{
-    const idx=parseInt(el.querySelector('.idx').textContent)-1;
+    const idx=parseInt(el.querySelector('.idx')?.textContent)-1;
     el.classList.toggle('active',idx===curIdx);
   });
-  // scroll active into view
   const active=document.querySelector('.track.active');
   if(active)active.scrollIntoView({block:'nearest',behavior:'smooth'});
 }
 
-function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;'):'';}
+// Auto-load more when scrolling near bottom
+document.getElementById('pl').addEventListener('scroll',function(){
+  if(this.scrollTop+this.clientHeight>=this.scrollHeight-50){
+    if(entries.length<total)loadPlaylist(true);
+  }
+});
 
-// Poll every second
 setInterval(poll,1000);
 poll();
-loadPlaylist();
-// Refresh playlist every 10s (in case entries change)
-setInterval(loadPlaylist,10000);
+loadPlaylist(false);
 </script>
 </body>
 </html>
