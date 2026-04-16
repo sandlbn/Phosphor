@@ -103,16 +103,20 @@ impl ExternalFilter {
 
     /// Clock the filter by one sample.  Input/output are signed 16-bit audio.
     ///
-    /// Matches ExternalFilter::clock() from libresidfp — one multiply-shift per stage.
+    /// Based on libresidfp's ExternalFilter — one multiply-shift per stage.
+    /// Uses i64 intermediates to avoid overflow when coefficients are large
+    /// (w0lp can reach ~87 at 48kHz, making w0 * delta exceed i32 range).
     #[inline(always)]
     fn clock(&mut self, input: i16) -> i16 {
-        let vi = (input as i32) << 11;
-        let dvlp = (self.w0lp_1_s7 * (vi - self.vlp)) >> 7;
-        let dvhp = (self.w0hp_1_s17 * (self.vlp - self.vhp)) >> 17;
-        self.vlp += dvlp;
-        self.vhp += dvhp;
-        // Shift back to i16 range.  Clamp defends against cold-start transients.
-        ((self.vlp - self.vhp) >> 11).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        let vi = (input as i64) << 11;
+        let vlp = self.vlp as i64;
+        let vhp = self.vhp as i64;
+        let dvlp = ((self.w0lp_1_s7 as i64) * (vi - vlp)) >> 7;
+        let dvhp = ((self.w0hp_1_s17 as i64) * (vlp - vhp)) >> 17;
+        self.vlp = (vlp + dvlp) as i32;
+        self.vhp = (vhp + dvhp) as i32;
+        (((self.vlp as i64 - self.vhp as i64) >> 11) as i32).clamp(i16::MIN as i32, i16::MAX as i32)
+            as i16
     }
 }
 
