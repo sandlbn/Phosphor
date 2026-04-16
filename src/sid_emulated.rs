@@ -180,22 +180,43 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
 
                 let buf = audio_buf;
 
+                // Fade-in length after an underrun (samples, not frames).
+                // ~5ms at 48kHz — inaudible but smooths the silence→audio
+                // discontinuity that WASAPI makes audible as crackle.
+                let fade_len = (actual_rate / 200).max(64) as usize; // ~5ms
+                let mut fade_pos: usize = 0;
+                let mut was_underrun = true; // start in underrun state
+
                 let stream = device
                     .build_output_stream(
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             let mut ring = buf.lock().unwrap();
-                            // data is interleaved [L, R, L, R, ...]
                             let frames = data.len() / 2;
                             for f in 0..frames {
                                 let idx = f * 2;
                                 if let Some((l, r)) = ring.pop_front() {
-                                    data[idx] = l as f32 / 32768.0;
-                                    data[idx + 1] = r as f32 / 32768.0;
+                                    let mut lf = l as f32 / 32768.0;
+                                    let mut rf = r as f32 / 32768.0;
+                                    // Apply fade-in ramp after an underrun to
+                                    // avoid the hard 0→signal click.
+                                    if was_underrun {
+                                        was_underrun = false;
+                                        fade_pos = 0;
+                                    }
+                                    if fade_pos < fade_len {
+                                        let gain = fade_pos as f32 / fade_len as f32;
+                                        lf *= gain;
+                                        rf *= gain;
+                                        fade_pos += 1;
+                                    }
+                                    data[idx] = lf;
+                                    data[idx + 1] = rf;
                                 } else {
                                     // Underrun: silence
                                     data[idx] = 0.0;
                                     data[idx + 1] = 0.0;
+                                    was_underrun = true;
                                 }
                             }
                         },

@@ -115,6 +115,10 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                 };
 
                 let buf = audio_buf;
+                let fade_len = (actual_rate / 200).max(64) as usize;
+                let mut fade_pos: usize = 0;
+                let mut was_underrun = true;
+
                 let stream = device
                     .build_output_stream(
                         &config,
@@ -124,11 +128,24 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                             for f in 0..frames {
                                 let idx = f * 2;
                                 if let Some((l, r)) = ring.pop_front() {
-                                    data[idx] = l as f32 / 32768.0;
-                                    data[idx + 1] = r as f32 / 32768.0;
+                                    let mut lf = l as f32 / 32768.0;
+                                    let mut rf = r as f32 / 32768.0;
+                                    if was_underrun {
+                                        was_underrun = false;
+                                        fade_pos = 0;
+                                    }
+                                    if fade_pos < fade_len {
+                                        let gain = fade_pos as f32 / fade_len as f32;
+                                        lf *= gain;
+                                        rf *= gain;
+                                        fade_pos += 1;
+                                    }
+                                    data[idx] = lf;
+                                    data[idx + 1] = rf;
                                 } else {
                                     data[idx] = 0.0;
                                     data[idx + 1] = 0.0;
+                                    was_underrun = true;
                                 }
                             }
                         },
