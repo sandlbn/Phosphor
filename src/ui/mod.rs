@@ -1430,6 +1430,7 @@ pub fn settings_panel<'a>(
     download_status: &'a str,
     stil_status: &'a str,
     http_remote_running: bool,
+    http_port_text: &'a str,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -1727,7 +1728,8 @@ pub fn settings_panel<'a>(
 
     // ── HTTP Remote Control ─────────────────────────────────────
     let remote_status = if http_remote_running {
-        format!("● Running on http://localhost:{}", config.http_remote_port)
+        let ip = local_ip_address().unwrap_or_else(|| "localhost".to_string());
+        format!("● Running on http://{}:{}", ip, config.http_remote_port)
     } else {
         "○ Stopped".to_string()
     };
@@ -1753,7 +1755,7 @@ pub fn settings_panel<'a>(
                 .size(11)
                 .color(Color::from_rgb(0.65, 0.67, 0.72)),
             Space::new().width(6),
-            text_input("8364", &config.http_remote_port.to_string())
+            text_input("8364", http_port_text)
                 .on_input(Message::HttpRemotePortChanged)
                 .size(12)
                 .padding(Padding::from([4, 8]))
@@ -2500,4 +2502,15 @@ impl<Message> canvas::Program<Message> for LoadingScroller {
 
         vec![frame.into_geometry()]
     }
+}
+
+/// Get the first non-loopback IPv4 address of this machine.
+fn local_ip_address() -> Option<String> {
+    use std::net::UdpSocket;
+    // Connect to a public IP (doesn't actually send data) to discover
+    // which local interface the OS would route through.
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
 }

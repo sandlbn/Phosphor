@@ -189,6 +189,8 @@ struct App {
     remote_cmd_tx: Sender<remote::RemoteCmd>,
     /// Whether the HTTP server is currently running.
     http_remote_running: bool,
+    /// Editable text for the HTTP port field in settings.
+    http_port_text: String,
 }
 
 impl App {
@@ -279,6 +281,7 @@ impl App {
         // Remote control HTTP server.
         let remote_state = Arc::new(Mutex::new(remote::SharedRemoteState::default()));
         let (remote_cmd_tx, remote_cmd_rx) = crossbeam_channel::bounded(32);
+        let http_port_text = config.http_remote_port.to_string();
         let mut http_remote_running = false;
         if config.http_remote_enabled {
             remote::start_server(
@@ -360,6 +363,7 @@ impl App {
             remote_cmd_rx,
             remote_cmd_tx,
             http_remote_running,
+            http_port_text,
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -1620,10 +1624,19 @@ impl App {
             }
 
             Message::HttpRemotePortChanged(val) => {
+                self.http_port_text = val.clone();
                 if let Ok(port) = val.trim().parse::<u16>() {
-                    if port >= 1024 {
+                    if port > 0 {
                         self.config.http_remote_port = port;
                         self.config.save();
+                        // Restart server on the new port if running.
+                        if self.http_remote_running {
+                            remote::start_server(
+                                port,
+                                Arc::clone(&self.remote_state),
+                                self.remote_cmd_tx.clone(),
+                            );
+                        }
                     }
                 }
             }
@@ -1697,6 +1710,7 @@ impl App {
                 &self.download_status,
                 &self.stil_status,
                 self.http_remote_running,
+                &self.http_port_text,
             );
             column![
                 info_bar,
