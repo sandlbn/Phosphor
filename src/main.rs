@@ -2125,7 +2125,20 @@ impl App {
         } else {
             self.vis_expanded_info = None;
         }
-        self.visualizer.update(&self.status.voice_levels);
+        // On USB hardware, the USBSID-Pico's stereo output has SID1 on
+        // the right channel and SID2 on the left.  Swap the voice level
+        // groups so the visualizer matches what you actually hear.
+        let levels = if self.config.output_engine == "usb" && self.status.voice_levels.len() == 6 {
+            let mut swapped = self.status.voice_levels.clone();
+            // Swap SID1 voices (0-2) with SID2 voices (3-5)
+            swapped.swap(0, 3);
+            swapped.swap(1, 4);
+            swapped.swap(2, 5);
+            swapped
+        } else {
+            self.status.voice_levels.clone()
+        };
+        self.visualizer.update(&levels);
 
         if self.status.state == PlayState::Playing {
             if let Some(cur_idx) = self.playlist.current {
