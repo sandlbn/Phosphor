@@ -21,6 +21,7 @@ mod daemon_installer;
 #[cfg(all(feature = "usb", not(target_os = "macos")))]
 mod sid_direct;
 
+mod remote;
 mod sid_emulated;
 mod sid_sidlite;
 mod sid_u64;
@@ -28,7 +29,9 @@ mod sid_u64;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+use crossbeam_channel::{self, Receiver, Sender};
 use iced::widget::{column, container, mouse_area, rule, Space};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
 
@@ -178,6 +181,14 @@ struct App {
     session_loaded: bool,
     /// Monotonic frame counter — drives loading animation redraw.
     tick: u32,
+    /// Shared state for the HTTP remote control server.
+    remote_state: Arc<Mutex<remote::SharedRemoteState>>,
+    /// Commands from the HTTP remote control server.
+    remote_cmd_rx: Receiver<remote::RemoteCmd>,
+    /// Sender kept to start new servers on the fly.
+    remote_cmd_tx: Sender<remote::RemoteCmd>,
+    /// Whether the HTTP server is currently running.
+    http_remote_running: bool,
 }
 
 impl App {
@@ -265,6 +276,19 @@ impl App {
         let window_width = config.window_width_saved;
         let window_height = config.window_height_saved;
 
+        // Remote control HTTP server.
+        let remote_state = Arc::new(Mutex::new(remote::SharedRemoteState::default()));
+        let (remote_cmd_tx, remote_cmd_rx) = crossbeam_channel::bounded(32);
+        let mut http_remote_running = false;
+        if config.http_remote_enabled {
+            remote::start_server(
+                config.http_remote_port,
+                Arc::clone(&remote_state),
+                remote_cmd_tx.clone(),
+            );
+            http_remote_running = true;
+        }
+
         // Snapshot fields needed for auto-download before config moves into app.
         let auto_songlength_url = config.songlength_url.clone();
         let auto_stil_url = config.stil_url.clone();
@@ -332,6 +356,10 @@ impl App {
             stil_display_text: String::new(),
             session_loaded: false,
             tick: 0,
+            remote_state,
+            remote_cmd_rx,
+            remote_cmd_tx,
+            http_remote_running,
         };
 
         let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -1305,6 +1333,12 @@ impl App {
                         }
                     }
                 }
+
+                // ── Remote control ──────────────────────────────────────
+                if self.http_remote_running {
+                    self.update_remote_state();
+                    self.poll_remote_commands();
+                }
             }
 
             Message::VersionCheckDone(Ok(Some(info))) => {
@@ -1564,6 +1598,36 @@ impl App {
                 }
             }
 
+            Message::ToggleHttpRemote => {
+                if self.http_remote_running {
+                    // Can't stop tiny_http gracefully, but we can flag it.
+                    // The server thread will keep running but commands will
+                    // be ignored because we won't poll them.
+                    self.http_remote_running = false;
+                    self.config.http_remote_enabled = false;
+                    self.config.save();
+                    eprintln!("[phosphor] Remote control disabled (restart app to free the port)");
+                } else {
+                    remote::start_server(
+                        self.config.http_remote_port,
+                        Arc::clone(&self.remote_state),
+                        self.remote_cmd_tx.clone(),
+                    );
+                    self.http_remote_running = true;
+                    self.config.http_remote_enabled = true;
+                    self.config.save();
+                }
+            }
+
+            Message::HttpRemotePortChanged(val) => {
+                if let Ok(port) = val.trim().parse::<u16>() {
+                    if port >= 1024 {
+                        self.config.http_remote_port = port;
+                        self.config.save();
+                    }
+                }
+            }
+
             Message::None => {}
         }
 
@@ -1632,6 +1696,7 @@ impl App {
                 &self.default_length_text,
                 &self.download_status,
                 &self.stil_status,
+                self.http_remote_running,
             );
             column![
                 info_bar,
@@ -2139,6 +2204,91 @@ impl App {
             if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
                 e.selected_song = song;
                 e.duration_secs = new_dur;
+            }
+        }
+    }
+
+    /// Push current status + playlist snapshot to the remote HTTP server.
+    fn update_remote_state(&self) {
+        if let Ok(mut rs) = self.remote_state.try_lock() {
+            let info = self.status.track_info.as_ref();
+            rs.status = remote::RemoteStatus {
+                state: match self.status.state {
+                    PlayState::Playing => "playing",
+                    PlayState::Paused => "paused",
+                    PlayState::Stopped => "stopped",
+                }
+                .to_string(),
+                title: info.map(|i| i.name.clone()).unwrap_or_default(),
+                author: info.map(|i| i.author.clone()).unwrap_or_default(),
+                released: info.map(|i| i.released.clone()).unwrap_or_default(),
+                current_song: info.map(|i| i.current_song).unwrap_or(0),
+                songs: info.map(|i| i.songs).unwrap_or(0),
+                elapsed_secs: self.status.elapsed.as_secs_f32(),
+                duration_secs: self
+                    .playlist
+                    .current_entry()
+                    .and_then(|e| e.duration_secs)
+                    .map(|d| d as f32),
+                current_index: self.playlist.current,
+                num_sids: info.map(|i| i.num_sids).unwrap_or(1),
+                sid_type: info.map(|i| i.sid_type.clone()).unwrap_or_default(),
+                is_pal: info.map(|i| i.is_pal).unwrap_or(true),
+                engine: self.config.output_engine.clone(),
+            };
+
+            // Only rebuild playlist snapshot when entries change.
+            let version = self.playlist.len() as u64;
+            if rs.playlist_version != version {
+                rs.playlist = self
+                    .playlist
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| remote::RemotePlaylistEntry {
+                        index: i,
+                        title: e.title.clone(),
+                        author: e.author.clone(),
+                        duration: e.duration_secs,
+                        num_sids: e.num_sids,
+                        is_rsid: e.is_rsid,
+                    })
+                    .collect();
+                rs.playlist_version = version;
+            }
+        }
+    }
+
+    /// Process commands from the HTTP remote control server.
+    fn poll_remote_commands(&mut self) {
+        while let Ok(cmd) = self.remote_cmd_rx.try_recv() {
+            match cmd {
+                remote::RemoteCmd::PlayTrack(idx) => {
+                    self.play_track(idx);
+                }
+                remote::RemoteCmd::Stop => {
+                    let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                }
+                remote::RemoteCmd::TogglePause => {
+                    let _ = self.cmd_tx.send(PlayerCmd::TogglePause);
+                }
+                remote::RemoteCmd::NextTrack => {
+                    if let Some(cur) = self.playlist.current {
+                        if cur + 1 < self.playlist.len() {
+                            self.play_track(cur + 1);
+                        }
+                    }
+                }
+                remote::RemoteCmd::PrevTrack => {
+                    if let Some(cur) = self.playlist.current {
+                        if cur > 0 {
+                            self.play_track(cur - 1);
+                        }
+                    }
+                }
+                remote::RemoteCmd::SetSubtune(n) => {
+                    let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(n));
+                }
             }
         }
     }

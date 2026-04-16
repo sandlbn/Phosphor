@@ -43,6 +43,9 @@ md5 = "0.7"
 # Directory scanning for adding folders
 walkdir = "2"
 
+# Remote control HTTP server
+tiny_http = "0.12"
+
 # Logging
 env_logger = "0.11"
 log = "0.4"

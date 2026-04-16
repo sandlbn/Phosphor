@@ -176,6 +176,10 @@ pub enum Message {
     SetU64Address(String),
     SetU64Password(String),
 
+    // Remote control
+    ToggleHttpRemote,
+    HttpRemotePortChanged(String),
+
     // Favorites
     ToggleFavorite(usize),
     ToggleFavoritesFilter,
@@ -1425,6 +1429,7 @@ pub fn settings_panel<'a>(
     default_length_text: &'a str,
     download_status: &'a str,
     stil_status: &'a str,
+    http_remote_running: bool,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -1720,6 +1725,48 @@ pub fn settings_panel<'a>(
     ]
     .spacing(6);
 
+    // ── HTTP Remote Control ─────────────────────────────────────
+    let remote_status = if http_remote_running {
+        format!("● Running on http://localhost:{}", config.http_remote_port)
+    } else {
+        "○ Stopped".to_string()
+    };
+    let remote_status_color = if http_remote_running {
+        Color::from_rgb(0.4, 0.9, 0.5)
+    } else {
+        Color::from_rgb(0.5, 0.5, 0.6)
+    };
+    let remote_section = column![
+        text("Remote control (HTTP):")
+            .size(14)
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        tool_button(
+            if http_remote_running {
+                "■ Stop remote server"
+            } else {
+                "▶ Start remote server"
+            },
+            Message::ToggleHttpRemote,
+        ),
+        row![
+            text("Port:")
+                .size(11)
+                .color(Color::from_rgb(0.65, 0.67, 0.72)),
+            Space::new().width(6),
+            text_input("8364", &config.http_remote_port.to_string())
+                .on_input(Message::HttpRemotePortChanged)
+                .size(12)
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fixed(80.0)),
+        ]
+        .align_y(Alignment::Center),
+        text(remote_status).size(12).color(remote_status_color),
+        text("Control Phosphor from any browser on the same network.")
+            .size(11)
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
+
     // ── Keyboard shortcuts ───────────────────────────────────────
     let mut kb_col = column![text("Keyboard shortcuts:")
         .size(14)
@@ -1758,6 +1805,8 @@ pub fn settings_panel<'a>(
         dl_section,
         rule::horizontal(1),
         stil_section,
+        rule::horizontal(1),
+        remote_section,
         rule::horizontal(1),
         kb_col,
     ]
