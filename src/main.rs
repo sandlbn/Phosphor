@@ -801,8 +801,11 @@ impl App {
                         pg.clear();
                     }
                 } else {
-                    let n = entries.len();
-                    self.pending_entries = Some(entries);
+                    // Extend rather than replace — multiple drops may arrive
+                    // concurrently and each resolves as a separate FilesLoaded.
+                    let pending = self.pending_entries.get_or_insert_with(Vec::new);
+                    pending.extend(entries);
+                    let n = pending.len();
                     if let Ok(mut pg) = self.loading_progress.lock() {
                         *pg = format!("⏳ Adding {} tracks…", n);
                     }

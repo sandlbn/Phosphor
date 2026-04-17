@@ -565,7 +565,13 @@ fn handle_cmd(
                 };
                 let track_info = TrackInfo {
                     path: path.clone(),
-                    name: header.name.clone(),
+                    name: if header.name.is_empty() {
+                        path.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        header.name.clone()
+                    },
                     author: header.author.clone(),
                     released: header.released.clone(),
                     songs: header.songs,
@@ -746,7 +752,13 @@ fn handle_cmd(
                                         };
                                         let track_info = TrackInfo {
                                             path: path.clone(),
-                                            name: header.name.clone(),
+                                            name: if header.name.is_empty() {
+                                                path.file_stem()
+                                                    .map(|s| s.to_string_lossy().to_string())
+                                                    .unwrap_or_default()
+                                            } else {
+                                                header.name.clone()
+                                            },
                                             author: header.author.clone(),
                                             released: header.released.clone(),
                                             songs: header.songs,
@@ -1081,7 +1093,13 @@ fn setup_playback(
 
     let track_info = TrackInfo {
         path: path.clone(),
-        name: header.name.clone(),
+        name: if header.name.is_empty() {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            header.name.clone()
+        },
         author: header.author.clone(),
         released: header.released.clone(),
         songs: header.songs,
