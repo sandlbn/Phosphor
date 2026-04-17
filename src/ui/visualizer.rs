@@ -103,6 +103,7 @@ pub struct ExpandedInfo {
     pub songs: u16,
     pub is_pal: bool,
     pub is_rsid: bool,
+    pub is_mus: bool,
     pub num_sids: usize,
     pub elapsed_secs: f32,
     pub duration_secs: Option<f32>,
@@ -795,7 +796,13 @@ fn draw_expanded(
         let tokens: &[&str] = &[
             &song_str,
             if info.is_pal { "PAL" } else { "NTSC" },
-            if info.is_rsid { "RSID" } else { "PSID" },
+            if info.is_mus {
+                "MUS"
+            } else if info.is_rsid {
+                "RSID"
+            } else {
+                "PSID"
+            },
             info.sid_type.as_str(),
             &sids_str,
             info.released.as_str(),

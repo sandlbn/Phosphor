@@ -490,8 +490,15 @@ fn handle_cmd(
                 }
             };
 
+            let is_mus = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mus"))
+                .unwrap_or(false);
+
             let sid_file = match load_sid(&data) {
                 Ok(s) => s,
+                Err(_) if is_mus => sid_file::load_mus_stub(&data),
                 Err(e) => {
                     eprintln!("[phosphor] SID parse error: {e}");
                     *last_error = Some(e);
@@ -1125,13 +1132,26 @@ fn setup_playback(
 
     // Route all tunes through libsidplayfp for cycle-accurate emulation.
     // Fall back to the built-in mos6502 engine only if libsidplayfp fails.
+    // MUS files can only be played by libsidplayfp — no built-in fallback.
+    let is_mus = sid_file.header.magic == "MUS";
     let engine = match libsidplayfp::LibSidPlayFp::new(&sid_file.raw, song) {
         Ok(fp) => {
             eprintln!(
                 "[phosphor] Using libsidplayfp for {} (cycle-accurate)",
-                if is_rsid { "RSID" } else { "PSID" },
+                if is_mus {
+                    "MUS"
+                } else if is_rsid {
+                    "RSID"
+                } else {
+                    "PSID"
+                },
             );
             PlayEngine::SidPlayFp(fp)
+        }
+        Err(e) if is_mus => {
+            eprintln!("[phosphor] MUS playback failed: {e} (libsidplayfp required)");
+            // Built-in CPU engine cannot play MUS — give up.
+            setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc)
         }
         Err(e) => {
             eprintln!("[phosphor] libsidplayfp failed: {e}, falling back to built-in CPU");

@@ -225,7 +225,18 @@ mod unix_main {
         eprintln!("[usbsid-bridge] client disconnected");
     }
 
+    const LOG_PATH: &str = "/tmp/usbsid-bridge.log";
+    const LOG_MAX_BYTES: u64 = 512 * 1024; // 512 KB
+
     pub fn run() {
+        // Rotate log if it has grown too large
+        if let Ok(meta) = std::fs::metadata(LOG_PATH) {
+            if meta.len() > LOG_MAX_BYTES {
+                let _ = std::fs::copy(LOG_PATH, format!("{LOG_PATH}.old"));
+                let _ = std::fs::File::create(LOG_PATH);
+            }
+        }
+
         eprintln!(
             "[usbsid-bridge] daemon starting (pid={})",
             std::process::id()

@@ -278,7 +278,19 @@ pub fn track_info_bar<'a>(
             info.author.as_str(),
             format!(
                 "{}  •  {}  •  Song {}/{}  •  {}  •  {} writes/frame",
-                if info.is_rsid { "RSID" } else { "PSID" },
+                if info
+                    .path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("mus"))
+                    .unwrap_or(false)
+                {
+                    "MUS"
+                } else if info.is_rsid {
+                    "RSID"
+                } else {
+                    "PSID"
+                },
                 info.sid_type,
                 info.current_song,
                 info.songs,
@@ -1274,7 +1286,20 @@ fn playlist_entry_row<'a>(
     } else {
         "1".to_string()
     };
-    let type_label = if entry.is_rsid { "RSID" } else { "PSID" }.to_string();
+    let is_mus = entry
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("mus"))
+        .unwrap_or(false);
+    let type_label = if is_mus {
+        "MUS"
+    } else if entry.is_rsid {
+        "RSID"
+    } else {
+        "PSID"
+    }
+    .to_string();
     let song_title = if entry.songs > 1 {
         format!("{} [{}/{}]", entry.title, entry.selected_song, entry.songs)
     } else {
@@ -2007,7 +2032,19 @@ pub fn filter_playlist(
             if q.is_empty() {
                 return true;
             }
-            let type_str = if entry.is_rsid { "rsid" } else { "psid" };
+            let is_mus = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mus"))
+                .unwrap_or(false);
+            let type_str = if is_mus {
+                "mus"
+            } else if entry.is_rsid {
+                "rsid"
+            } else {
+                "psid"
+            };
             entry.title.to_lowercase().contains(&q)
                 || entry.author.to_lowercase().contains(&q)
                 || entry.released.to_lowercase().contains(&q)

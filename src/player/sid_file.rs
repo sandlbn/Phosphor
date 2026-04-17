@@ -93,6 +93,41 @@ fn decode_sid_addr_byte(b: u8) -> u16 {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+/// Returns true if the extension (lowercase, no dot) is a playable SID format.
+pub fn is_sid_extension(ext: &str) -> bool {
+    matches!(ext, "sid" | "mus")
+}
+
+/// Build a minimal `SidFile` for a MUS file so the rest of the pipeline
+/// (playlist metadata, MD5, libsidplayfp hand-off) has something to work with.
+/// The built-in CPU engine cannot play MUS — only libsidplayfp can.
+pub fn load_mus_stub(data: &[u8]) -> SidFile {
+    SidFile {
+        header: SidHeader {
+            magic: "MUS".into(),
+            version: 0,
+            data_offset: 0,
+            load_address: 0,
+            init_address: 0,
+            play_address: 0,
+            songs: 1,
+            start_song: 1,
+            speed: 0,
+            name: String::new(),
+            author: String::new(),
+            released: String::new(),
+            is_pal: true,
+            is_rsid: false,
+            is_basic: false,
+            sid_model: 0,
+            extra_sid_addrs: [0; 2],
+        },
+        load_address: 0,
+        payload: Vec::new(),
+        raw: data.to_vec(),
+    }
+}
+
 /// Parse a SID file from raw bytes.
 pub fn load_sid(data: &[u8]) -> Result<SidFile, String> {
     let header = parse_header(data)?;

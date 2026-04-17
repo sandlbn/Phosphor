@@ -33,11 +33,19 @@ pub struct PlaylistEntry {
 }
 
 impl PlaylistEntry {
-    /// Try to create an entry by reading and parsing a .sid file header.
+    /// Try to create an entry by reading and parsing a .sid/.mus file header.
     pub fn from_path(path: &Path) -> Result<Self, String> {
         let data =
             std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-        let sid = sid_file::load_sid(&data)?;
+        let is_mus = path
+            .extension()
+            .map(|e| e.to_ascii_lowercase() == "mus")
+            .unwrap_or(false);
+        let sid = match sid_file::load_sid(&data) {
+            Ok(s) => s,
+            Err(_) if is_mus => sid_file::load_mus_stub(&data),
+            Err(e) => return Err(e),
+        };
         let h = &sid.header;
 
         let md5 = sid_file::compute_hvsc_md5(&sid);
@@ -177,7 +185,7 @@ impl Playlist {
         Ok(())
     }
 
-    /// Recursively add all .sid files from a directory.
+    /// Recursively add all .sid/.mus files from a directory.
     pub fn add_directory(&mut self, dir: &Path) -> usize {
         let mut count = 0;
         for entry in WalkDir::new(dir)
@@ -186,7 +194,12 @@ impl Playlist {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if p.extension().map(|e| e.to_ascii_lowercase()) == Some("sid".into()) {
+            let dominated = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| sid_file::is_sid_extension(&e.to_ascii_lowercase()))
+                .unwrap_or(false);
+            if dominated {
                 if self.add_file(p).is_ok() {
                     count += 1;
                 }
@@ -850,7 +863,7 @@ pub fn parse_files(paths: Vec<PathBuf>, progress: LoadingProgress) -> Vec<Playli
     entries
 }
 
-/// Recursively walk a directory and parse all .sid files (blocking I/O).
+/// Recursively walk a directory and parse all .sid/.mus files (blocking I/O).
 /// Designed to be called from a background thread via `Task::perform`.
 pub fn parse_directory(dir: PathBuf, progress: LoadingProgress) -> Vec<PlaylistEntry> {
     let mut entries = Vec::new();
@@ -861,7 +874,12 @@ pub fn parse_directory(dir: PathBuf, progress: LoadingProgress) -> Vec<PlaylistE
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
-        if p.extension().map(|e| e.to_ascii_lowercase()) == Some("sid".into()) {
+        let is_sid = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| sid_file::is_sid_extension(&e.to_ascii_lowercase()))
+            .unwrap_or(false);
+        if is_sid {
             count += 1;
             if let Ok(mut pg) = progress.lock() {
                 *pg = format!("⏳ Scanning folder: {} files found", count);

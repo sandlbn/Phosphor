@@ -4,6 +4,7 @@
 mod c64_emu;
 mod config;
 mod heard_db;
+mod petscii;
 mod player;
 mod playlist;
 mod recently_played;
@@ -849,7 +850,7 @@ impl App {
                     .unwrap_or("")
                     .to_lowercase();
                 match ext.as_str() {
-                    "sid" => {
+                    "sid" | "mus" => {
                         self.config.remember_sid_dir(&path);
                         let paths = vec![path];
                         let pg = self.loading_progress.clone();
@@ -1316,6 +1317,8 @@ impl App {
                     self.visualizer.invalidate_expanded();
                 }
                 // Keep STIL text in sync with current subtune.
+                // Only rebuild on tick for STIL entries (subtune may change).
+                // WDS lyrics are static per track and loaded once via refresh_stil_entry.
                 if self.stil_entry.is_some() {
                     self.rebuild_stil_display();
                 }
@@ -1687,7 +1690,7 @@ impl App {
             tracker_ref,
             is_now_playing_fav,
             self.status.track_info.is_some(),
-            self.stil_entry.is_some(),
+            self.stil_entry.is_some() || !self.stil_display_text.is_empty(),
             self.window_width,
             &self.config.output_engine,
         );
@@ -1872,7 +1875,9 @@ impl App {
             .into()
         } else if self.show_help {
             ui::help_overlay()
-        } else if self.show_stil_overlay && self.stil_entry.is_some() {
+        } else if self.show_stil_overlay
+            && (self.stil_entry.is_some() || !self.stil_display_text.is_empty())
+        {
             let current_song = self
                 .status
                 .track_info
@@ -2081,6 +2086,7 @@ impl App {
     }
 
     /// Rebuild `stil_display_text` from the current `stil_entry` and active subtune.
+    /// For MUS files without STIL info, loads companion .wds lyrics if available.
     fn rebuild_stil_display(&mut self) {
         let subtune = self
             .status
@@ -2090,7 +2096,13 @@ impl App {
             .unwrap_or(1);
         self.stil_display_text = match self.stil_entry.as_ref() {
             Some(e) => e.format_for_display(subtune),
-            None => String::new(),
+            None => {
+                // Try loading companion .wds lyrics for MUS files.
+                self.playlist
+                    .current_entry()
+                    .and_then(|e| petscii::load_wds_lyrics(&e.path))
+                    .unwrap_or_default()
+            }
         };
     }
 
@@ -2116,6 +2128,12 @@ impl App {
                 songs: info.songs,
                 is_pal: info.is_pal,
                 is_rsid: info.is_rsid,
+                is_mus: info
+                    .path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("mus"))
+                    .unwrap_or(false),
                 num_sids: info.num_sids,
                 elapsed_secs: self.status.elapsed.as_secs_f32(),
                 duration_secs: current_duration,
@@ -2434,7 +2452,7 @@ impl Drop for App {
 async fn pick_files(start_dir: Option<String>) -> Vec<PathBuf> {
     let mut d = rfd::AsyncFileDialog::new()
         .set_title("Add SID files")
-        .add_filter("SID files", &["sid", "SID"]);
+        .add_filter("SID files", &["sid", "SID", "mus", "MUS"]);
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {
