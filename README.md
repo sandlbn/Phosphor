@@ -30,9 +30,8 @@ https://github.com/sandlbn/Phosphor/releases
 - **Keyboard shortcuts** — full keyboard control (see below)
 - **Mini player mode** — compact window mode for background listening
 - **Window geometry** — size and position are remembered between sessions
-- **HVSC completion tracking** — persistent log of every unique SID heard; status bar shows your progress against the full HVSC collection (e.g. *42 of 50127 HVSC SIDs heard (0.08%)*)
-
-## Keyboard Shortcuts
+- **HVSC completion tracking** — persistent log of every unique SID heard; status bar shows your progress against the full HVSC collection.
+Good luck hearing all 60,000+ — at four minutes each that's only about 167 straight days without sleep
 
 ## Keyboard Shortcuts
  
@@ -71,13 +70,15 @@ Phosphor includes a built-in web server for controlling playback from any device
 
 The web UI supports server-side search across large collections with paginated loading. Port is configurable (default 8364). The setting persists across restarts.
 
-## Requirements
+## Development Requirements
 
 - Rust toolchain (`cargo`)
 - SID files (e.g. from [HVSC](https://www.hvsc.c64.org/))
 - One or more of: USBSID-Pico device, audio output (for emulation), or Commodore Ultimate 64 / Elite / Ultimate-II+ on the network
 
-## Install
+## Install from source
+
+> **You don't need to build from source.** Prebuilt binaries for macOS, Linux, and Windows are available on the [Releases](https://github.com/sandlbn/Phosphor/releases) page. The instructions below are only needed if you want to develop or customise Phosphor.
 
 ### macOS
 
@@ -154,9 +155,9 @@ Files stored there:
 
 Phosphor can load two HVSC databases from Settings (⚙):
 
-**Songlength DB** — provides accurate per-subtune durations so tracks advance automatically at the right time. Download directly from the HVSC CDN or point to a local `Songlengths.md5` file.
+**Songlength DB** — provides  per-subtune durations so tracks advance automatically at the right time. 
 
-**STIL** — the SID Tune Information List maps each SID file to the original songs it covers, the performing artists, and curator comments. Once loaded, a ⓘ button appears next to the ♥ heart whenever info is available for the current tune. Click it to show the overlay; click the backdrop or ✕ to dismiss.
+**STIL** — the SID Tune Information List maps each SID file to the original songs it covers, the performing artists, and curator comments. Once loaded, a ⓘ button appears next to the ♥ heart whenever info is available for the current tune.
 
 For the most accurate STIL lookups, set the **HVSC root directory** in Settings to the root of your local HVSC tree (e.g. `/home/user/C64Music`). Without it Phosphor falls back to matching by filename, which works for most collections but can be ambiguous when multiple composers share a filename.
 
