@@ -184,7 +184,9 @@ struct App {
     karaoke_flag_times: Vec<f32>,
     /// Whether the MUS file contains any FLAG commands (in any voice).
     karaoke_has_flags: bool,
-    /// Current karaoke line index (advanced by real-time FLAG events from player).
+    /// Logical lyric groups parsed from WDS file (each group = 1+ display rows).
+    karaoke_groups: Vec<Vec<String>>,
+    /// Current karaoke group index (advanced by real-time FLAG events from player).
     karaoke_line: usize,
     /// Last seen flag_count from player status (to detect new FLAG events).
     last_flag_count: u32,
@@ -374,6 +376,7 @@ impl App {
             stil_display_text: String::new(),
             karaoke_flag_times: Vec::new(),
             karaoke_has_flags: false,
+            karaoke_groups: Vec::new(),
             karaoke_line: 0,
             last_flag_count: 0,
             session_loaded: false,
@@ -2049,6 +2052,7 @@ impl App {
             }
 
             self.silence_frames = 0;
+            self.karaoke_groups.clear();
             self.karaoke_line = 0;
             self.last_flag_count = 0;
             self.playlist.current = Some(idx);
@@ -2188,17 +2192,28 @@ impl App {
                             }
                         }
 
-                        // Load WDS lyrics if available.
-                        if let Some(lyrics) = petscii::load_wds_lyrics(&mus_path) {
+                        // Load WDS lyrics as logical groups.
+                        if let Some(groups) = petscii::load_wds_lyrics(&mus_path) {
+                            let total_rows: usize =
+                                groups.iter().map(|g| g.len()).sum();
                             eprintln!(
-                                "[phosphor] Karaoke: {} FLAG timestamps for {} lyric lines",
-                                self.karaoke_flag_times.len(),
-                                lyrics.lines().count(),
+                                "[phosphor] Karaoke: {} lyric groups ({} display rows)",
+                                groups.len(),
+                                total_rows,
                             );
+                            // Flatten groups into plain text for STIL overlay.
+                            let flat: String = groups
+                                .iter()
+                                .flat_map(|g| g.iter().map(String::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n");
                             if !parts.is_empty() {
-                                parts.push(String::new()); // blank separator
+                                parts.push(String::new());
                             }
-                            parts.push(lyrics);
+                            parts.push(flat);
+                            self.karaoke_groups = groups;
+                        } else {
+                            self.karaoke_groups.clear();
                         }
 
                         parts.join("\n")
@@ -2250,7 +2265,7 @@ impl App {
                 duration_secs: current_duration,
                 stil_text: self.stil_display_text.clone(),
                 stil_scroll_x: self.stil_scroll_x,
-                karaoke_text: self.stil_display_text.clone(),
+                karaoke_groups: self.karaoke_groups.clone(),
                 karaoke_line: self.karaoke_line,
             });
         } else {

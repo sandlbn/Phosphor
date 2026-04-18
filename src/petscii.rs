@@ -4,6 +4,7 @@ use std::path::Path;
 
 /// Decode a PETSCII byte buffer (Commodore 64 character set) into a UTF-8 string.
 /// Strips control codes, converts shifted uppercase, preserves verse structure.
+#[allow(dead_code)]
 pub fn petscii_to_string(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len());
     for &b in data {
@@ -377,9 +378,61 @@ pub fn mus_has_flags(data: &[u8]) -> bool {
     false
 }
 
+/// Parse WDS lyrics into logical lyric groups.
+///
+/// WDS files store **screen rows**, not logical lyrics. A single lyric phrase
+/// may span multiple rows due to line wrapping / indentation. Continuation
+/// rows start with leading spaces (after stripping PETSCII control codes like
+/// $92 reverse-off). Each group is one or more screen rows that belong together.
+///
+/// Returns `Vec<Vec<String>>` — each inner Vec is one logical lyric unit
+/// containing 1+ trimmed display rows.
+pub fn petscii_to_wds_groups(data: &[u8]) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+
+    // Split raw bytes on 0x0D (carriage return) to get PETSCII rows.
+    for row_bytes in data.split(|&b| b == 0x0D) {
+        // Decode PETSCII → UTF-8.
+        let mut decoded = String::new();
+        for &b in row_bytes {
+            match b {
+                0x20..=0x5F => decoded.push(b as char),
+                0xC1..=0xDA => decoded.push((b - 0x80) as char),
+                _ => {}
+            }
+        }
+
+        let trimmed = decoded.trim().to_string();
+
+        // Blank row → keep as its own group (acts as a timing pause:
+        // a FLAG that lands on it shows nothing, just like the original player).
+        // Do NOT collapse consecutive blanks — each blank WDS row consumes
+        // one FLAG in the original SIDplayer, so we must preserve that 1:1 mapping.
+        if trimmed.is_empty() {
+            groups.push(vec![String::new()]);
+            continue;
+        }
+
+        // Continuation row: raw PETSCII starts with $92 $20 (reverse-off + space).
+        // This is the standard WDS indentation for wrapped lyrics lines.
+        // Centered text uses other control codes before spaces, so won't match.
+        let is_continuation = row_bytes.len() >= 2
+            && row_bytes[0] == 0x92
+            && row_bytes[1] == 0x20;
+
+        if is_continuation && !groups.is_empty() {
+            groups.last_mut().unwrap().push(trimmed);
+        } else {
+            groups.push(vec![trimmed]);
+        }
+    }
+
+    groups
+}
+
 /// Try to load a companion .wds lyrics file for a MUS path.
-/// Returns the decoded lyrics string, or None if no .wds file exists.
-pub fn load_wds_lyrics(mus_path: &Path) -> Option<String> {
+/// Returns logical lyric groups, or None if no .wds file exists.
+pub fn load_wds_lyrics(mus_path: &Path) -> Option<Vec<Vec<String>>> {
     let ext = mus_path.extension()?.to_str()?;
     if !ext.eq_ignore_ascii_case("mus") {
         return None;
@@ -388,7 +441,11 @@ pub fn load_wds_lyrics(mus_path: &Path) -> Option<String> {
         let wds_path = mus_path.with_extension(wds_ext);
         if let Ok(data) = std::fs::read(&wds_path) {
             eprintln!("[phosphor] WDS lyrics loaded: {}", wds_path.display());
-            return Some(petscii_to_string(&data));
+            let groups = petscii_to_wds_groups(&data);
+            if groups.is_empty() {
+                continue;
+            }
+            return Some(groups);
         }
     }
     None

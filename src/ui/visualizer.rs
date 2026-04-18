@@ -114,9 +114,9 @@ pub struct ExpandedInfo {
     pub stil_text: String,
     /// Horizontal scroll offset for the STIL demoscene ticker (advances each tick).
     pub stil_scroll_x: f32,
-    /// Full karaoke lyrics text (from WDS file, newline-separated lines).
-    pub karaoke_text: String,
-    /// Current karaoke line index from real-time FLAG events.
+    /// Logical lyric groups from WDS file (each group = 1+ display rows).
+    pub karaoke_groups: Vec<Vec<String>>,
+    /// Current karaoke group index from real-time FLAG events.
     pub karaoke_line: usize,
 }
 
@@ -1557,58 +1557,72 @@ fn draw_karaoke_expanded(frame: &mut Frame, bounds: Rectangle, info: Option<&Exp
     frame.fill_rectangle(Point::new(0.0, lyrics_top - 2.0), Size::new(w, 1.0), div);
     frame.fill_rectangle(Point::new(0.0, lyrics_bot + 2.0), Size::new(w, 1.0), div);
 
-    let lines: Vec<&str> = info.karaoke_text.lines().collect();
-    if lines.is_empty() {
+    let groups = &info.karaoke_groups;
+    if groups.is_empty() {
         return;
     }
-    let total = lines.len();
+    let total_groups = groups.len();
+    let current_group = info.karaoke_line.min(total_groups.saturating_sub(1));
 
-    // Real-time karaoke sync: 1 FLAG = 1 WDS line.
-    // Songs with fewer FLAGs than WDS lines only show partial lyrics.
-    let current_idx = info.karaoke_line.min(total.saturating_sub(1));
+    // Build flat display list: (group_index, row_text).
+    let display_rows: Vec<(usize, &str)> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(gi, group)| group.iter().map(move |line| (gi, line.as_str())))
+        .collect();
+
+    if display_rows.is_empty() {
+        return;
+    }
 
     // Rendering params
     let current_scale = 3_u32;
     let other_scale = 2_u32;
     let current_ch = (5 * current_scale) as f32;
-    let other_ch = (5 * other_scale) as f32;
     let line_spacing = 14.0_f32;
     let line_step = current_ch + line_spacing;
 
-    // Teleprompter-style scrolling:
-    // All lines are laid out top-to-bottom from lyrics_top.
-    // We scroll the viewport only when the current line would fall
-    // below the center of the lyrics area — so lyrics always START
-    // at the top and only begin scrolling once enough lines have passed.
-    let center_threshold = lyrics_h * 0.45;
-    let current_line_top_y = current_idx as f32 * line_step;
-    let scroll_offset = (current_line_top_y - center_threshold).max(0.0);
+    // Find the flat row index of the first row in the current group.
+    let current_first_row = display_rows
+        .iter()
+        .position(|(gi, _)| *gi == current_group)
+        .unwrap_or(0);
 
-    // Render all lines that fall within the visible lyrics area.
-    for idx in 0..total {
-        let line = lines[idx].trim();
-        if line.is_empty() {
+    // Teleprompter-style scrolling: start at top, scroll only when
+    // the current group would fall below the center of the lyrics area.
+    let center_threshold = lyrics_h * 0.45;
+    let current_row_y = current_first_row as f32 * line_step;
+    let scroll_offset = (current_row_y - center_threshold).max(0.0);
+
+    // Render all rows that fall within the visible lyrics area.
+    for (flat_idx, &(group_idx, line)) in display_rows.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        let delta = idx as i32 - current_idx as i32;
-        let in_active = delta.abs() <= 1;
-        let scale = if in_active { current_scale } else { other_scale };
-        let ch = if in_active { current_ch } else { other_ch };
+        let group_delta = group_idx as i32 - current_group as i32;
+        let in_active = group_delta.abs() <= 1;
+        let scale = if group_delta == 0 {
+            current_scale
+        } else {
+            other_scale
+        };
+        let ch = (5 * scale) as f32;
         let cw = (3 * scale + scale) as f32;
 
         // Y position: top-aligned with scroll offset
-        let base_y = lyrics_top + idx as f32 * line_step - scroll_offset;
+        let base_y = lyrics_top + flat_idx as f32 * line_step - scroll_offset;
 
         // Clip to lyrics area
         if base_y + ch < lyrics_top || base_y > lyrics_bot {
             continue;
         }
 
-        // Color and alpha based on distance from current
-        let dist = delta.unsigned_abs() as f32;
-        let color = if delta == 0 {
-            // Current line — bright green
+        // Color based on group distance (all rows in a group share the same color)
+        let dist = group_delta.unsigned_abs() as f32;
+        let color = if group_delta == 0 {
+            // Current group — bright green
             Color {
                 r: 0.40,
                 g: 0.95,
@@ -1616,15 +1630,15 @@ fn draw_karaoke_expanded(frame: &mut Frame, bounds: Rectangle, info: Option<&Exp
                 a: 1.0,
             }
         } else if in_active {
-            // Adjacent lines — slightly dimmed green
+            // Adjacent groups — slightly dimmed green
             Color {
                 r: 0.35,
                 g: 0.80,
                 b: 0.60,
                 a: 0.75,
             }
-        } else if delta < 0 {
-            // Past lines — dimmed gray, stay readable
+        } else if group_delta < 0 {
+            // Past groups — dimmed gray, stay readable
             let a = (0.60 - (dist - 1.0) * 0.03).max(0.30);
             Color {
                 r: 0.50,
@@ -1633,7 +1647,7 @@ fn draw_karaoke_expanded(frame: &mut Frame, bounds: Rectangle, info: Option<&Exp
                 a,
             }
         } else {
-            // Future lines — subtle blue, stay readable
+            // Future groups — subtle blue, stay readable
             let a = (0.55 - (dist - 1.0) * 0.03).max(0.25);
             Color {
                 r: 0.35,
@@ -1644,7 +1658,7 @@ fn draw_karaoke_expanded(frame: &mut Frame, bounds: Rectangle, info: Option<&Exp
         };
 
         let max_chars = ((w - 80.0) / cw).floor() as usize;
-        let chars: Vec<char> = line.chars().take(max_chars).collect();
+        let chars: Vec<char> = trimmed.chars().take(max_chars).collect();
         let tw = chars.len() as f32 * cw;
         draw_pixel_text(
             frame,
