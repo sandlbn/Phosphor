@@ -43,7 +43,8 @@ Good luck hearing all 60,000+ — at four minutes each that's only about 167 str
 | `↑` | Select previous track in playlist |
 | `↓` | Select next track in playlist |
 | `F` | Toggle full-screen visualiser |
-| `V` | Cycle visualiser mode (Bars → Scope → Tracker) |
+| `V` | Cycle visualiser mode (Bars → Scope → Tracker → Karaoke) |
+| `K` | Toggle karaoke lyrics (MUS files with .wds) |
 | `H` | Toggle favourite for currently playing track |
 | `?` | Show keyboard shortcuts & about |
 | `Delete` | Remove selected track |

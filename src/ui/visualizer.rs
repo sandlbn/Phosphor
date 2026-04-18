@@ -67,15 +67,18 @@ pub enum VisMode {
     Scope,
     /// SIDdump-style tracker view (note / waveform / ADSR per voice).
     Tracker,
+    /// Fullscreen karaoke lyrics display (MUS + WDS files).
+    Karaoke,
 }
 
 impl VisMode {
-    /// Cycle through the three modes: Bars → Scope → Tracker → Bars…
+    /// Cycle through modes: Bars → Scope → Tracker → Karaoke → Bars…
     pub fn toggle(self) -> Self {
         match self {
             Self::Bars => Self::Scope,
             Self::Scope => Self::Tracker,
-            Self::Tracker => Self::Bars,
+            Self::Tracker => Self::Karaoke,
+            Self::Karaoke => Self::Bars,
         }
     }
 }
@@ -111,6 +114,10 @@ pub struct ExpandedInfo {
     pub stil_text: String,
     /// Horizontal scroll offset for the STIL demoscene ticker (advances each tick).
     pub stil_scroll_x: f32,
+    /// Full karaoke lyrics text (from WDS file, newline-separated lines).
+    pub karaoke_text: String,
+    /// Current karaoke line index from real-time FLAG events.
+    pub karaoke_line: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,19 +394,26 @@ impl<'v, 'i> canvas::Program<super::Message> for VisProg<'v, 'i> {
     ) -> Vec<Geometry> {
         let geom = self.cache.draw(renderer, bounds.size(), |frame| {
             if self.expanded {
-                if self.vis.mode == VisMode::Tracker {
-                    if let Some(ref tr) = self.tracker {
-                        draw_tracker_expanded(tr, frame, bounds, self.info);
-                    } else {
+                match self.vis.mode {
+                    VisMode::Tracker => {
+                        if let Some(ref tr) = self.tracker {
+                            draw_tracker_expanded(tr, frame, bounds, self.info);
+                        } else {
+                            draw_expanded(self.vis, frame, bounds, self.info);
+                        }
+                    }
+                    VisMode::Karaoke => {
+                        draw_karaoke_expanded(frame, bounds, self.info);
+                    }
+                    _ => {
                         draw_expanded(self.vis, frame, bounds, self.info);
                     }
-                } else {
-                    draw_expanded(self.vis, frame, bounds, self.info);
                 }
             } else {
                 match self.vis.mode {
                     VisMode::Bars => draw_bars(self.vis, frame, bounds),
                     VisMode::Scope => draw_scope(self.vis, frame, bounds),
+                    VisMode::Karaoke => draw_bars(self.vis, frame, bounds), // compact fallback
                     VisMode::Tracker => {
                         if let Some(ref tr) = self.tracker {
                             super::sid_panel::paint_tracker_compact(
@@ -897,7 +911,7 @@ fn draw_expanded(
     match vis.mode {
         VisMode::Bars => draw_bars_expanded(vis, frame, vis_bounds),
         VisMode::Scope => draw_scope_expanded(vis, frame, vis_bounds),
-        VisMode::Tracker => {} // handled by draw_tracker_expanded before this is called
+        VisMode::Tracker | VisMode::Karaoke => {} // handled separately
     }
 }
 
@@ -1431,6 +1445,280 @@ pub(crate) fn hue_to_rgb(h: f32, s: f32, v: f32) -> Color {
         _ => (v, p, q),
     };
     Color { r, g, b, a: 1.0 }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Karaoke expanded view
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn draw_karaoke_expanded(frame: &mut Frame, bounds: Rectangle, info: Option<&ExpandedInfo>) {
+    let w = bounds.width;
+    let h = bounds.height;
+
+    // ── Background (CRT) ─────────────────────────────────────────────────────
+    frame.fill_rectangle(
+        Point::ORIGIN,
+        Size::new(w, h),
+        Color::from_rgb(0.03, 0.03, 0.05),
+    );
+    let mut sy = 0.0_f32;
+    while sy < h {
+        frame.fill_rectangle(
+            Point::new(0.0, sy),
+            Size::new(w, 1.0),
+            Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.12,
+            },
+        );
+        sy += 4.0;
+    }
+    // Vignette
+    for ring in 0..6_u8 {
+        let t = ring as f32 / 6.0;
+        let alpha = 0.20 * (1.0 - t) * (1.0 - t);
+        let pad = t * (w.min(h) * 0.42);
+        let v = Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: alpha,
+        };
+        frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(w, pad), v);
+        frame.fill_rectangle(Point::new(0.0, h - pad), Size::new(w, pad), v);
+        frame.fill_rectangle(Point::new(0.0, pad), Size::new(pad, h - 2.0 * pad), v);
+        frame.fill_rectangle(Point::new(w - pad, pad), Size::new(pad, h - 2.0 * pad), v);
+    }
+
+    let info = match info {
+        Some(i) => i,
+        None => return,
+    };
+
+    // ── Title (top) ──────────────────────────────────────────────────────────
+    let title_y = 30.0_f32;
+    let ns = 3_u32;
+    let ncw = (3 * ns + ns) as f32;
+    let nch = (5 * ns) as f32;
+    let nmax = ((w - 80.0) / ncw).floor() as usize;
+    let nch_vec: Vec<char> = info.name.chars().take(nmax).collect();
+    let ntw = nch_vec.len() as f32 * ncw;
+    draw_pixel_text(
+        frame,
+        &nch_vec,
+        ((w - ntw) / 2.0).max(40.0),
+        title_y,
+        ns,
+        Color {
+            r: 0.35,
+            g: 0.90,
+            b: 0.60,
+            a: 0.95,
+        },
+    );
+
+    // Author
+    let aus = 2_u32;
+    let aucw = (3 * aus + aus) as f32;
+    let aumax = ((w - 80.0) / aucw).floor() as usize;
+    let au_vec: Vec<char> = info.author.chars().take(aumax).collect();
+    let autw = au_vec.len() as f32 * aucw;
+    draw_pixel_text(
+        frame,
+        &au_vec,
+        ((w - autw) / 2.0).max(40.0),
+        title_y + nch + 10.0,
+        aus,
+        Color {
+            r: 0.55,
+            g: 0.65,
+            b: 0.90,
+            a: 0.80,
+        },
+    );
+
+    // ── Lyrics area ──────────────────────────────────────────────────────────
+    let lyrics_top = title_y + nch + 10.0 + (5 * aus) as f32 + 30.0;
+    let lyrics_bot = h - 50.0;
+    let lyrics_h = lyrics_bot - lyrics_top;
+    if lyrics_h < 40.0 {
+        return;
+    }
+
+    // Divider lines
+    let div = Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 0.06,
+    };
+    frame.fill_rectangle(Point::new(0.0, lyrics_top - 2.0), Size::new(w, 1.0), div);
+    frame.fill_rectangle(Point::new(0.0, lyrics_bot + 2.0), Size::new(w, 1.0), div);
+
+    let lines: Vec<&str> = info.karaoke_text.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+    let total = lines.len();
+
+    // Real-time karaoke sync: 1 FLAG = 1 WDS line.
+    // Songs with fewer FLAGs than WDS lines only show partial lyrics.
+    let current_idx = info.karaoke_line.min(total.saturating_sub(1));
+
+    // Rendering params
+    let current_scale = 3_u32;
+    let other_scale = 2_u32;
+    let current_ch = (5 * current_scale) as f32;
+    let other_ch = (5 * other_scale) as f32;
+    let line_spacing = 14.0_f32;
+    let line_step = current_ch + line_spacing;
+
+    // Teleprompter-style scrolling:
+    // All lines are laid out top-to-bottom from lyrics_top.
+    // We scroll the viewport only when the current line would fall
+    // below the center of the lyrics area — so lyrics always START
+    // at the top and only begin scrolling once enough lines have passed.
+    let center_threshold = lyrics_h * 0.45;
+    let current_line_top_y = current_idx as f32 * line_step;
+    let scroll_offset = (current_line_top_y - center_threshold).max(0.0);
+
+    // Render all lines that fall within the visible lyrics area.
+    for idx in 0..total {
+        let line = lines[idx].trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let delta = idx as i32 - current_idx as i32;
+        let in_active = delta.abs() <= 1;
+        let scale = if in_active { current_scale } else { other_scale };
+        let ch = if in_active { current_ch } else { other_ch };
+        let cw = (3 * scale + scale) as f32;
+
+        // Y position: top-aligned with scroll offset
+        let base_y = lyrics_top + idx as f32 * line_step - scroll_offset;
+
+        // Clip to lyrics area
+        if base_y + ch < lyrics_top || base_y > lyrics_bot {
+            continue;
+        }
+
+        // Color and alpha based on distance from current
+        let dist = delta.unsigned_abs() as f32;
+        let color = if delta == 0 {
+            // Current line — bright green
+            Color {
+                r: 0.40,
+                g: 0.95,
+                b: 0.70,
+                a: 1.0,
+            }
+        } else if in_active {
+            // Adjacent lines — slightly dimmed green
+            Color {
+                r: 0.35,
+                g: 0.80,
+                b: 0.60,
+                a: 0.75,
+            }
+        } else if delta < 0 {
+            // Past lines — dimmed gray, stay readable
+            let a = (0.60 - (dist - 1.0) * 0.03).max(0.30);
+            Color {
+                r: 0.50,
+                g: 0.55,
+                b: 0.65,
+                a,
+            }
+        } else {
+            // Future lines — subtle blue, stay readable
+            let a = (0.55 - (dist - 1.0) * 0.03).max(0.25);
+            Color {
+                r: 0.35,
+                g: 0.55,
+                b: 0.80,
+                a,
+            }
+        };
+
+        let max_chars = ((w - 80.0) / cw).floor() as usize;
+        let chars: Vec<char> = line.chars().take(max_chars).collect();
+        let tw = chars.len() as f32 * cw;
+        draw_pixel_text(
+            frame,
+            &chars,
+            ((w - tw) / 2.0).max(40.0),
+            base_y,
+            scale,
+            color,
+        );
+    }
+
+    // ── Progress bar (bottom) ────────────────────────────────────────────────
+    if let Some(dur) = info.duration_secs {
+        if dur > 0.0 {
+            let bar_y = lyrics_bot + 16.0;
+            let bar_w = w * 0.6;
+            let bar_x = (w - bar_w) / 2.0;
+            // Track
+            frame.fill_rectangle(
+                Point::new(bar_x, bar_y),
+                Size::new(bar_w, 3.0),
+                Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.10,
+                },
+            );
+            // Fill
+            frame.fill_rectangle(
+                Point::new(bar_x, bar_y),
+                Size::new(bar_w * (info.elapsed_secs / dur).clamp(0.0, 1.0), 3.0),
+                Color {
+                    r: 0.35,
+                    g: 0.90,
+                    b: 0.60,
+                    a: 0.70,
+                },
+            );
+            // Time labels
+            let ts = 1_u32;
+            let tcw = (3 * ts + ts) as f32;
+            let elapsed_str = format_time(info.elapsed_secs);
+            let dur_str = format_time(dur);
+            let e_chars: Vec<char> = elapsed_str.chars().collect();
+            let d_chars: Vec<char> = dur_str.chars().collect();
+            draw_pixel_text(
+                frame,
+                &e_chars,
+                bar_x - e_chars.len() as f32 * tcw - 8.0,
+                bar_y - 1.0,
+                ts,
+                Color {
+                    r: 0.6,
+                    g: 0.6,
+                    b: 0.7,
+                    a: 0.7,
+                },
+            );
+            draw_pixel_text(
+                frame,
+                &d_chars,
+                bar_x + bar_w + 8.0,
+                bar_y - 1.0,
+                ts,
+                Color {
+                    r: 0.6,
+                    g: 0.6,
+                    b: 0.7,
+                    a: 0.7,
+                },
+            );
+        }
+    }
 }
 
 pub(crate) fn draw_pixel_text(

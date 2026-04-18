@@ -51,16 +51,18 @@ pub struct LibSidPlayFp {
     pub num_sids: usize,
     /// CIA1 Timer A latch.
     pub cia1_timer_a: u16,
+    /// MUS comment strings (embedded credits — title, author, etc.).
+    #[allow(dead_code)]
+    pub comments: Vec<String>,
     /// Diagnostic counter for periodic logging.
     frame_diag: u32,
 }
 
 impl LibSidPlayFp {
-    /// Create a new player and load a SID file.
-    pub fn new(sid_data: &[u8], subtune: u16) -> Result<Self, String> {
+    /// Set up a new player with ROMs loaded.
+    fn setup_player() -> Result<Player, String> {
         let mut player = Player::new()?;
 
-        // Try to load ROMs.
         let dirs = rom_search_dirs();
         let kernal = find_rom(&dirs, KERNAL_NAMES);
         let basic = find_rom(&dirs, BASIC_NAMES);
@@ -72,7 +74,6 @@ impl LibSidPlayFp {
             eprintln!("[libsidplayfp] ROM files not found — using built-in stubs");
         }
 
-        // Set ROMs (libsidplayfp accepts raw pointers, None = built-in stubs).
         unsafe {
             let k = kernal.as_ref().and_then(|d| {
                 if d.len() >= 8192 {
@@ -98,27 +99,53 @@ impl LibSidPlayFp {
             player.set_roms(k, b, c);
         }
 
-        // Load the tune.
-        player.load(sid_data, subtune)?;
+        Ok(player)
+    }
 
+    /// Finalize a player after loading a tune.
+    fn finalize(player: Player) -> Self {
         let num_sids = player.num_sids();
         let cia1_timer_a = player.cia1_timer_a();
+        let comments = player.comments();
 
         eprintln!(
-            "[libsidplayfp] Loaded: {} SIDs, {}, CIA1 Timer A latch={}",
+            "[libsidplayfp] Loaded: {} SIDs, {}, CIA1 Timer A latch={}, {} comment lines",
             num_sids,
             if player.is_pal() { "PAL" } else { "NTSC" },
             cia1_timer_a,
+            comments.len(),
         );
+        for (i, c) in comments.iter().enumerate() {
+            if !c.is_empty() {
+                eprintln!("[libsidplayfp]   comment[{}]: {}", i, c);
+            }
+        }
 
-        Ok(Self {
+        Self {
             player,
             sid_writes: Vec::with_capacity(512),
             sid_shadow: [0u8; 128],
             num_sids,
             cia1_timer_a,
+            comments,
             frame_diag: 0,
-        })
+        }
+    }
+
+    /// Create a new player and load a SID file from raw bytes.
+    pub fn new(sid_data: &[u8], subtune: u16) -> Result<Self, String> {
+        let mut player = Self::setup_player()?;
+        player.load(sid_data, subtune)?;
+        Ok(Self::finalize(player))
+    }
+
+    /// Create a new player and load a SID/MUS file from a file path.
+    /// For MUS files, libsidplayfp automatically finds companion .str files
+    /// for stereo playback.
+    pub fn new_from_file(path: &std::path::Path, subtune: u16) -> Result<Self, String> {
+        let mut player = Self::setup_player()?;
+        player.load_file(path, subtune)?;
+        Ok(Self::finalize(player))
     }
 
     /// Run one frame of emulation (cycles CPU cycles).
@@ -163,6 +190,16 @@ impl LibSidPlayFp {
         self.frame_diag = (self.frame_diag + 1) % 250;
 
         actual_cycles
+    }
+
+    /// Read a byte from emulated C64 RAM.
+    pub fn read_mem(&self, addr: u16) -> u8 {
+        self.player.read_mem(addr)
+    }
+
+    /// Write a byte to emulated C64 RAM.
+    pub fn write_mem(&mut self, addr: u16, val: u8) {
+        self.player.write_mem(addr, val);
     }
 
     /// Clear writes and reset shadow.

@@ -209,6 +209,8 @@ pub enum Message {
     ToggleMiniPlayer,
     /// Toggle fullscreen mode (triggered by double-clicking the visualiser).
     ToggleVisFull,
+    /// Toggle karaoke fullscreen mode (K key — MUS files with WDS lyrics).
+    ToggleKaraoke,
 
     // Panels
     /// Toggle the SID register info panel (mutually exclusive with settings
@@ -1346,6 +1348,7 @@ fn playlist_entry_row<'a>(
     let row_content = playlist_row_content(
         format!("{display_pos}"),
         song_title,
+        entry.has_wds,
         entry.author.clone(),
         entry.released.clone(),
         entry.format_duration(),
@@ -1388,6 +1391,7 @@ fn playlist_entry_row<'a>(
 fn playlist_row_content<'a>(
     num: String,
     title: String,
+    has_wds: bool,
     author: String,
     released: String,
     time: String,
@@ -1408,15 +1412,30 @@ fn playlist_row_content<'a>(
     };
     let indicator = if is_current { "▶ " } else { "  " };
 
+    let title_cell: Element<'a, Message> = if has_wds {
+        row![
+            text(title).size(size).color(color),
+            text(" (Karaoke)")
+                .size(10)
+                .color(Color::from_rgb(0.30, 0.75, 0.45)),
+        ]
+        .spacing(4)
+        .width(Length::FillPortion(4))
+        .into()
+    } else {
+        text(title)
+            .size(size)
+            .color(color)
+            .width(Length::FillPortion(4))
+            .into()
+    };
+
     row![
         text(format!("{indicator}{num:>3}"))
             .size(size)
             .color(color)
             .width(Length::Fixed(50.0)),
-        text(title)
-            .size(size)
-            .color(color)
-            .width(Length::FillPortion(4)),
+        title_cell,
         text(author)
             .size(size)
             .color(color)
@@ -1891,6 +1910,40 @@ fn engine_btn_style(is_active: bool, st: button::Status) -> button::Style {
 //  STIL info overlay
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Fullscreen karaoke overlay for MUS files without FLAG sync.
+/// Shows lyrics as static scrollable text with CRT-style background.
+#[allow(dead_code)]
+pub fn karaoke_static_overlay(lyrics: &str) -> Element<'_, Message> {
+    use iced::widget::scrollable;
+
+    let body = scrollable(
+        container(
+            text(lyrics)
+                .size(18)
+                .font(iced::Font::MONOSPACE)
+                .color(Color::from_rgb(0.35, 0.90, 0.60)),
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([20, 60])),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let panel = container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(
+                0.04, 0.04, 0.06, 0.97,
+            ))),
+            ..Default::default()
+        });
+
+    mouse_area(panel)
+        .on_press(Message::Noop) // prevent click-through
+        .into()
+}
+
 /// Build the STIL info overlay panel.  Rendered via `iced::widget::stack!`
 /// on top of the normal UI — clicking outside or the × button dismisses it.
 pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Message> {
@@ -1916,10 +1969,13 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
         container(
             text(text_content)
                 .size(12)
+                .font(iced::Font::MONOSPACE)
                 .color(Color::from_rgb(0.80, 0.83, 0.88)),
         )
-        .padding(Padding::from([0, 4])),
+        .width(Length::Fill)
+        .padding(Padding::from([0, 40])),
     )
+    .width(Length::Fill)
     .height(Length::Fill);
 
     let panel = container(
@@ -1927,8 +1983,8 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
             .spacing(8)
             .padding(Padding::from([12, 16])),
     )
-    .width(Length::Fixed(440.0))
-    .height(Length::Fixed(340.0))
+    .max_width(700)
+    .height(Length::FillPortion(7)) // ~70% of available space
     .style(|_theme: &Theme| container::Style {
         background: Some(iced::Background::Color(Color::from_rgba(
             0.07, 0.09, 0.12, 0.97,
@@ -1958,7 +2014,6 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
     .width(Length::Fill)
     .height(Length::Fill);
 
-    // Stack: backdrop first, then panel centred on top.
     iced::widget::stack![
         backdrop,
         container(panel)
@@ -2107,7 +2162,11 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
         ("← →", "Previous / Next track"),
         ("↑ ↓", "Select track in playlist"),
         ("F", "Toggle full-screen visualiser"),
-        ("V", "Cycle visualiser mode (Bars / Scope / Tracker)"),
+        (
+            "V",
+            "Cycle visualiser mode (Bars / Scope / Tracker / Karaoke)",
+        ),
+        ("K", "Toggle karaoke lyrics (MUS files)"),
         ("H", "Toggle favourite for current track"),
         ("M", "Toggle mini player"),
         ("Ctrl+F", "Focus search"),

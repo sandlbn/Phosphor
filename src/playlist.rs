@@ -30,6 +30,8 @@ pub struct PlaylistEntry {
     pub md5: Option<String>,
     /// Duration from Songlength DB, if available (seconds).
     pub duration_secs: Option<u32>,
+    /// True if a companion .wds lyrics file exists (karaoke available).
+    pub has_wds: bool,
 }
 
 impl PlaylistEntry {
@@ -43,7 +45,7 @@ impl PlaylistEntry {
             .unwrap_or(false);
         let sid = match sid_file::load_sid(&data) {
             Ok(s) => s,
-            Err(_) if is_mus => sid_file::load_mus_stub(&data),
+            Err(_) if is_mus => sid_file::load_mus_stub(&data, Some(path)),
             Err(e) => return Err(e),
         };
         let h = &sid.header;
@@ -67,7 +69,14 @@ impl PlaylistEntry {
             num_sids: h.num_sids(),
             is_rsid: h.is_rsid,
             md5: Some(md5),
-            duration_secs: None,
+            duration_secs: None, // MUS duration handled by silence detection
+            has_wds: if is_mus {
+                let wds = path.with_extension("wds");
+                let wds_upper = path.with_extension("WDS");
+                wds.exists() || wds_upper.exists()
+            } else {
+                false
+            },
         })
     }
 
@@ -103,6 +112,14 @@ impl PlaylistEntry {
             is_rsid: is_rsid.unwrap_or(false),
             md5: md5.map(|s| s.to_string()),
             duration_secs,
+            has_wds: {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext.eq_ignore_ascii_case("mus") {
+                    path.with_extension("wds").exists() || path.with_extension("WDS").exists()
+                } else {
+                    false
+                }
+            },
         })
     }
 

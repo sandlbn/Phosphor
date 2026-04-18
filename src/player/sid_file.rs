@@ -101,7 +101,29 @@ pub fn is_sid_extension(ext: &str) -> bool {
 /// Build a minimal `SidFile` for a MUS file so the rest of the pipeline
 /// (playlist metadata, MD5, libsidplayfp hand-off) has something to work with.
 /// The built-in CPU engine cannot play MUS — only libsidplayfp can.
-pub fn load_mus_stub(data: &[u8]) -> SidFile {
+///
+/// If `mus_path` is provided, checks for a companion `.str` file and sets
+/// `extra_sid_addrs[0]` to 0xD500 (stereo SID) when found.
+///
+/// Extracts embedded PETSCII credit lines for title/author metadata.
+pub fn load_mus_stub(data: &[u8], mus_path: Option<&std::path::Path>) -> SidFile {
+    // Check for companion .str file → stereo.
+    let has_str = mus_path
+        .map(|p| p.with_extension("str").exists() || p.with_extension("STR").exists())
+        .unwrap_or(false);
+
+    // Use filename as title and parent directory as author.
+    // PETSCII art credits are too garbled for reliable metadata extraction.
+    let name = mus_path
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().replace('_', " "))
+        .unwrap_or_default();
+    let author = mus_path
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().replace('_', " "))
+        .unwrap_or_default();
+
     SidFile {
         header: SidHeader {
             magic: "MUS".into(),
@@ -113,14 +135,14 @@ pub fn load_mus_stub(data: &[u8]) -> SidFile {
             songs: 1,
             start_song: 1,
             speed: 0,
-            name: String::new(),
-            author: String::new(),
+            name,
+            author,
             released: String::new(),
             is_pal: true,
             is_rsid: false,
             is_basic: false,
             sid_model: 0,
-            extra_sid_addrs: [0; 2],
+            extra_sid_addrs: if has_str { [0xD500, 0] } else { [0; 2] },
         },
         load_address: 0,
         payload: Vec::new(),

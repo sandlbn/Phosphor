@@ -3702,7 +3702,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phosphor"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -4684,9 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "sidplayfp-sys"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cd5fb81b48e6e8fa0124cc8e297b3c98dd014e978121f58d3cfb7f30eb45964"
+version = "0.1.4"
 dependencies = [
  "cc",
 ]
