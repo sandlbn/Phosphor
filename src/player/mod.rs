@@ -325,38 +325,46 @@ fn player_loop(
                                 let actual = fp.run_frame(ctx.cycles_per_frame);
 
                                 // Poll MUS FLAG_STATUS ($E001) for karaoke sync.
-                                // The SIDplayer writes the FLAG parameter here;
-                                // we read it, advance the karaoke line, and clear it
-                                // — exactly as the original C64 stereo player does.
-                                // Skip the first 10 frames: the SIDplayer init routine
-                                // clears work memory (including FLAG_STATUS) which can
-                                // produce false FLAG detections before music starts.
-                                const FLAG_STATUS_ADDR: u16 = 0xE001;
-                                let flag_val = if ctx.frame_count >= 10 {
-                                    fp.read_mem(FLAG_STATUS_ADDR)
-                                } else {
-                                    // Clear any init-phase writes silently.
-                                    fp.write_mem(FLAG_STATUS_ADDR, 0);
-                                    0
-                                };
-                                if flag_val != 0 {
-                                    ctx.flag_count += 1;
-                                    let elapsed = ctx.elapsed.as_secs_f32();
-                                    eprintln!(
-                                        "[karaoke] FLAG #{:3} val={} frame={:5} elapsed={:.1}s",
-                                        ctx.flag_count, flag_val, ctx.frame_count, elapsed,
-                                    );
-                                    fp.write_mem(FLAG_STATUS_ADDR, 0);
+                                // Only for MUS files — $E001 is SIDplayer work memory.
+                                // Reading/writing this address on non-MUS tunes corrupts
+                                // their memory and can cause hangs.
+                                if ctx.is_mus {
+                                    const FLAG_STATUS_ADDR: u16 = 0xE001;
+                                    let flag_val = if ctx.frame_count >= 10 {
+                                        fp.read_mem(FLAG_STATUS_ADDR)
+                                    } else {
+                                        fp.write_mem(FLAG_STATUS_ADDR, 0);
+                                        0
+                                    };
+                                    if flag_val != 0 {
+                                        ctx.flag_count += 1;
+                                        let elapsed = ctx.elapsed.as_secs_f32();
+                                        eprintln!(
+                                            "[karaoke] FLAG #{:3} val={} frame={:5} elapsed={:.1}s",
+                                            ctx.flag_count, flag_val, ctx.frame_count, elapsed,
+                                        );
+                                        fp.write_mem(FLAG_STATUS_ADDR, 0);
+                                    }
                                 }
 
                                 if let Some(ref mut br) = bridge {
                                     br.set_cycles_per_frame(actual);
+                                    let t0 = Instant::now();
                                     send_sid_writes(
                                         br.as_mut(),
                                         &fp.sid_writes,
                                         ctx.mirror_mono,
                                         actual,
                                     );
+                                    let dt = t0.elapsed();
+                                    if dt.as_millis() > 10 {
+                                        eprintln!(
+                                            "[player] SLOW send_sid_writes: {} writes in {:.1}ms (frame {})",
+                                            fp.sid_writes.len(),
+                                            dt.as_secs_f64() * 1000.0,
+                                            ctx.frame_count,
+                                        );
+                                    }
                                 }
                             }
                             PlayEngine::Native { shadow } => {
@@ -384,7 +392,16 @@ fn player_loop(
                         // writes for this frame (no-op for Native engine).
                         if !ctx.is_native() {
                             if let Some(ref mut br) = bridge {
+                                let t0 = Instant::now();
                                 br.flush();
+                                let dt = t0.elapsed();
+                                if dt.as_millis() > 10 {
+                                    eprintln!(
+                                        "[player] SLOW flush: {:.1}ms (frame {})",
+                                        dt.as_secs_f64() * 1000.0,
+                                        ctx.frame_count,
+                                    );
+                                }
                             }
                         }
 
@@ -677,6 +694,7 @@ fn handle_cmd(
                     track_info,
                     frame_count: 0,
                     next_frame: Instant::now(),
+                    is_mus: false,
                     flag_count: 0,
                     audio_port,
                 });
@@ -870,6 +888,7 @@ fn handle_cmd(
                                             track_info,
                                             frame_count: 0,
                                             next_frame: Instant::now(),
+                                            is_mus: false,
                                             flag_count: 0,
                                             audio_port: saved_audio_port,
                                         });
@@ -975,6 +994,8 @@ struct PlayContext {
     track_info: TrackInfo,
     frame_count: u32,
     next_frame: Instant, // absolute deadline for next frame
+    /// True when playing a MUS file (enables FLAG_STATUS polling for karaoke).
+    is_mus: bool,
     /// Cumulative MUS FLAG count (for karaoke sync).
     flag_count: u32,
     /// UDP port for U64 audio streaming, if active. Preserved across subtune changes.
@@ -1418,6 +1439,7 @@ fn setup_playback(
         track_info,
         frame_count: 0,
         next_frame: Instant::now(),
+        is_mus,
         flag_count: 0,
         audio_port: None,
     }

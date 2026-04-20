@@ -127,16 +127,30 @@ impl SidDevice for BridgeDevice {
         }
         // No CMD_FLUSH here — the player loop calls flush() after this.
 
+        let t0 = std::time::Instant::now();
         let _ = self.stream.write_all(&buf);
         let _ = self.stream.flush();
+        let dt = t0.elapsed();
+        if dt.as_millis() > 10 {
+            eprintln!(
+                "[usb-bridge] SLOW ring_cycled: {} writes, {:.1}ms",
+                writes.len(),
+                dt.as_secs_f64() * 1000.0,
+            );
+        }
     }
 
     fn flush(&mut self) {
+        let t0 = std::time::Instant::now();
         let _ = self.stream.write_all(&[CMD_FLUSH]);
         let _ = self.stream.flush();
-        // Non-blocking: daemon batches writes and signals the writer
-        // thread to drain asynchronously.  No response expected — the
-        // player's frame pacing (wait_until) provides natural flow control.
+        let dt = t0.elapsed();
+        if dt.as_millis() > 10 {
+            eprintln!(
+                "[usb-bridge] SLOW flush: {:.1}ms",
+                dt.as_secs_f64() * 1000.0,
+            );
+        }
     }
 
     fn reinit(&mut self) -> Result<(), String> {

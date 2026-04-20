@@ -171,10 +171,28 @@ mod unix_main {
                     // the next frame.
                     if let Some(ref mut d) = dev {
                         if !pending_writes.is_empty() {
+                            let count = pending_writes.len();
+                            let t0 = std::time::Instant::now();
                             let _ = d.write_ring_cycled_batch(&pending_writes);
+                            let dt = t0.elapsed();
+                            if dt.as_millis() > 5 {
+                                eprintln!(
+                                    "[usbsid-bridge] SLOW write_ring_cycled_batch: {} writes in {:.1}ms",
+                                    count,
+                                    dt.as_secs_f64() * 1000.0,
+                                );
+                            }
                             pending_writes.clear();
                         }
-                        d.set_flush(); // non-blocking — writer thread drains async
+                        let t0 = std::time::Instant::now();
+                        d.set_flush();
+                        let dt = t0.elapsed();
+                        if dt.as_millis() > 5 {
+                            eprintln!(
+                                "[usbsid-bridge] SLOW set_flush: {:.1}ms",
+                                dt.as_secs_f64() * 1000.0,
+                            );
+                        }
                     }
                 }
 
