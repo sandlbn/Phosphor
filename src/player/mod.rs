@@ -425,8 +425,7 @@ fn player_loop(
                             if overrun_ms > 5.0 {
                                 eprintln!(
                                     "[player] Frame overrun: {:.1}ms behind (frame {})",
-                                    overrun_ms,
-                                    ctx.frame_count,
+                                    overrun_ms, ctx.frame_count,
                                 );
                             }
                             ctx.next_frame = now;

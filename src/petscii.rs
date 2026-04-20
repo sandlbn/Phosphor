@@ -416,9 +416,7 @@ pub fn petscii_to_wds_groups(data: &[u8]) -> Vec<Vec<String>> {
         // Continuation row: raw PETSCII starts with $92 $20 (reverse-off + space).
         // This is the standard WDS indentation for wrapped lyrics lines.
         // Centered text uses other control codes before spaces, so won't match.
-        let is_continuation = row_bytes.len() >= 2
-            && row_bytes[0] == 0x92
-            && row_bytes[1] == 0x20;
+        let is_continuation = row_bytes.len() >= 2 && row_bytes[0] == 0x92 && row_bytes[1] == 0x20;
 
         if is_continuation && !groups.is_empty() {
             groups.last_mut().unwrap().push(trimmed);

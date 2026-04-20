@@ -2194,8 +2194,7 @@ impl App {
 
                         // Load WDS lyrics as logical groups.
                         if let Some(groups) = petscii::load_wds_lyrics(&mus_path) {
-                            let total_rows: usize =
-                                groups.iter().map(|g| g.len()).sum();
+                            let total_rows: usize = groups.iter().map(|g| g.len()).sum();
                             eprintln!(
                                 "[phosphor] Karaoke: {} lyric groups ({} display rows)",
                                 groups.len(),

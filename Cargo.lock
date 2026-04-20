@@ -4685,6 +4685,8 @@ dependencies = [
 [[package]]
 name = "sidplayfp-sys"
 version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12c31ad63268d5c8e7f5ee3bcd799f74ed585c86d03ae7319f9a7e2a147cdf26"
 dependencies = [
  "cc",
 ]
