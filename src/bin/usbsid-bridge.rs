@@ -32,7 +32,7 @@ fn main() {
 #[cfg(all(feature = "usb", unix))]
 mod unix_main {
 
-    use std::io::{Read, Write};
+    use std::io::{BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use usbsid_pico::{ClockSpeed, UsbSid};
@@ -66,27 +66,31 @@ mod unix_main {
         let _ = stream.flush();
     }
 
-    fn handle_client(mut stream: std::os::unix::net::UnixStream) {
+    fn handle_client(stream: std::os::unix::net::UnixStream) {
+        // Split into buffered reader + raw writer.
+        // BufReader reads large chunks from the kernel socket buffer in one
+        // syscall (~8KB), then serves individual read_exact calls from memory.
+        // This reduces 2500+ syscalls/frame to ~1 for heavy tunes.
+        let mut writer = stream.try_clone().expect("stream clone failed");
+        let mut reader = BufReader::with_capacity(8192, stream);
         let mut dev: Option<UsbSid> = None;
         let mut cmd = [0u8; 1];
 
         // Pending ring writes — collected locally and pushed to the driver
-        // in one batch when CMD_FLUSH arrives.  This eliminates per-write
-        // mutex contention (one lock instead of hundreds) and prevents the
-        // writer thread from sending partial USB packets mid-frame.
+        // in one batch when CMD_FLUSH arrives.
         let mut pending_writes: Vec<(u8, u8, u16)> = Vec::with_capacity(512);
 
         eprintln!("[usbsid-bridge] client connected");
 
         loop {
-            if stream.read_exact(&mut cmd).is_err() {
+            if reader.read_exact(&mut cmd).is_err() {
                 break;
             }
 
             match cmd[0] {
                 CMD_INIT => {
                     if dev.is_some() {
-                        send_ok(&mut stream);
+                        send_ok(&mut writer);
                         continue;
                     }
                     let mut d = UsbSid::new();
@@ -94,19 +98,19 @@ mod unix_main {
                         Ok(_) => {
                             eprintln!("[usbsid-bridge] USBSID-Pico opened (threaded, cycled)");
                             dev = Some(d);
-                            send_ok(&mut stream);
+                            send_ok(&mut writer);
                         }
                         Err(e) => {
                             let msg = format!("USB init failed: {e}");
                             eprintln!("[usbsid-bridge] {msg}");
-                            send_err(&mut stream, &msg);
+                            send_err(&mut writer, &msg);
                         }
                     }
                 }
 
                 CMD_CLOCK => {
                     let mut b = [0u8; 1];
-                    if stream.read_exact(&mut b).is_err() {
+                    if reader.read_exact(&mut b).is_err() {
                         break;
                     }
                     if let Some(ref mut d) = dev {
@@ -117,7 +121,7 @@ mod unix_main {
                         };
                         d.set_clock_rate(speed, true);
                     }
-                    send_ok(&mut stream);
+                    send_ok(&mut writer);
                 }
 
                 CMD_RESET => {
@@ -125,25 +129,25 @@ mod unix_main {
                     if let Some(ref mut d) = dev {
                         d.reset();
                     }
-                    send_ok(&mut stream);
+                    send_ok(&mut writer);
                 }
 
                 CMD_STEREO => {
                     let mut b = [0u8; 1];
-                    if stream.read_exact(&mut b).is_err() {
+                    if reader.read_exact(&mut b).is_err() {
                         break;
                     }
                     if let Some(ref mut d) = dev {
                         d.set_stereo(b[0] as i32);
                     }
-                    send_ok(&mut stream);
+                    send_ok(&mut writer);
                 }
 
                 CMD_WRITE => {
                     // Immediate register write (init/setup).
                     // Uses single_write because write() is blocked in threaded mode.
                     let mut b = [0u8; 2];
-                    if stream.read_exact(&mut b).is_err() {
+                    if reader.read_exact(&mut b).is_err() {
                         break;
                     }
                     if let Some(ref d) = dev {
@@ -156,7 +160,7 @@ mod unix_main {
                     // Collect writes locally — they will be pushed to the
                     // driver in a single batch when CMD_FLUSH arrives.
                     let mut b = [0u8; 4];
-                    if stream.read_exact(&mut b).is_err() {
+                    if reader.read_exact(&mut b).is_err() {
                         break;
                     }
                     let cycles = ((b[2] as u16) << 8) | (b[3] as u16);
@@ -164,35 +168,12 @@ mod unix_main {
                 }
 
                 CMD_FLUSH => {
-                    // Push all collected writes in one batch (single mutex
-                    // lock + single condvar notification), then signal the
-                    // writer thread to drain.  Non-blocking — the writer
-                    // thread drains asynchronously while the player prepares
-                    // the next frame.
                     if let Some(ref mut d) = dev {
                         if !pending_writes.is_empty() {
-                            let count = pending_writes.len();
-                            let t0 = std::time::Instant::now();
                             let _ = d.write_ring_cycled_batch(&pending_writes);
-                            let dt = t0.elapsed();
-                            if dt.as_millis() > 5 {
-                                eprintln!(
-                                    "[usbsid-bridge] SLOW write_ring_cycled_batch: {} writes in {:.1}ms",
-                                    count,
-                                    dt.as_secs_f64() * 1000.0,
-                                );
-                            }
                             pending_writes.clear();
                         }
-                        let t0 = std::time::Instant::now();
                         d.set_flush();
-                        let dt = t0.elapsed();
-                        if dt.as_millis() > 5 {
-                            eprintln!(
-                                "[usbsid-bridge] SLOW set_flush: {:.1}ms",
-                                dt.as_secs_f64() * 1000.0,
-                            );
-                        }
                     }
                 }
 
@@ -201,7 +182,7 @@ mod unix_main {
                     if let Some(ref mut d) = dev {
                         d.mute();
                     }
-                    send_ok(&mut stream);
+                    send_ok(&mut writer);
                 }
 
                 CMD_CLOSE => {
@@ -213,7 +194,7 @@ mod unix_main {
                         d.close();
                     }
                     dev = None;
-                    send_ok(&mut stream);
+                    send_ok(&mut writer);
                 }
 
                 CMD_QUIT => {

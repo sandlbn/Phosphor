@@ -292,12 +292,23 @@ fn player_loop(
                                 run_rsid_sub_emu(cpu, ctx.cycles_per_frame, prev_nmi);
 
                                 if let Some(ref mut br) = bridge {
+                                    let nw = cpu.memory.sid_writes.len();
+                                    let t0 = Instant::now();
                                     send_sid_writes(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
                                         ctx.mirror_mono,
                                         ctx.cycles_per_frame,
                                     );
+                                    let dt = t0.elapsed();
+                                    if dt.as_millis() > 10 || nw > 500 {
+                                        eprintln!(
+                                            "[player] RSID send: {} writes in {:.1}ms (frame {})",
+                                            nw,
+                                            dt.as_secs_f64() * 1000.0,
+                                            ctx.frame_count,
+                                        );
+                                    }
                                 }
                             }
                             PlayEngine::Psid(cpu) => {
@@ -410,7 +421,14 @@ fn player_loop(
 
                         let now = Instant::now();
                         if ctx.next_frame < now {
-                            // Frame overrun — reset to avoid cascading drift
+                            let overrun_ms = (now - ctx.next_frame).as_secs_f64() * 1000.0;
+                            if overrun_ms > 5.0 {
+                                eprintln!(
+                                    "[player] Frame overrun: {:.1}ms behind (frame {})",
+                                    overrun_ms,
+                                    ctx.frame_count,
+                                );
+                            }
                             ctx.next_frame = now;
                         }
 
