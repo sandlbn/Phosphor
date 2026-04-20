@@ -60,6 +60,9 @@ pub struct PlayerStatus {
     /// Raw SID register shadow — 128 bytes (4 SIDs × 32 bytes each).
     /// Indices 0x00–0x1F = SID1, 0x20–0x3F = SID2, etc.
     pub sid_regs: Vec<u8>,
+    /// Cumulative count of MUS FLAG commands detected during playback.
+    /// Increments each time FLAG_STATUS ($E00A) transitions from 0 to non-zero.
+    pub flag_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +86,8 @@ pub struct TrackInfo {
     pub num_sids: usize,
     pub sid_type: String,
     pub md5: String,
+    /// MUS comment lines from libsidplayfp (PETSCII→ASCII converted).
+    pub mus_comments: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,12 +292,23 @@ fn player_loop(
                                 run_rsid_sub_emu(cpu, ctx.cycles_per_frame, prev_nmi);
 
                                 if let Some(ref mut br) = bridge {
+                                    let nw = cpu.memory.sid_writes.len();
+                                    let t0 = Instant::now();
                                     send_sid_writes(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
                                         ctx.mirror_mono,
                                         ctx.cycles_per_frame,
                                     );
+                                    let dt = t0.elapsed();
+                                    if dt.as_millis() > 10 || nw > 500 {
+                                        eprintln!(
+                                            "[player] RSID send: {} writes in {:.1}ms (frame {})",
+                                            nw,
+                                            dt.as_secs_f64() * 1000.0,
+                                            ctx.frame_count,
+                                        );
+                                    }
                                 }
                             }
                             PlayEngine::Psid(cpu) => {
@@ -319,14 +335,47 @@ fn player_loop(
                                 // SID engine doesn't pad silence at frame end.
                                 let actual = fp.run_frame(ctx.cycles_per_frame);
 
+                                // Poll MUS FLAG_STATUS ($E001) for karaoke sync.
+                                // Only for MUS files — $E001 is SIDplayer work memory.
+                                // Reading/writing this address on non-MUS tunes corrupts
+                                // their memory and can cause hangs.
+                                if ctx.is_mus {
+                                    const FLAG_STATUS_ADDR: u16 = 0xE001;
+                                    let flag_val = if ctx.frame_count >= 10 {
+                                        fp.read_mem(FLAG_STATUS_ADDR)
+                                    } else {
+                                        fp.write_mem(FLAG_STATUS_ADDR, 0);
+                                        0
+                                    };
+                                    if flag_val != 0 {
+                                        ctx.flag_count += 1;
+                                        let elapsed = ctx.elapsed.as_secs_f32();
+                                        eprintln!(
+                                            "[karaoke] FLAG #{:3} val={} frame={:5} elapsed={:.1}s",
+                                            ctx.flag_count, flag_val, ctx.frame_count, elapsed,
+                                        );
+                                        fp.write_mem(FLAG_STATUS_ADDR, 0);
+                                    }
+                                }
+
                                 if let Some(ref mut br) = bridge {
                                     br.set_cycles_per_frame(actual);
+                                    let t0 = Instant::now();
                                     send_sid_writes(
                                         br.as_mut(),
                                         &fp.sid_writes,
                                         ctx.mirror_mono,
                                         actual,
                                     );
+                                    let dt = t0.elapsed();
+                                    if dt.as_millis() > 10 {
+                                        eprintln!(
+                                            "[player] SLOW send_sid_writes: {} writes in {:.1}ms (frame {})",
+                                            fp.sid_writes.len(),
+                                            dt.as_secs_f64() * 1000.0,
+                                            ctx.frame_count,
+                                        );
+                                    }
                                 }
                             }
                             PlayEngine::Native { shadow } => {
@@ -354,7 +403,16 @@ fn player_loop(
                         // writes for this frame (no-op for Native engine).
                         if !ctx.is_native() {
                             if let Some(ref mut br) = bridge {
+                                let t0 = Instant::now();
                                 br.flush();
+                                let dt = t0.elapsed();
+                                if dt.as_millis() > 10 {
+                                    eprintln!(
+                                        "[player] SLOW flush: {:.1}ms (frame {})",
+                                        dt.as_secs_f64() * 1000.0,
+                                        ctx.frame_count,
+                                    );
+                                }
                             }
                         }
 
@@ -363,7 +421,13 @@ fn player_loop(
 
                         let now = Instant::now();
                         if ctx.next_frame < now {
-                            // Frame overrun — reset to avoid cascading drift
+                            let overrun_ms = (now - ctx.next_frame).as_secs_f64() * 1000.0;
+                            if overrun_ms > 5.0 {
+                                eprintln!(
+                                    "[player] Frame overrun: {:.1}ms behind (frame {})",
+                                    overrun_ms, ctx.frame_count,
+                                );
+                            }
                             ctx.next_frame = now;
                         }
 
@@ -417,15 +481,16 @@ fn send_status(
     error: &Option<String>,
     tx: &Sender<PlayerStatus>,
 ) {
-    let (info, elapsed, levels, writes, regs) = match ctx {
+    let (info, elapsed, levels, writes, regs, flag_count) = match ctx {
         Some(c) => (
             Some(c.track_info.clone()),
             c.elapsed,
             c.voice_levels(),
             c.sid_writes().len(),
             c.sid_regs(),
+            c.flag_count,
         ),
-        None => (None, Duration::ZERO, vec![], 0, vec![0u8; 128]),
+        None => (None, Duration::ZERO, vec![], 0, vec![0u8; 128], 0),
     };
 
     let _ = tx.try_send(PlayerStatus {
@@ -436,6 +501,7 @@ fn send_status(
         writes_per_frame: writes,
         error: error.clone(),
         sid_regs: regs,
+        flag_count,
     });
 }
 
@@ -490,8 +556,15 @@ fn handle_cmd(
                 }
             };
 
+            let is_mus = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mus"))
+                .unwrap_or(false);
+
             let sid_file = match load_sid(&data) {
                 Ok(s) => s,
+                Err(_) if is_mus => sid_file::load_mus_stub(&data, Some(&path)),
                 Err(e) => {
                     eprintln!("[phosphor] SID parse error: {e}");
                     *last_error = Some(e);
@@ -558,7 +631,13 @@ fn handle_cmd(
                 };
                 let track_info = TrackInfo {
                     path: path.clone(),
-                    name: header.name.clone(),
+                    name: if header.name.is_empty() {
+                        path.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        header.name.clone()
+                    },
                     author: header.author.clone(),
                     released: header.released.clone(),
                     songs: header.songs,
@@ -568,6 +647,7 @@ fn handle_cmd(
                     num_sids,
                     sid_type,
                     md5,
+                    mus_comments: Vec::new(),
                 };
 
                 // Build shadow emulation for visualization
@@ -631,6 +711,8 @@ fn handle_cmd(
                     track_info,
                     frame_count: 0,
                     next_frame: Instant::now(),
+                    is_mus: false,
+                    flag_count: 0,
                     audio_port,
                 });
             } else {
@@ -739,7 +821,13 @@ fn handle_cmd(
                                         };
                                         let track_info = TrackInfo {
                                             path: path.clone(),
-                                            name: header.name.clone(),
+                                            name: if header.name.is_empty() {
+                                                path.file_stem()
+                                                    .map(|s| s.to_string_lossy().to_string())
+                                                    .unwrap_or_default()
+                                            } else {
+                                                header.name.clone()
+                                            },
                                             author: header.author.clone(),
                                             released: header.released.clone(),
                                             songs: header.songs,
@@ -749,6 +837,7 @@ fn handle_cmd(
                                             num_sids,
                                             sid_type,
                                             md5,
+                                            mus_comments: Vec::new(),
                                         };
 
                                         // Build shadow CPU for visualization
@@ -816,6 +905,8 @@ fn handle_cmd(
                                             track_info,
                                             frame_count: 0,
                                             next_frame: Instant::now(),
+                                            is_mus: false,
+                                            flag_count: 0,
                                             audio_port: saved_audio_port,
                                         });
                                         *state = PlayState::Playing;
@@ -920,6 +1011,10 @@ struct PlayContext {
     track_info: TrackInfo,
     frame_count: u32,
     next_frame: Instant, // absolute deadline for next frame
+    /// True when playing a MUS file (enables FLAG_STATUS polling for karaoke).
+    is_mus: bool,
+    /// Cumulative MUS FLAG count (for karaoke sync).
+    flag_count: u32,
     /// UDP port for U64 audio streaming, if active. Preserved across subtune changes.
     audio_port: Option<u16>,
 }
@@ -1072,9 +1167,15 @@ fn setup_playback(
 
     let md5 = compute_hvsc_md5(&sid_file);
 
-    let track_info = TrackInfo {
+    let mut track_info = TrackInfo {
         path: path.clone(),
-        name: header.name.clone(),
+        name: if header.name.is_empty() {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            header.name.clone()
+        },
         author: header.author.clone(),
         released: header.released.clone(),
         songs: header.songs,
@@ -1084,6 +1185,7 @@ fn setup_playback(
         num_sids,
         sid_type: sid_type.clone(),
         md5,
+        mus_comments: Vec::new(),
     };
 
     // ── Configure hardware ───────────────────────────────────────────────
@@ -1125,13 +1227,33 @@ fn setup_playback(
 
     // Route all tunes through libsidplayfp for cycle-accurate emulation.
     // Fall back to the built-in mos6502 engine only if libsidplayfp fails.
-    let engine = match libsidplayfp::LibSidPlayFp::new(&sid_file.raw, song) {
+    // MUS files can only be played by libsidplayfp — no built-in fallback.
+    let is_mus = sid_file.header.magic == "MUS";
+    // For MUS files, use file-path loading so libsidplayfp can find
+    // companion .str files for stereo playback automatically.
+    let fp_result = if is_mus {
+        libsidplayfp::LibSidPlayFp::new_from_file(&path, song)
+    } else {
+        libsidplayfp::LibSidPlayFp::new(&sid_file.raw, song)
+    };
+    let engine = match fp_result {
         Ok(fp) => {
             eprintln!(
                 "[phosphor] Using libsidplayfp for {} (cycle-accurate)",
-                if is_rsid { "RSID" } else { "PSID" },
+                if is_mus {
+                    "MUS"
+                } else if is_rsid {
+                    "RSID"
+                } else {
+                    "PSID"
+                },
             );
             PlayEngine::SidPlayFp(fp)
+        }
+        Err(e) if is_mus => {
+            eprintln!("[phosphor] MUS playback failed: {e} (libsidplayfp required)");
+            // Built-in CPU engine cannot play MUS — give up.
+            setup_psid_engine(&sid_file, song, &mapper, mono_mode, trampoline, halt_pc)
         }
         Err(e) => {
             eprintln!("[phosphor] libsidplayfp failed: {e}, falling back to built-in CPU");
@@ -1150,6 +1272,14 @@ fn setup_playback(
             }
         }
     };
+
+    // For MUS files, update num_sids and capture comments from libsidplayfp.
+    if is_mus {
+        if let PlayEngine::SidPlayFp(ref fp) = engine {
+            track_info.num_sids = fp.num_sids;
+            track_info.mus_comments = fp.comments.clone();
+        }
+    }
 
     // Send INIT writes to hardware
     let empty_writes: Vec<(u32, u8, u8)> = Vec::new();
@@ -1326,6 +1456,8 @@ fn setup_playback(
         track_info,
         frame_count: 0,
         next_frame: Instant::now(),
+        is_mus,
+        flag_count: 0,
         audio_port: None,
     }
 }

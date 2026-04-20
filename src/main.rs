@@ -4,6 +4,7 @@
 mod c64_emu;
 mod config;
 mod heard_db;
+mod petscii;
 mod player;
 mod playlist;
 mod recently_played;
@@ -146,6 +147,10 @@ struct App {
 
     /// Some(_) when the right-click context menu is visible.
     context_menu: Option<ContextMenu>,
+    /// Consecutive frames with zero SID writes — used to detect end-of-song
+    /// silence for MUS files that don't have songlength DB entries.
+    silence_frames: u32,
+
     /// Whether the visualiser is expanded to fill the whole window (overlay mode).
     /// Double-clicking the visualiser canvas toggles this.
     vis_expanded: bool,
@@ -175,6 +180,16 @@ struct App {
     /// Pre-formatted STIL text for the currently playing tune + subtune.
     /// Kept in App so view() can borrow it without a local String lifetime issue.
     stil_display_text: String,
+    /// MUS FLAG command timestamps for karaoke sync (seconds per WDS line).
+    karaoke_flag_times: Vec<f32>,
+    /// Whether the MUS file contains any FLAG commands (in any voice).
+    karaoke_has_flags: bool,
+    /// Logical lyric groups parsed from WDS file (each group = 1+ display rows).
+    karaoke_groups: Vec<Vec<String>>,
+    /// Current karaoke group index (advanced by real-time FLAG events from player).
+    karaoke_line: usize,
+    /// Last seen flag_count from player status (to detect new FLAG events).
+    last_flag_count: u32,
     /// Set once the background session load finishes.
     /// Guards save_session in Drop against nuking the file
     /// before loading completes.
@@ -309,6 +324,7 @@ impl App {
                 writes_per_frame: 0,
                 error: None,
                 sid_regs: vec![0u8; 128],
+                flag_count: 0,
             },
             playlist,
             selected: None,
@@ -344,6 +360,7 @@ impl App {
             playlist_viewport_y: 0.0,
             pixel_ratio: 1.0,
             context_menu: None,
+            silence_frames: 0,
             vis_expanded: false,
             show_help: false,
             mini_mode: false,
@@ -357,6 +374,11 @@ impl App {
             show_stil_overlay: false,
             stil_status: String::new(),
             stil_display_text: String::new(),
+            karaoke_flag_times: Vec::new(),
+            karaoke_has_flags: false,
+            karaoke_groups: Vec::new(),
+            karaoke_line: 0,
+            last_flag_count: 0,
             session_loaded: false,
             tick: 0,
             remote_state,
@@ -800,8 +822,11 @@ impl App {
                         pg.clear();
                     }
                 } else {
-                    let n = entries.len();
-                    self.pending_entries = Some(entries);
+                    // Extend rather than replace — multiple drops may arrive
+                    // concurrently and each resolves as a separate FilesLoaded.
+                    let pending = self.pending_entries.get_or_insert_with(Vec::new);
+                    pending.extend(entries);
+                    let n = pending.len();
                     if let Ok(mut pg) = self.loading_progress.lock() {
                         *pg = format!("⏳ Adding {} tracks…", n);
                     }
@@ -849,7 +874,7 @@ impl App {
                     .unwrap_or("")
                     .to_lowercase();
                 match ext.as_str() {
-                    "sid" => {
+                    "sid" | "mus" => {
                         self.config.remember_sid_dir(&path);
                         let paths = vec![path];
                         let pg = self.loading_progress.clone();
@@ -1310,12 +1335,19 @@ impl App {
                     self.heard_text = self.heard_db.format_completion(total);
                 }
                 // Advance STIL ticker when tracker is in full-screen mode.
-                if self.vis_expanded && self.visualizer.mode == ui::visualizer::VisMode::Tracker {
+                if self.vis_expanded
+                    && matches!(
+                        self.visualizer.mode,
+                        ui::visualizer::VisMode::Tracker | ui::visualizer::VisMode::Karaoke
+                    )
+                {
                     // ~80 logical px/s at ~30 fps
                     self.stil_scroll_x += 2.65;
                     self.visualizer.invalidate_expanded();
                 }
                 // Keep STIL text in sync with current subtune.
+                // Only rebuild on tick for STIL entries (subtune may change).
+                // WDS lyrics are static per track and loaded once via refresh_stil_entry.
                 if self.stil_entry.is_some() {
                     self.rebuild_stil_display();
                 }
@@ -1388,6 +1420,19 @@ impl App {
 
             Message::ToggleVisFull => {
                 self.vis_expanded = !self.vis_expanded;
+            }
+
+            Message::ToggleKaraoke => {
+                // Only activate if we have karaoke lyrics.
+                if !self.stil_display_text.is_empty() {
+                    if self.vis_expanded && self.visualizer.mode == ui::visualizer::VisMode::Karaoke
+                    {
+                        self.vis_expanded = false;
+                    } else {
+                        self.visualizer.mode = ui::visualizer::VisMode::Karaoke;
+                        self.vis_expanded = true;
+                    }
+                }
             }
 
             Message::HvscCheckDone(Ok(remote_ver)) => {
@@ -1687,7 +1732,7 @@ impl App {
             tracker_ref,
             is_now_playing_fav,
             self.status.track_info.is_some(),
-            self.stil_entry.is_some(),
+            self.stil_entry.is_some() || !self.stil_display_text.is_empty(),
             self.window_width,
             &self.config.output_engine,
         );
@@ -1872,7 +1917,9 @@ impl App {
             .into()
         } else if self.show_help {
             ui::help_overlay()
-        } else if self.show_stil_overlay && self.stil_entry.is_some() {
+        } else if self.show_stil_overlay
+            && (self.stil_entry.is_some() || !self.stil_display_text.is_empty())
+        {
             let current_song = self
                 .status
                 .track_info
@@ -1937,6 +1984,10 @@ impl App {
                     Key::Character(ref c) if c.as_str() == "h" && status != Status::Captured => {
                         Some(Message::ToggleFavoriteCurrent)
                     }
+                    // K — toggle karaoke mode (MUS files with WDS lyrics)
+                    Key::Character(ref c) if c.as_str() == "k" && status != Status::Captured => {
+                        Some(Message::ToggleKaraoke)
+                    }
                     // M — toggle mini player
                     Key::Character(ref c) if c.as_str() == "m" && status != Status::Captured => {
                         Some(Message::ToggleMiniPlayer)
@@ -2000,6 +2051,10 @@ impl App {
                 self.heard_db.save();
             }
 
+            self.silence_frames = 0;
+            self.karaoke_groups.clear();
+            self.karaoke_line = 0;
+            self.last_flag_count = 0;
             self.playlist.current = Some(idx);
             self.selected = Some(idx);
             self.scroll_to_current = true;
@@ -2081,6 +2136,7 @@ impl App {
     }
 
     /// Rebuild `stil_display_text` from the current `stil_entry` and active subtune.
+    /// For MUS files without STIL info, loads companion .wds lyrics if available.
     fn rebuild_stil_display(&mut self) {
         let subtune = self
             .status
@@ -2090,13 +2146,94 @@ impl App {
             .unwrap_or(1);
         self.stil_display_text = match self.stil_entry.as_ref() {
             Some(e) => e.format_for_display(subtune),
-            None => String::new(),
+            None => {
+                // For MUS files: load WDS lyrics and MUS embedded credits.
+                // WDS lyrics go to karaoke; credits + lyrics go to STIL overlay.
+                self.karaoke_flag_times.clear();
+                // Extract path and state from the current entry before mutating.
+                let mus_info = self.playlist.current_entry().map(|entry| {
+                    let is_mus = entry
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("mus"))
+                        .unwrap_or(false);
+                    (entry.path.clone(), is_mus, entry.duration_secs.is_some())
+                });
+                if let Some((mus_path, is_mus, _has_dur)) = mus_info {
+                    if !is_mus {
+                        String::new()
+                    } else {
+                        let mut parts = Vec::new();
+
+                        // Use libsidplayfp comments (properly converted PETSCII→ASCII).
+                        // Only if the track_info matches the current track path.
+                        if let Some(ref info) = self.status.track_info {
+                            if info.path == mus_path && !info.mus_comments.is_empty() {
+                                parts.push(info.mus_comments.join("\n"));
+                            }
+                        }
+
+                        // Check for FLAG commands in MUS and companion STR file.
+                        if let Ok(mus_data) = std::fs::read(&mus_path) {
+                            self.karaoke_has_flags = petscii::mus_has_flags(&mus_data);
+                        }
+                        if !self.karaoke_has_flags {
+                            // Stereo voices 4-6 are in a separate .str file;
+                            // FLAGs may live there instead.
+                            for ext in &["str", "STR"] {
+                                let str_path = mus_path.with_extension(ext);
+                                if let Ok(str_data) = std::fs::read(&str_path) {
+                                    if petscii::mus_has_flags(&str_data) {
+                                        self.karaoke_has_flags = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Load WDS lyrics as logical groups.
+                        if let Some(groups) = petscii::load_wds_lyrics(&mus_path) {
+                            let total_rows: usize = groups.iter().map(|g| g.len()).sum();
+                            eprintln!(
+                                "[phosphor] Karaoke: {} lyric groups ({} display rows)",
+                                groups.len(),
+                                total_rows,
+                            );
+                            // Flatten groups into plain text for STIL overlay.
+                            let flat: String = groups
+                                .iter()
+                                .flat_map(|g| g.iter().map(String::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !parts.is_empty() {
+                                parts.push(String::new());
+                            }
+                            parts.push(flat);
+                            self.karaoke_groups = groups;
+                        } else {
+                            self.karaoke_groups.clear();
+                        }
+
+                        parts.join("\n")
+                    }
+                } else {
+                    String::new()
+                }
+            }
         };
     }
 
     fn poll_status(&mut self) {
         while let Ok(status) = self.status_rx.try_recv() {
             self.status = status;
+        }
+
+        // Advance karaoke line when new FLAG events are detected.
+        if self.status.flag_count > self.last_flag_count {
+            let new_flags = self.status.flag_count - self.last_flag_count;
+            self.karaoke_line += new_flags as usize;
+            self.last_flag_count = self.status.flag_count;
         }
 
         if let Some(ref info) = self.status.track_info {
@@ -2116,11 +2253,19 @@ impl App {
                 songs: info.songs,
                 is_pal: info.is_pal,
                 is_rsid: info.is_rsid,
+                is_mus: info
+                    .path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("mus"))
+                    .unwrap_or(false),
                 num_sids: info.num_sids,
                 elapsed_secs: self.status.elapsed.as_secs_f32(),
                 duration_secs: current_duration,
                 stil_text: self.stil_display_text.clone(),
                 stil_scroll_x: self.stil_scroll_x,
+                karaoke_groups: self.karaoke_groups.clone(),
+                karaoke_line: self.karaoke_line,
             });
         } else {
             self.vis_expanded_info = None;
@@ -2141,10 +2286,29 @@ impl App {
         self.visualizer.update(&levels);
 
         if self.status.state == PlayState::Playing {
+            // Track silence — when SID writes drop to zero for ~3 seconds
+            // (90 frames at 30fps tick rate), the song has ended.
+            if self.status.writes_per_frame == 0 {
+                self.silence_frames += 1;
+            } else {
+                self.silence_frames = 0;
+            }
+
             if let Some(cur_idx) = self.playlist.current {
                 let advance_info = self.playlist.entries.get(cur_idx).and_then(|entry| {
-                    let dur = entry.duration_secs?;
-                    if self.status.elapsed.as_secs() >= dur as u64 {
+                    let dur = entry.duration_secs;
+                    // Advance if duration exceeded OR prolonged silence detected.
+                    // Silence detection: ~90 frames ≈ 3 seconds at 30fps tick.
+                    // Only trigger after at least 5 seconds of playback to avoid
+                    // false positives during song intro.
+                    let elapsed = self.status.elapsed.as_secs();
+                    let silence_ended = self.silence_frames > 90 && elapsed > 5;
+                    let duration_ended = dur.map_or(false, |d| elapsed >= d as u64);
+
+                    if duration_ended || silence_ended {
+                        if silence_ended && dur.is_none() {
+                            eprintln!("[phosphor] Silence detected after {}s — advancing", elapsed);
+                        }
                         Some((entry.selected_song, entry.songs, entry.md5.clone()))
                     } else {
                         None
@@ -2392,6 +2556,16 @@ fn apply_default_length(playlist: &mut Playlist, default_secs: u32) {
     let mut count = 0;
     for entry in &mut playlist.entries {
         if entry.duration_secs.is_none() {
+            // Skip MUS files — they use silence detection for song endings.
+            let is_mus = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mus"))
+                .unwrap_or(false);
+            if is_mus {
+                continue;
+            }
             entry.duration_secs = Some(default_secs);
             count += 1;
         }
@@ -2434,7 +2608,7 @@ impl Drop for App {
 async fn pick_files(start_dir: Option<String>) -> Vec<PathBuf> {
     let mut d = rfd::AsyncFileDialog::new()
         .set_title("Add SID files")
-        .add_filter("SID files", &["sid", "SID"]);
+        .add_filter("SID files", &["sid", "SID", "mus", "MUS"]);
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {

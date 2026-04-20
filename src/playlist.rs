@@ -30,14 +30,24 @@ pub struct PlaylistEntry {
     pub md5: Option<String>,
     /// Duration from Songlength DB, if available (seconds).
     pub duration_secs: Option<u32>,
+    /// True if a companion .wds lyrics file exists (karaoke available).
+    pub has_wds: bool,
 }
 
 impl PlaylistEntry {
-    /// Try to create an entry by reading and parsing a .sid file header.
+    /// Try to create an entry by reading and parsing a .sid/.mus file header.
     pub fn from_path(path: &Path) -> Result<Self, String> {
         let data =
             std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-        let sid = sid_file::load_sid(&data)?;
+        let is_mus = path
+            .extension()
+            .map(|e| e.to_ascii_lowercase() == "mus")
+            .unwrap_or(false);
+        let sid = match sid_file::load_sid(&data) {
+            Ok(s) => s,
+            Err(_) if is_mus => sid_file::load_mus_stub(&data, Some(path)),
+            Err(e) => return Err(e),
+        };
         let h = &sid.header;
 
         let md5 = sid_file::compute_hvsc_md5(&sid);
@@ -59,7 +69,14 @@ impl PlaylistEntry {
             num_sids: h.num_sids(),
             is_rsid: h.is_rsid,
             md5: Some(md5),
-            duration_secs: None,
+            duration_secs: None, // MUS duration handled by silence detection
+            has_wds: if is_mus {
+                let wds = path.with_extension("wds");
+                let wds_upper = path.with_extension("WDS");
+                wds.exists() || wds_upper.exists()
+            } else {
+                false
+            },
         })
     }
 
@@ -95,6 +112,14 @@ impl PlaylistEntry {
             is_rsid: is_rsid.unwrap_or(false),
             md5: md5.map(|s| s.to_string()),
             duration_secs,
+            has_wds: {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext.eq_ignore_ascii_case("mus") {
+                    path.with_extension("wds").exists() || path.with_extension("WDS").exists()
+                } else {
+                    false
+                }
+            },
         })
     }
 
@@ -177,7 +202,7 @@ impl Playlist {
         Ok(())
     }
 
-    /// Recursively add all .sid files from a directory.
+    /// Recursively add all .sid/.mus files from a directory.
     pub fn add_directory(&mut self, dir: &Path) -> usize {
         let mut count = 0;
         for entry in WalkDir::new(dir)
@@ -186,7 +211,12 @@ impl Playlist {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if p.extension().map(|e| e.to_ascii_lowercase()) == Some("sid".into()) {
+            let dominated = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| sid_file::is_sid_extension(&e.to_ascii_lowercase()))
+                .unwrap_or(false);
+            if dominated {
                 if self.add_file(p).is_ok() {
                     count += 1;
                 }
@@ -850,7 +880,7 @@ pub fn parse_files(paths: Vec<PathBuf>, progress: LoadingProgress) -> Vec<Playli
     entries
 }
 
-/// Recursively walk a directory and parse all .sid files (blocking I/O).
+/// Recursively walk a directory and parse all .sid/.mus files (blocking I/O).
 /// Designed to be called from a background thread via `Task::perform`.
 pub fn parse_directory(dir: PathBuf, progress: LoadingProgress) -> Vec<PlaylistEntry> {
     let mut entries = Vec::new();
@@ -861,7 +891,12 @@ pub fn parse_directory(dir: PathBuf, progress: LoadingProgress) -> Vec<PlaylistE
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
-        if p.extension().map(|e| e.to_ascii_lowercase()) == Some("sid".into()) {
+        let is_sid = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| sid_file::is_sid_extension(&e.to_ascii_lowercase()))
+            .unwrap_or(false);
+        if is_sid {
             count += 1;
             if let Ok(mut pg) = progress.lock() {
                 *pg = format!("⏳ Scanning folder: {} files found", count);
