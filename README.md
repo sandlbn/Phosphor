@@ -23,7 +23,7 @@ https://github.com/sandlbn/Phosphor/releases
 - **Recently played** — persistent history of the last 100 unique tracks with human-readable timestamps
 - **HVSC Songlength DB** — automatic song-length lookup with configurable fallback duration
 - **HVSC STIL** — song info overlay (cover titles, original artists, composer comments) via the ⓘ button; downloaded or loaded from a local STIL.txt
-- **MUS file support** — Compute's Gazette SIDplayer format with stereo (MUS+STR), PETSCII lyrics display (WDS), and real-time karaoke mode synchronized via FLAG commands
+- **MUS file support** *(beta)* — Compute's Gazette SIDplayer format with stereo (MUS+STR), PETSCII lyrics display (WDS), and real-time karaoke mode synchronized via FLAG commands
 - **Multi-SID support** — PSID/RSID, 1SID/2SID/3SID tunes, PAL/NTSC
 - **Sub-tune navigation** — step through all sub-tunes within a SID file
 - **SID register panel** — real-time scrolling tracker view (note, waveform, ADSR per voice) plus live register readout for all active SID chips
