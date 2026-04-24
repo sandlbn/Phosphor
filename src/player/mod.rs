@@ -85,6 +85,8 @@ pub struct TrackInfo {
     pub is_rsid: bool,
     pub num_sids: usize,
     pub sid_type: String,
+    /// SID chip model from file header flags: 0=unknown, 1=6581, 2=8580, 3=both.
+    pub sid_model: u8,
     pub md5: String,
     /// MUS comment lines from libsidplayfp (PETSCII→ASCII converted).
     pub mus_comments: Vec<String>,
@@ -646,6 +648,7 @@ fn handle_cmd(
                     is_rsid,
                     num_sids,
                     sid_type,
+                    sid_model: header.sid_model,
                     md5,
                     mus_comments: Vec::new(),
                 };
@@ -836,6 +839,7 @@ fn handle_cmd(
                                             is_rsid,
                                             num_sids,
                                             sid_type,
+                                            sid_model: header.sid_model,
                                             md5,
                                             mus_comments: Vec::new(),
                                         };
@@ -1184,6 +1188,7 @@ fn setup_playback(
         is_rsid,
         num_sids,
         sid_type: sid_type.clone(),
+        sid_model: header.sid_model,
         md5,
         mus_comments: Vec::new(),
     };

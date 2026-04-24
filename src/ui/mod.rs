@@ -275,31 +275,41 @@ pub fn track_info_bar<'a>(
     };
 
     let (title, author, extra) = match &status.track_info {
-        Some(info) => (
-            info.name.as_str(),
-            info.author.as_str(),
-            format!(
-                "{}  •  {}  •  Song {}/{}  •  {}  •  {} writes/frame",
-                if info
-                    .path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("mus"))
-                    .unwrap_or(false)
-                {
-                    "MUS"
-                } else if info.is_rsid {
-                    "RSID"
-                } else {
-                    "PSID"
-                },
-                info.sid_type,
-                info.current_song,
-                info.songs,
-                if info.is_pal { "PAL" } else { "NTSC" },
-                status.writes_per_frame,
-            ),
-        ),
+        Some(info) => {
+            let format_label = if info
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mus"))
+                .unwrap_or(false)
+            {
+                "MUS"
+            } else if info.is_rsid {
+                "RSID"
+            } else {
+                "PSID"
+            };
+            let chip_label = match info.sid_model {
+                1 => "  •  MOS6581",
+                2 => "  •  MOS8580",
+                3 => "  •  MOS6581/8580",
+                _ => "",
+            };
+            (
+                info.name.as_str(),
+                info.author.as_str(),
+                format!(
+                    "{}  •  {}{}  •  Song {}/{}  •  {}  •  {} writes/frame",
+                    format_label,
+                    info.sid_type,
+                    chip_label,
+                    info.current_song,
+                    info.songs,
+                    if info.is_pal { "PAL" } else { "NTSC" },
+                    status.writes_per_frame,
+                ),
+            )
+        }
         None => ("No track loaded", "—", String::new()),
     };
 
