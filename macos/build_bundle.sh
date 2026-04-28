@@ -32,7 +32,7 @@ BUNDLE_ID="com.phosphor.player"
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 SIGN_IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 CREATE_DMG=false
-NOTARIZE=false
+NOTARIZE=true
 ARCH="${MACOS_ARCH:-$(uname -m)}"
 
 # ── Parse args ───────────────────────────────────────────────────────────────
