@@ -85,7 +85,12 @@ assets = [
   # udev rules (recommended if you need non-root USB access)
   ["packaging/99-usbsid-pico.rules", "etc/udev/rules.d/99-usbsid-pico.rules", "644"],
 
-  # optional desktop integration (Linux desktop)
-  # ["packaging/phosphor.desktop", "usr/share/applications/phosphor.desktop", "644"],
-  # ["assets/icons/phosphor.png", "usr/share/pixmaps/phosphor.png", "644"],
+  # desktop integration (menu entry + icon)
+  ["packaging/phosphor.desktop", "usr/share/applications/phosphor.desktop", "644"],
+  ["assets/phosphor.png", "usr/share/icons/hicolor/256x256/apps/phosphor.png", "644"],
+  ["assets/phosphor.png", "usr/share/pixmaps/phosphor.png", "644"],
 ]
+
+# Maintainer scripts to refresh desktop/icon caches so the menu entry shows up
+# without requiring a logout. Falls back silently if the helper tools aren't installed.
+maintainer-scripts = "packaging/debian"
