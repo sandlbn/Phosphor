@@ -316,16 +316,7 @@ impl App {
         let app = Self {
             cmd_tx,
             status_rx,
-            status: PlayerStatus {
-                state: PlayState::Stopped,
-                track_info: None,
-                elapsed: Duration::ZERO,
-                voice_levels: vec![],
-                writes_per_frame: 0,
-                error: None,
-                sid_regs: vec![0u8; 128],
-                flag_count: 0,
-            },
+            status: PlayerStatus::default(),
             playlist,
             selected: None,
             visualizer: Visualizer::new(),
@@ -2296,12 +2287,30 @@ impl App {
 
             if let Some(cur_idx) = self.playlist.current {
                 let advance_info = self.playlist.entries.get(cur_idx).and_then(|entry| {
-                    let dur = entry.duration_secs;
+                    // Prefer the U64's on-screen total when HVSC has no entry —
+                    // it's whatever the U64 SID-player UI shows next to the timer.
+                    let dur = entry
+                        .duration_secs
+                        .or_else(|| self.status.u64_screen_total_secs.map(|s| s as u32));
+                    // Prefer the U64's on-screen elapsed seconds over host wall-clock
+                    // so playback advances based on actual hardware position, not on
+                    // host time that started counting before the C64 produced audio.
+                    // Interpolate sub-second time using the wall-clock delta since
+                    // the last successful read — without this, elapsed lags up to
+                    // ~1.5 s behind reality (1 s screen-render granularity + 0.5 s
+                    // poll period). Falls back to wall-clock for non-U64 engines or
+                    // when the U64's player UI couldn't be parsed.
+                    let elapsed = match (
+                        self.status.u64_screen_elapsed_secs,
+                        self.status.u64_screen_read_at,
+                    ) {
+                        (Some(secs), Some(read_at)) => secs as u64 + read_at.elapsed().as_secs(),
+                        _ => self.status.elapsed.as_secs(),
+                    };
                     // Advance if duration exceeded OR prolonged silence detected.
                     // Silence detection: ~90 frames ≈ 3 seconds at 30fps tick.
                     // Only trigger after at least 5 seconds of playback to avoid
                     // false positives during song intro.
-                    let elapsed = self.status.elapsed.as_secs();
                     let silence_ended = self.silence_frames > 90 && elapsed > 5;
                     let duration_ended = dur.map_or(false, |d| elapsed >= d as u64);
 
@@ -2803,15 +2812,30 @@ fn main() -> iced::Result {
             config_for_window.window_width_saved,
             config_for_window.window_height_saved,
         ))
-        .window(iced::window::Settings {
-            icon: Some(icon),
-            position: match (config_for_window.window_x, config_for_window.window_y) {
-                (Some(x), Some(y)) => {
-                    iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))
-                }
-                _ => iced::window::Position::Default,
-            },
-            ..Default::default()
+        .window({
+            #[allow(unused_mut)]
+            let mut s = iced::window::Settings {
+                icon: Some(icon),
+                position: match (config_for_window.window_x, config_for_window.window_y) {
+                    (Some(x), Some(y)) => {
+                        iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))
+                    }
+                    _ => iced::window::Position::Default,
+                },
+                ..Default::default()
+            };
+            // Pin the X11 WM_CLASS / Wayland app_id so KDE (and other desktops
+            // that key icons off the .desktop file rather than _NET_WM_ICON)
+            // can match the running window to packaging/phosphor.desktop's
+            // StartupWMClass=phosphor and pull the title-bar icon from there.
+            #[cfg(target_os = "linux")]
+            {
+                s.platform_specific = iced::window::settings::PlatformSpecific {
+                    application_id: "phosphor".to_string(),
+                    ..Default::default()
+                };
+            }
+            s
         })
         .run()
 }

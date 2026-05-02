@@ -57,12 +57,45 @@ pub struct PlayerStatus {
     pub voice_levels: Vec<f32>,
     pub writes_per_frame: usize,
     pub error: Option<String>,
+    /// Elapsed playback time in seconds, read from the U64 SID-player's
+    /// on-screen clock when streaming to an Ultimate 64. `None` for every
+    /// other engine, or on the U64 when its player UI couldn't be parsed.
+    /// Lets the GUI advance songs based on the actual hardware playback
+    /// position rather than host wall-clock + start-latency.
+    pub u64_screen_elapsed_secs: Option<u32>,
+    /// `Instant` at which `u64_screen_elapsed_secs` was last successfully
+    /// updated. Lets the GUI interpolate between polls so the effective
+    /// elapsed time advances continuously (1 s on-screen resolution + 0.5 s
+    /// poll period would otherwise leave the comparison up to ~1.5 s behind).
+    pub u64_screen_read_at: Option<Instant>,
+    /// Total song length in seconds from the U64 player's on-screen total
+    /// slot. Used as a duration fallback when HVSC has no entry. `None` for
+    /// non-U64 engines or until the first successful read.
+    pub u64_screen_total_secs: Option<u32>,
     /// Raw SID register shadow — 128 bytes (4 SIDs × 32 bytes each).
     /// Indices 0x00–0x1F = SID1, 0x20–0x3F = SID2, etc.
     pub sid_regs: Vec<u8>,
     /// Cumulative count of MUS FLAG commands detected during playback.
     /// Increments each time FLAG_STATUS ($E00A) transitions from 0 to non-zero.
     pub flag_count: u32,
+}
+
+impl Default for PlayerStatus {
+    fn default() -> Self {
+        Self {
+            state: PlayState::Stopped,
+            track_info: None,
+            elapsed: Duration::ZERO,
+            voice_levels: Vec::new(),
+            writes_per_frame: 0,
+            error: None,
+            sid_regs: vec![0u8; 128],
+            flag_count: 0,
+            u64_screen_elapsed_secs: None,
+            u64_screen_read_at: None,
+            u64_screen_total_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -398,6 +431,28 @@ fn player_loop(
                                         run_rsid_sub_emu(cpu, ctx.cycles_per_frame, prev_nmi);
                                     }
                                 }
+
+                                // Poll the U64 player's on-screen timer about
+                                // twice a second so the GUI can advance songs
+                                // based on the actual hardware playback position
+                                // rather than host wall-clock + start latency.
+                                // The on-screen clock has 1 s resolution, so
+                                // any cadence finer than that is wasted.
+                                let frame_hz = (1_000_000 / ctx.frame_us.max(1)) as u32;
+                                let poll_period = (frame_hz / 2).max(1);
+                                if ctx.frame_count % poll_period == 0 {
+                                    if let Some(ref mut br) = bridge {
+                                        if let Some(secs) = br.read_screen_elapsed() {
+                                            ctx.u64_screen_elapsed_secs = Some(secs);
+                                            ctx.u64_screen_read_at = Some(Instant::now());
+                                        }
+                                        // Total only changes per song; only fetch
+                                        // until we've successfully captured it.
+                                        if ctx.u64_screen_total_secs.is_none() {
+                                            ctx.u64_screen_total_secs = br.read_screen_total();
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -483,28 +538,23 @@ fn send_status(
     error: &Option<String>,
     tx: &Sender<PlayerStatus>,
 ) {
-    let (info, elapsed, levels, writes, regs, flag_count) = match ctx {
-        Some(c) => (
-            Some(c.track_info.clone()),
-            c.elapsed,
-            c.voice_levels(),
-            c.sid_writes().len(),
-            c.sid_regs(),
-            c.flag_count,
-        ),
-        None => (None, Duration::ZERO, vec![], 0, vec![0u8; 128], 0),
-    };
-
-    let _ = tx.try_send(PlayerStatus {
+    let mut s = PlayerStatus {
         state: state.clone(),
-        track_info: info,
-        elapsed,
-        voice_levels: levels,
-        writes_per_frame: writes,
         error: error.clone(),
-        sid_regs: regs,
-        flag_count,
-    });
+        ..PlayerStatus::default()
+    };
+    if let Some(c) = ctx {
+        s.track_info = Some(c.track_info.clone());
+        s.elapsed = c.elapsed;
+        s.voice_levels = c.voice_levels();
+        s.writes_per_frame = c.sid_writes().len();
+        s.sid_regs = c.sid_regs();
+        s.flag_count = c.flag_count;
+        s.u64_screen_elapsed_secs = c.u64_screen_elapsed_secs;
+        s.u64_screen_read_at = c.u64_screen_read_at;
+        s.u64_screen_total_secs = c.u64_screen_total_secs;
+    }
+    let _ = tx.try_send(s);
 }
 
 fn handle_cmd(
@@ -717,6 +767,9 @@ fn handle_cmd(
                     is_mus: false,
                     flag_count: 0,
                     audio_port,
+                    u64_screen_elapsed_secs: None,
+                    u64_screen_read_at: None,
+                    u64_screen_total_secs: None,
                 });
             } else {
                 let mut ctx = setup_playback(
@@ -912,6 +965,9 @@ fn handle_cmd(
                                             is_mus: false,
                                             flag_count: 0,
                                             audio_port: saved_audio_port,
+                                            u64_screen_elapsed_secs: None,
+                                            u64_screen_read_at: None,
+                                            u64_screen_total_secs: None,
                                         });
                                         *state = PlayState::Playing;
                                     }
@@ -1021,6 +1077,16 @@ struct PlayContext {
     flag_count: u32,
     /// UDP port for U64 audio streaming, if active. Preserved across subtune changes.
     audio_port: Option<u16>,
+    /// Last successful read of the U64 player's on-screen elapsed time
+    /// (whole seconds). `None` until the first successful poll. Populated
+    /// only on the U64 native engine path; left at `None` for other engines.
+    u64_screen_elapsed_secs: Option<u32>,
+    /// `Instant` of the read that produced `u64_screen_elapsed_secs`. Used
+    /// by the GUI to interpolate sub-second time between polls.
+    u64_screen_read_at: Option<Instant>,
+    /// On-screen total song length, captured at the first successful poll.
+    /// Used as a duration fallback when HVSC has no entry for this tune.
+    u64_screen_total_secs: Option<u32>,
 }
 
 enum PlayEngine {
@@ -1464,6 +1530,9 @@ fn setup_playback(
         is_mus,
         flag_count: 0,
         audio_port: None,
+        u64_screen_elapsed_secs: None,
+        u64_screen_read_at: None,
+        u64_screen_total_secs: None,
     }
 }
 
