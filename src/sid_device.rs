@@ -62,6 +62,21 @@ pub trait SidDevice: Send {
     /// Stop the audio stream started by `start_audio`.
     /// Default no-op — only meaningful for native engines (U64).
     fn stop_audio(&mut self) {}
+
+    /// Read the elapsed playback time, in seconds, that the U64 firmware
+    /// renders to its on-screen player UI. `None` means either the device
+    /// doesn't expose one (USB / emulated / sidlite) or the layout couldn't
+    /// be validated this run.
+    fn read_screen_elapsed(&mut self) -> Option<u32> {
+        None
+    }
+
+    /// Read the on-screen "total song length" the U64 firmware shows next
+    /// to the elapsed time. Useful as a duration fallback when HVSC has no
+    /// entry for the current tune. Default no-op for non-U64 engines.
+    fn read_screen_total(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -431,6 +431,17 @@ pub struct U64Device {
     rest: Rest,
     address: String,
     audio: Option<AudioStream>,
+    /// Cached base address of the C64 screen RAM, computed once after
+    /// `play_sid_native()` returns. The U64's SID-player UI renders the
+    /// elapsed playback time as 5 ASCII screen-code digits at row 23
+    /// cols 0–4 (`MM:SS`) and the total length at cols 35–39.
+    /// `None` once means we haven't computed it yet for the current song;
+    /// `Some` after the layout has been validated. Reset on each new song.
+    screen_base: Option<u16>,
+    /// Layout-validation result for the current song. When false we stop
+    /// trying to read the on-screen timer until the next play_sid_native()
+    /// (the firmware's UI must be different than what we expect).
+    screen_layout_ok: bool,
 }
 
 impl U64Device {
@@ -471,7 +482,81 @@ impl U64Device {
             rest,
             address: address.to_string(),
             audio: None,
+            screen_base: None,
+            screen_layout_ok: false,
         })
+    }
+
+    /// Compute the C64 screen-RAM base address from VIC-II + CIA2 registers.
+    /// On firmware 1.1.0 the SID-player UI uses VIC bank 0 and screen offset
+    /// 0xF, giving `$3C00`. Other firmware versions may differ, so we read it
+    /// rather than hardcoding.
+    fn compute_screen_base(&self) -> Option<u16> {
+        let vic_d018 = self.rest.read_mem(0xD018, 1).ok()?;
+        let cia2_pa = self.rest.read_mem(0xDD00, 1).ok()?;
+        let screen_offset = ((vic_d018[0] >> 4) & 0x0F) as u16;
+        // CIA2 PA bits 0-1 select VIC bank, inverted: 11→bank0, 10→bank1, etc.
+        let bank = (!cia2_pa[0]) & 0x03;
+        let base = (bank as u16) * 0x4000 + screen_offset * 0x400;
+        Some(base)
+    }
+
+    /// Parse five screen-code bytes laid out as `MM:SS` into total seconds.
+    /// Returns `None` if any digit is out of range or the colon is wrong —
+    /// in that case the firmware UI doesn't match what we expect.
+    fn parse_mmss(bytes: &[u8]) -> Option<u32> {
+        if bytes.len() < 5 {
+            return None;
+        }
+        let d = |b: u8| -> Option<u32> {
+            if (0x30..=0x39).contains(&b) {
+                Some((b - 0x30) as u32)
+            } else {
+                None
+            }
+        };
+        if bytes[2] != 0x3A {
+            return None;
+        }
+        Some(d(bytes[0])? * 600 + d(bytes[1])? * 60 + d(bytes[3])? * 10 + d(bytes[4])?)
+    }
+
+    /// Read 5 screen-code bytes at `addr` and parse as `MM:SS`. Internal helper.
+    fn read_screen_mmss(&self, addr: u16) -> Option<u32> {
+        let bytes = self.rest.read_mem(addr, 5).ok()?;
+        Self::parse_mmss(&bytes)
+    }
+
+    /// Reset the cached screen layout — call this after every new
+    /// `sid_play()` since the player UI may redraw or move.
+    fn invalidate_screen_layout(&mut self) {
+        self.screen_base = None;
+        self.screen_layout_ok = false;
+    }
+
+    /// Lazily resolve and validate the screen base. Returns the base, or
+    /// `None` if the layout doesn't match the U64's player UI.
+    fn ensure_screen_layout(&mut self) -> Option<u16> {
+        if let Some(base) = self.screen_base {
+            return if self.screen_layout_ok {
+                Some(base)
+            } else {
+                None
+            };
+        }
+        let base = self.compute_screen_base()?;
+        let elapsed_addr = base.checked_add(23 * 40)?;
+        // Validate by reading the 5 elapsed-time digits and parsing them.
+        // If parsing succeeds the colon is in place and digits are screen
+        // codes for '0'..='9' — we trust the layout.
+        let ok = self.read_screen_mmss(elapsed_addr).is_some();
+        self.screen_base = Some(base);
+        self.screen_layout_ok = ok;
+        if ok {
+            Some(base)
+        } else {
+            None
+        }
     }
 }
 
@@ -533,8 +618,25 @@ impl SidDevice for U64Device {
             .sid_play(data, song_num)
             .map_err(|e| format!("U64 sid_play failed: {e}"))?;
 
+        // The U64 redraws its player UI for each new song, so the screen
+        // base + validation must be recomputed. The next read_screen_*
+        // call will lazily re-resolve the layout.
+        self.invalidate_screen_layout();
+
         eprintln!("[u64] SID file sent ({} bytes, song {})", data.len(), song);
         Ok(true)
+    }
+
+    fn read_screen_elapsed(&mut self) -> Option<u32> {
+        let base = self.ensure_screen_layout()?;
+        // Row 23 col 0..4 — elapsed MM:SS.
+        self.read_screen_mmss(base.wrapping_add(23 * 40))
+    }
+
+    fn read_screen_total(&mut self) -> Option<u32> {
+        let base = self.ensure_screen_layout()?;
+        // Row 23 col 35..39 — total MM:SS.
+        self.read_screen_mmss(base.wrapping_add(23 * 40 + 35))
     }
 
     /// Freeze the C64 mid-frame — clock and SID output both pause instantly.
