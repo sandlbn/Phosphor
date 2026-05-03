@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Phosphor
+GenericName=SID Music Player
+Comment=SID music player for USBSID-Pico, reSID, and Ultimate 64
+Exec=phosphor %F
+Icon=phosphor
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=SID;C64;Commodore;chiptune;music;USBSID;
+MimeType=audio/prs.sid;audio/x-psid;audio/x-rsid;
+StartupNotify=true
+StartupWMClass=phosphor

@@ -1,3 +1,4 @@
+pub mod font;
 pub mod right_click;
 pub mod sid_panel;
 pub mod visualizer;
@@ -169,6 +170,7 @@ pub enum Message {
     ToggleSkipRsid,
     ToggleForceStereo2sid,
     DefaultSongLengthChanged(String),
+    BaseFontSizeChanged(String),
     SonglengthUrlChanged(String),
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
@@ -320,15 +322,15 @@ pub fn track_info_bar<'a>(
     };
 
     let mut info_col = column![
-        text(format!("{state_icon}  {title}")).size(title_size),
+        text(format!("{state_icon}  {title}")).size(font::sized(title_size)),
         text(author)
-            .size(author_size)
+            .size(font::sized(author_size))
             .color(Color::from_rgb(0.6, 0.7, 0.8)),
         text(extra)
-            .size(extra_size)
+            .size(font::sized(extra_size))
             .color(Color::from_rgb(0.5, 0.5, 0.6)),
         text(format!("Engine: {engine_label}"))
-            .size(extra_size)
+            .size(font::sized(extra_size))
             .color(Color::from_rgb(0.4, 0.55, 0.45)),
     ]
     .spacing(2)
@@ -337,7 +339,7 @@ pub fn track_info_bar<'a>(
     if let Some(ref err) = status.error {
         info_col = info_col.push(
             text(format!("⚠ {err}"))
-                .size(12)
+                .size(font::sized(12.0))
                 .color(Color::from_rgb(1.0, 0.3, 0.3)),
         );
     }
@@ -353,7 +355,7 @@ pub fn track_info_bar<'a>(
         } else {
             Color::from_rgb(0.5, 0.5, 0.6)
         };
-        let heart_btn = button(text(heart_label).size(18).color(heart_color))
+        let heart_btn = button(text(heart_label).size(font::sized(18.0)).color(heart_color))
             .on_press(Message::FavoriteNowPlaying)
             .padding(Padding::from([4, 6]))
             .style(|_theme: &Theme, _status| button::Style {
@@ -361,15 +363,19 @@ pub fn track_info_bar<'a>(
                 text_color: Color::WHITE,
                 ..Default::default()
             });
-        let scroll_btn = button(text("⌖").size(16).color(Color::from_rgb(0.5, 0.5, 0.6)))
-            .on_press(Message::ScrollToNowPlaying)
-            .padding(Padding::from([4, 6]))
-            .style(|_theme: &Theme, _status| button::Style {
-                background: None,
-                text_color: Color::WHITE,
-                ..Default::default()
-            });
-        let info_btn = button(text("ⓘ").size(15).color(if has_stil_info {
+        let scroll_btn = button(
+            text("⌖")
+                .size(font::sized(16.0))
+                .color(Color::from_rgb(0.5, 0.5, 0.6)),
+        )
+        .on_press(Message::ScrollToNowPlaying)
+        .padding(Padding::from([4, 6]))
+        .style(|_theme: &Theme, _status| button::Style {
+            background: None,
+            text_color: Color::WHITE,
+            ..Default::default()
+        });
+        let info_btn = button(text("ⓘ").size(font::sized(15.0)).color(if has_stil_info {
             Color::from_rgb(0.45, 0.75, 1.0)
         } else {
             Color::from_rgb(0.30, 0.30, 0.40)
@@ -432,7 +438,7 @@ pub fn progress_bar<'a>(
         "—:——".to_string()
     };
     let time_label = text(format!("  {elapsed_str} / {total_str}"))
-        .size(11)
+        .size(font::sized(11.0))
         .color(Color::from_rgb(0.6, 0.65, 0.7));
     let bar_pct = (fraction * 100.0) as u16;
 
@@ -495,7 +501,7 @@ pub fn controls_bar<'a>(
     };
 
     let small_button = |label: &'a str, msg: Message| -> Element<'a, Message> {
-        button(text(label).size(btn_size))
+        button(text(label).size(font::sized(btn_size)))
             .on_press(msg)
             .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
             .style(|_theme: &Theme, st| {
@@ -520,7 +526,7 @@ pub fn controls_bar<'a>(
 
     let sep = || -> Element<'a, Message> {
         text(" │ ")
-            .size(btn_size)
+            .size(font::sized(btn_size))
             .color(Color::from_rgb(0.3, 0.3, 0.35))
             .into()
     };
@@ -553,7 +559,7 @@ pub fn controls_bar<'a>(
     .spacing(4);
 
     let recent_btn: Element<'a, Message> =
-        button(text(if compact { "🕐" } else { "🕐 Recent" }).size(btn_size))
+        button(text(if compact { "🕐" } else { "🕐 Recent" }).size(font::sized(btn_size)))
             .on_press(Message::ShowRecentlyPlayed)
             .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
             .style(move |_theme: &Theme, st| {
@@ -592,7 +598,7 @@ pub fn controls_bar<'a>(
             .into();
 
     let sid_btn: Element<'a, Message> =
-        button(text(if compact { "SID" } else { "SID" }).size(btn_size))
+        button(text(if compact { "SID" } else { "SID" }).size(font::sized(btn_size)))
             .on_press(Message::ToggleSidPanel)
             .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
             .style(move |_theme: &Theme, st| {
@@ -659,7 +665,7 @@ pub fn controls_bar<'a>(
     let update_badge = |version: &str| -> Element<'a, Message> {
         button(
             text(format!("⬆ {version}"))
-                .size(if compact { 11.0 } else { 12.0 })
+                .size(font::sized(if compact { 11.0 } else { 12.0 }))
                 .color(Color::from_rgb(0.1, 0.1, 0.12)),
         )
         .on_press(Message::OpenUpdateUrl)
@@ -733,7 +739,7 @@ pub fn search_bar<'a>(
     let search_input = text_input("Search playlist...", search_text)
         .id(search_input_id())
         .on_input(Message::SearchChanged)
-        .size(13)
+        .size(font::sized(13.0))
         .padding(Padding::from([4, 8]))
         .width(Length::Fill)
         .style(|_theme: &Theme, _status| text_input::Style {
@@ -770,7 +776,7 @@ pub fn search_bar<'a>(
         format!("♡ {favorites_count}")
     };
 
-    let fav_btn = button(text(fav_label).size(12))
+    let fav_btn = button(text(fav_label).size(font::sized(12.0)))
         .on_press(Message::ToggleFavoritesFilter)
         .padding(Padding::from([4, 10]))
         .style(move |_theme: &Theme, st| {
@@ -808,7 +814,9 @@ pub fn search_bar<'a>(
         });
 
     let mut search_row = row![
-        text("🔍 ").size(13).color(Color::from_rgb(0.5, 0.5, 0.6)),
+        text("🔍 ")
+            .size(font::sized(13.0))
+            .color(Color::from_rgb(0.5, 0.5, 0.6)),
         search_input,
     ]
     .spacing(4)
@@ -824,7 +832,7 @@ pub fn search_bar<'a>(
             Space::new().width(Length::Fixed(8.0)),
             fav_btn,
             Space::new().width(Length::Fixed(8.0)),
-            text(count_text).size(12).color(count_color)
+            text(count_text).size(font::sized(12.0)).color(count_color)
         ]
         .spacing(4)
         .align_y(Alignment::Center)
@@ -882,7 +890,7 @@ pub fn playlist_view<'a>(
         } else {
             Color::from_rgb(0.5, 0.5, 0.6)
         };
-        button(text(display).size(11).color(text_color))
+        button(text(display).size(font::sized(11.0)).color(text_color))
             .on_press(Message::SortBy(col))
             .padding(Padding::from([2, 4]))
             .style(|_theme: &Theme, st| button::Style {
@@ -906,7 +914,7 @@ pub fn playlist_view<'a>(
     let header = container(
         row![
             text("♥")
-                .size(11)
+                .size(font::sized(11.0))
                 .color(Color::from_rgb(0.5, 0.5, 0.6))
                 .width(Length::Fixed(22.0)),
             container(header_btn("#", SortColumn::Index)).width(Length::Fixed(50.0)),
@@ -954,9 +962,13 @@ pub fn playlist_view<'a>(
                 "No matching tracks"
             };
             rows = rows.push(
-                container(text(msg).size(14).color(Color::from_rgb(0.4, 0.4, 0.5)))
-                    .padding(40)
-                    .center_x(Length::Fill),
+                container(
+                    text(msg)
+                        .size(font::sized(14.0))
+                        .color(Color::from_rgb(0.4, 0.4, 0.5)),
+                )
+                .padding(40)
+                .center_x(Length::Fill),
             );
         }
     } else {
@@ -1062,7 +1074,7 @@ pub fn context_menu_overlay<'a>(
     };
 
     let item = |icon_label: &'a str, msg: Message| -> Element<'a, Message> {
-        button(text(icon_label).size(13))
+        button(text(icon_label).size(font::sized(13.0)))
             .on_press(msg)
             .width(Length::Fill)
             .padding(Padding::from([7, 14]))
@@ -1144,23 +1156,23 @@ pub fn recently_played_view<'a>(
 ) -> Element<'a, Message> {
     let header_row = row![
         text("#")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
             .width(Length::Fixed(40.0)),
         text("Title")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
             .width(Length::FillPortion(4)),
         text("Author")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
             .width(Length::FillPortion(3)),
         text("Released")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
             .width(Length::FillPortion(2)),
         text("Played")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
             .width(Length::Fixed(110.0)),
     ]
@@ -1178,7 +1190,7 @@ pub fn recently_played_view<'a>(
     let toolbar = container(
         row![
             text(format!("🕐  {} recently played tracks", recent.len()))
-                .size(12)
+                .size(font::sized(12.0))
                 .color(Color::from_rgb(0.55, 0.80, 1.0)),
             Space::new().width(Length::Fill),
             tool_button("🗑 Clear history", Message::ClearRecentlyPlayed),
@@ -1203,7 +1215,7 @@ pub fn recently_played_view<'a>(
         rows = rows.push(
             container(
                 text("No recently played tracks yet — start listening!")
-                    .size(14)
+                    .size(font::sized(14.0))
                     .color(Color::from_rgb(0.4, 0.4, 0.5)),
             )
             .padding(40)
@@ -1221,23 +1233,23 @@ pub fn recently_played_view<'a>(
 
             let row_content = row![
                 text(format!("{}{}", indicator, i + 1))
-                    .size(13)
+                    .size(font::sized(13.0))
                     .color(color)
                     .width(Length::Fixed(40.0)),
                 text(entry.title.clone())
-                    .size(13)
+                    .size(font::sized(13.0))
                     .color(color)
                     .width(Length::FillPortion(4)),
                 text(entry.author.clone())
-                    .size(13)
+                    .size(font::sized(13.0))
                     .color(color)
                     .width(Length::FillPortion(3)),
                 text(entry.released.clone())
-                    .size(13)
+                    .size(font::sized(13.0))
                     .color(color)
                     .width(Length::FillPortion(2)),
                 text(format_played_at(entry.played_at))
-                    .size(12)
+                    .size(font::sized(12.0))
                     .color(Color::from_rgb(0.5, 0.55, 0.65))
                     .width(Length::Fixed(110.0)),
             ]
@@ -1337,7 +1349,7 @@ fn playlist_entry_row<'a>(
         Color::from_rgb(0.35, 0.35, 0.40)
     };
 
-    let heart_btn = button(text(heart_label).size(13).color(heart_color))
+    let heart_btn = button(text(heart_label).size(font::sized(13.0)).color(heart_color))
         .on_press(Message::ToggleFavorite(idx))
         .padding(Padding::from([4, 4]))
         .style(|_theme: &Theme, st| button::Style {
@@ -1409,7 +1421,7 @@ fn playlist_row_content<'a>(
     sids: String,
     is_current: bool,
 ) -> Element<'a, Message> {
-    let size = 13;
+    let size: f32 = 13.0;
     let color = if is_current {
         Color::from_rgb(0.35, 0.85, 0.55)
     } else {
@@ -1424,9 +1436,9 @@ fn playlist_row_content<'a>(
 
     let title_cell: Element<'a, Message> = if has_wds {
         row![
-            text(title).size(size).color(color),
+            text(title).size(font::sized(size)).color(color),
             text(" (Karaoke)")
-                .size(10)
+                .size(font::sized(10.0))
                 .color(Color::from_rgb(0.30, 0.75, 0.45)),
         ]
         .spacing(4)
@@ -1434,7 +1446,7 @@ fn playlist_row_content<'a>(
         .into()
     } else {
         text(title)
-            .size(size)
+            .size(font::sized(size))
             .color(color)
             .width(Length::FillPortion(4))
             .into()
@@ -1442,28 +1454,28 @@ fn playlist_row_content<'a>(
 
     row![
         text(format!("{indicator}{num:>3}"))
-            .size(size)
+            .size(font::sized(size))
             .color(color)
             .width(Length::Fixed(50.0)),
         title_cell,
         text(author)
-            .size(size)
+            .size(font::sized(size))
             .color(color)
             .width(Length::FillPortion(3)),
         text(released)
-            .size(size)
+            .size(font::sized(size))
             .color(color)
             .width(Length::FillPortion(2)),
         text(time)
-            .size(size)
+            .size(font::sized(size))
             .color(color)
             .width(Length::Fixed(55.0)),
         text(sid_type)
-            .size(size)
+            .size(font::sized(size))
             .color(type_color)
             .width(Length::Fixed(42.0)),
         text(sids)
-            .size(size)
+            .size(font::sized(size))
             .color(color)
             .width(Length::Fixed(45.0)),
     ]
@@ -1485,10 +1497,11 @@ pub fn settings_panel<'a>(
     stil_status: &'a str,
     http_remote_running: bool,
     http_port_text: &'a str,
+    base_font_size_text: &'a str,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
-            .size(18)
+            .size(font::sized(18.0))
             .color(Color::from_rgb(0.85, 0.87, 0.9)),
         Space::new().width(Length::Fill),
         tool_button("✕ Close", Message::ToggleSettings),
@@ -1500,7 +1513,7 @@ pub fn settings_panel<'a>(
     let current_engine = &config.output_engine;
 
     let mut engine_col = column![text("Audio output engine:")
-        .size(14)
+        .size(font::sized(14.0))
         .color(Color::from_rgb(0.75, 0.77, 0.82)),]
     .spacing(6);
 
@@ -1512,7 +1525,7 @@ pub fn settings_panel<'a>(
             } else {
                 "○ Auto (try USB, fall back to emulation)"
             })
-            .size(12),
+            .size(font::sized(12.0)),
         )
         .on_press(Message::SetOutputEngine("auto".to_string()))
         .padding(Padding::from([4, 10]))
@@ -1535,7 +1548,7 @@ pub fn settings_panel<'a>(
             format!("○ {display}")
         };
         engine_col = engine_col.push(
-            button(text(label).size(12))
+            button(text(label).size(font::sized(12.0)))
                 .on_press(Message::SetOutputEngine(name.to_string()))
                 .padding(Padding::from([4, 10]))
                 .width(Length::Fill)
@@ -1546,38 +1559,38 @@ pub fn settings_panel<'a>(
     engine_col = engine_col
         .push(
             text("Playback will restart automatically on the new engine.")
-                .size(11)
+                .size(font::sized(11.0))
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         )
         .push(rule::horizontal(1))
         .push(
             text("Ultimate 64 connection:")
-                .size(12)
+                .size(font::sized(12.0))
                 .color(Color::from_rgb(0.65, 0.67, 0.72)),
         )
         .push(
             text_input("IP address (e.g. 192.168.1.64)", &config.u64_address)
                 .on_input(Message::SetU64Address)
-                .size(12)
+                .size(font::sized(12.0))
                 .padding(Padding::from([4, 8]))
                 .width(Length::Fill),
         )
         .push(
             text_input("Password (leave empty if none)", &config.u64_password)
                 .on_input(Message::SetU64Password)
-                .size(12)
+                .size(font::sized(12.0))
                 .padding(Padding::from([4, 8]))
                 .width(Length::Fill),
         )
         .push(
             text("Set IP/hostname of your Ultimate 64 or Ultimate-II+ device.")
-                .size(11)
+                .size(font::sized(11.0))
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         )
         .push(rule::horizontal(1))
         .push(
             text("U64 audio streaming:")
-                .size(12)
+                .size(font::sized(12.0))
                 .color(Color::from_rgb(0.65, 0.67, 0.72)),
         )
         .push(
@@ -1592,11 +1605,11 @@ pub fn settings_panel<'a>(
         )
         .push(
             row![
-                text("UDP port:").size(11).color(Color::from_rgb(0.65, 0.67, 0.72)),
+                text("UDP port:").size(font::sized(11.0)).color(Color::from_rgb(0.65, 0.67, 0.72)),
                 Space::new().width(6),
                 text_input("11001", &config.u64_audio_port.to_string())
                     .on_input(Message::U64AudioPortChanged)
-                    .size(12)
+                    .size(font::sized(12.0))
                     .padding(Padding::from([4, 8]))
                     .width(Length::Fixed(80.0)),
             ]
@@ -1604,14 +1617,14 @@ pub fn settings_panel<'a>(
         )
         .push(
             text("When enabled, the U64 streams its SID audio over UDP to this machine. Use a different port to the video stream.")
-                .size(11)
+                .size(font::sized(11.0))
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         );
 
     // ── Skip RSID ────────────────────────────────────────────────
     let rsid_section = column![
         text("Skip RSID tunes:")
-            .size(14)
+            .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         tool_button(
             if config.skip_rsid {
@@ -1622,19 +1635,19 @@ pub fn settings_panel<'a>(
             Message::ToggleSkipRsid
         ),
         text("When enabled, RSID tunes are automatically skipped during playback.")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.52)),
     ]
     .spacing(6);
 
     // ── Force stereo ─────────────────────────────────────────────
     let stereo_section = column![
-        text("Force stereo for 2SID tunes:").size(14).color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text("Force stereo for 2SID tunes:").size(font::sized(14.0)).color(Color::from_rgb(0.75, 0.77, 0.82)),
         tool_button(
             if config.force_stereo_2sid { "✓ Yes — mirror SID1 to both channels" } else { "✗ No — true dual-SID (L=SID1, R=SID2)" },
             Message::ToggleForceStereo2sid,
         ),
-        text("When enabled, 2SID tunes ignore the second SID and mirror SID1 to both speakers (same as mono).").size(11).color(Color::from_rgb(0.45, 0.47, 0.52)),
+        text("When enabled, 2SID tunes ignore the second SID and mirror SID1 to both speakers (same as mono).").size(font::sized(11.0)).color(Color::from_rgb(0.45, 0.47, 0.52)),
     ].spacing(6);
 
     // ── Default song length ──────────────────────────────────────
@@ -1649,13 +1662,41 @@ pub fn settings_panel<'a>(
         "Disabled (0) — unknown songs won't auto-advance".to_string()
     };
 
+    // ── Base font size ─────────────────────────────────────────
+    let font_size_section = column![
+        text("Base font size (pt):")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text_input("12.0", base_font_size_text)
+            .on_input(Message::BaseFontSizeChanged)
+            .size(font::sized(14.0))
+            .padding(Padding::from([6, 10]))
+            .width(Length::Fixed(180.0))
+            .style(|_theme: &Theme, _st| text_input::Style {
+                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30)
+                },
+                icon: Color::from_rgb(0.5, 0.5, 0.6),
+                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+                value: Color::from_rgb(0.85, 0.87, 0.9),
+                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+            }),
+        text("All UI text scales relative to this. Default 12. Range 8–32.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
+
     let length_section = column![
         text("Default song length (seconds):")
-            .size(14)
+            .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         text_input("0 = disabled", default_length_text)
             .on_input(Message::DefaultSongLengthChanged)
-            .size(14)
+            .size(font::sized(14.0))
             .padding(Padding::from([6, 10]))
             .width(Length::Fixed(180.0))
             .style(|_theme: &Theme, _st| text_input::Style {
@@ -1671,10 +1712,10 @@ pub fn settings_panel<'a>(
                 selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
             }),
         text(cur_len)
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.52)),
         text("Fallback duration for songs not found in Songlength DB. Set to 0 to disable.")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.52)),
     ]
     .spacing(6);
@@ -1690,11 +1731,11 @@ pub fn settings_panel<'a>(
 
     let dl_section = column![
         text("HVSC Songlength database:")
-            .size(14)
+            .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         text_input("Songlength.md5 URL", &config.songlength_url)
             .on_input(Message::SonglengthUrlChanged)
-            .size(12)
+            .size(font::sized(12.0))
             .padding(Padding::from([6, 10]))
             .width(Length::Fill)
             .style(|_theme: &Theme, _st| text_input::Style {
@@ -1714,7 +1755,9 @@ pub fn settings_panel<'a>(
             Message::DownloadSonglength
         ),
         tool_button("📂 Load Songlength.md5 from file…", Message::LoadSonglength),
-        text(download_status).size(12).color(dl_color),
+        text(download_status)
+            .size(font::sized(12.0))
+            .color(dl_color),
     ]
     .spacing(6);
 
@@ -1729,11 +1772,11 @@ pub fn settings_panel<'a>(
 
     let stil_section = column![
         text("HVSC STIL.txt (song info & comments):")
-            .size(14)
+            .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         text_input("STIL.txt URL", &config.stil_url)
             .on_input(Message::StilUrlChanged)
-            .size(12)
+            .size(font::sized(12.0))
             .padding(Padding::from([6, 10]))
             .width(Length::Fill)
             .style(|_theme: &Theme, _st| text_input::Style {
@@ -1751,7 +1794,7 @@ pub fn settings_panel<'a>(
         tool_button("⬇ Download / Refresh STIL.txt", Message::DownloadStil),
         tool_button("📂 Load STIL.txt from file…", Message::LoadStil),
         text("HVSC root directory (optional — improves lookup accuracy):")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.55, 0.57, 0.62)),
         text_input(
             "e.g. /home/user/C64Music",
@@ -1761,7 +1804,7 @@ pub fn settings_panel<'a>(
         .on_submit(Message::SetHvscRoot(
             config.hvsc_root.clone().unwrap_or_default(),
         ))
-        .size(12)
+        .size(font::sized(12.0))
         .padding(Padding::from([6, 10]))
         .width(Length::Fill)
         .style(|_theme: &Theme, _st| text_input::Style {
@@ -1776,7 +1819,7 @@ pub fn settings_panel<'a>(
             value: Color::from_rgb(0.85, 0.87, 0.9),
             selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
         }),
-        text(stil_status).size(12).color(stil_color),
+        text(stil_status).size(font::sized(12.0)).color(stil_color),
     ]
     .spacing(6);
 
@@ -1794,7 +1837,7 @@ pub fn settings_panel<'a>(
     };
     let remote_section = column![
         text("Remote control (HTTP):")
-            .size(14)
+            .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         tool_button(
             if http_remote_running {
@@ -1806,26 +1849,28 @@ pub fn settings_panel<'a>(
         ),
         row![
             text("Port:")
-                .size(11)
+                .size(font::sized(11.0))
                 .color(Color::from_rgb(0.65, 0.67, 0.72)),
             Space::new().width(6),
             text_input("8364", http_port_text)
                 .on_input(Message::HttpRemotePortChanged)
-                .size(12)
+                .size(font::sized(12.0))
                 .padding(Padding::from([4, 8]))
                 .width(Length::Fixed(80.0)),
         ]
         .align_y(Alignment::Center),
-        text(remote_status).size(12).color(remote_status_color),
+        text(remote_status)
+            .size(font::sized(12.0))
+            .color(remote_status_color),
         text("Control Phosphor from any browser on the same network.")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.52)),
     ]
     .spacing(6);
 
     // ── Keyboard shortcuts ───────────────────────────────────────
     let mut kb_col = column![text("Keyboard shortcuts:")
-        .size(14)
+        .size(font::sized(14.0))
         .color(Color::from_rgb(0.75, 0.77, 0.82))]
     .spacing(4);
     for (key, desc) in [
@@ -1838,10 +1883,12 @@ pub fn settings_panel<'a>(
         kb_col = kb_col.push(
             row![
                 text(key)
-                    .size(12)
+                    .size(font::sized(12.0))
                     .color(Color::from_rgb(0.75, 0.88, 1.0))
                     .width(Length::Fixed(100.0)),
-                text(desc).size(12).color(Color::from_rgb(0.65, 0.67, 0.72)),
+                text(desc)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.65, 0.67, 0.72)),
             ]
             .spacing(8),
         );
@@ -1857,6 +1904,8 @@ pub fn settings_panel<'a>(
         stereo_section,
         rule::horizontal(1),
         length_section,
+        rule::horizontal(1),
+        font_size_section,
         rule::horizontal(1),
         dl_section,
         rule::horizontal(1),
@@ -1929,7 +1978,7 @@ pub fn karaoke_static_overlay(lyrics: &str) -> Element<'_, Message> {
     let body = scrollable(
         container(
             text(lyrics)
-                .size(18)
+                .size(font::sized(18.0))
                 .font(iced::Font::MONOSPACE)
                 .color(Color::from_rgb(0.35, 0.90, 0.60)),
         )
@@ -1961,16 +2010,20 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
 
     let header = row![
         text(format!("ⓘ  Song Info  (subtune {})", subtune))
-            .size(13)
+            .size(font::sized(13.0))
             .color(Color::from_rgb(0.45, 0.75, 1.0))
             .width(Length::Fill),
-        button(text("✕").size(13).color(Color::from_rgb(0.7, 0.7, 0.8)))
-            .on_press(Message::DismissStilOverlay)
-            .padding(Padding::from([2, 8]))
-            .style(|_theme: &Theme, _st| button::Style {
-                background: None,
-                ..Default::default()
-            }),
+        button(
+            text("✕")
+                .size(font::sized(13.0))
+                .color(Color::from_rgb(0.7, 0.7, 0.8))
+        )
+        .on_press(Message::DismissStilOverlay)
+        .padding(Padding::from([2, 8]))
+        .style(|_theme: &Theme, _st| button::Style {
+            background: None,
+            ..Default::default()
+        }),
     ]
     .align_y(Alignment::Center)
     .spacing(8);
@@ -1978,7 +2031,7 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
     let body = scrollable(
         container(
             text(text_content)
-                .size(12)
+                .size(font::sized(12.0))
                 .font(iced::Font::MONOSPACE)
                 .color(Color::from_rgb(0.80, 0.83, 0.88)),
         )
@@ -2043,7 +2096,7 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
 
 /// Small utility button used throughout the settings panel and toolbars.
 fn tool_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
-    button(text(label).size(12))
+    button(text(label).size(font::sized(12.0)))
         .on_press(msg)
         .padding(Padding::from([4, 10]))
         .style(|_theme: &Theme, st| button::Style {
@@ -2127,7 +2180,7 @@ pub fn filter_playlist(
 /// Thin right-aligned footer bar showing HVSC completion stats.
 /// Mimics the foobar2000 status bar style.
 pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
-    let help_btn = button(text("?").size(10))
+    let help_btn = button(text("?").size(font::sized(10.0)))
         .on_press(Message::ShowHelp)
         .padding(Padding::from([1, 6]))
         .style(|_theme: &Theme, st| button::Style {
@@ -2146,7 +2199,7 @@ pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
             help_btn,
             Space::new().width(Length::Fill),
             text(heard_text)
-                .size(11)
+                .size(font::sized(11.0))
                 .color(Color::from_rgb(0.42, 0.44, 0.52)),
             Space::new().width(Length::Fixed(12.0)),
         ]
@@ -2190,7 +2243,7 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
     // Title
     rows.push(
         text("Phosphor — Keyboard Shortcuts")
-            .size(15)
+            .size(font::sized(15.0))
             .color(Color::from_rgb(0.35, 0.90, 0.60))
             .into(),
     );
@@ -2199,10 +2252,14 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
     for (key, action) in shortcuts {
         rows.push(
             row![
-                container(text(*key).size(12).color(Color::from_rgb(0.80, 0.82, 0.90)))
-                    .width(Length::Fixed(180.0)),
+                container(
+                    text(*key)
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.80, 0.82, 0.90))
+                )
+                .width(Length::Fixed(180.0)),
                 text(*action)
-                    .size(12)
+                    .size(font::sized(12.0))
                     .color(Color::from_rgb(0.60, 0.62, 0.70)),
             ]
             .height(Length::Fixed(row_height))
@@ -2216,13 +2273,13 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
     // Author notice
     rows.push(
         text("Phosphor — SID music player")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.35, 0.37, 0.45))
             .into(),
     );
     rows.push(
         text("Built with Rust + Iced  •  USBSID-Pico / reSID / Ultimate 64")
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.30, 0.32, 0.40))
             .into(),
     );
@@ -2273,7 +2330,7 @@ pub fn mini_player_view<'a>(
 ) -> Element<'a, Message> {
     // ── Transport buttons ─────────────────────────────────────────────────────
     let mk_btn = |label: &'a str, msg: Message| -> Element<'a, Message> {
-        button(text(label).size(13))
+        button(text(label).size(font::sized(13.0)))
             .on_press(msg)
             .padding(Padding::from([4, 10]))
             .style(|_theme: &Theme, st| button::Style {
@@ -2322,10 +2379,10 @@ pub fn mini_player_view<'a>(
 
     let song_info = column![
         text(title)
-            .size(13)
+            .size(font::sized(13.0))
             .color(Color::from_rgb(0.88, 0.90, 0.95)),
         text(author)
-            .size(11)
+            .size(font::sized(11.0))
             .color(Color::from_rgb(0.52, 0.55, 0.65)),
     ]
     .spacing(2)
@@ -2358,7 +2415,7 @@ pub fn mini_player_view<'a>(
     .width(Length::Fill);
 
     // ── Expand + fav buttons ──────────────────────────────────────────────────
-    let expand_btn = button(text("⤢").size(12))
+    let expand_btn = button(text("⤢").size(font::sized(12.0)))
         .on_press(Message::ToggleMiniPlayer)
         .padding(Padding::from([4, 8]))
         .style(|_theme: &Theme, st| button::Style {
@@ -2371,7 +2428,7 @@ pub fn mini_player_view<'a>(
             ..Default::default()
         });
 
-    let fav_btn = button(text(fav_label).size(12))
+    let fav_btn = button(text(fav_label).size(font::sized(12.0)))
         .on_press(Message::ToggleFavoriteCurrent)
         .padding(Padding::from([4, 8]))
         .style(move |_theme: &Theme, _st| button::Style {
