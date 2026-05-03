@@ -95,6 +95,10 @@ struct App {
     show_settings: bool,
     /// Raw text from the default-song-length input field (may be mid-edit).
     default_length_text: String,
+    /// Raw text from the base-font-size input field. Holds intermediate
+    /// keystrokes (e.g. just `"1"` while typing `"14"`) so the field stays
+    /// editable; only successful parses commit to config.
+    base_font_size_text: String,
     /// Status message shown below the Songlength download button.
     download_status: String,
     /// Combined status for auto-downloads shown in the search bar.
@@ -211,6 +215,9 @@ struct App {
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let config = Config::load();
+        // Re-seed the global font scale to match the (possibly newer) config
+        // boot reads; main() also seeds before the window opens.
+        crate::ui::font::set_base(config.base_font_size);
         eprintln!(
             "[phosphor] Config: skip_rsid={}, default_length={}s, engine={}",
             config.skip_rsid, config.default_song_length_secs, config.output_engine,
@@ -286,6 +293,7 @@ impl App {
         } else {
             String::new()
         };
+        let base_font_size_text = format!("{}", config.base_font_size);
 
         let favorites = FavoritesDb::load();
         let recently_played = RecentlyPlayed::load();
@@ -328,6 +336,7 @@ impl App {
             config,
             show_settings: false,
             default_length_text,
+            base_font_size_text,
             download_status: String::new(),
             auto_download_status: String::new(),
             pending_auto_downloads: 0,
@@ -1146,6 +1155,21 @@ impl App {
                 }
             }
 
+            Message::BaseFontSizeChanged(val) => {
+                // Echo the keystroke back into the input buffer so the
+                // field remains editable mid-type. On a successful parse
+                // commit the clamped value and re-seed the global scale.
+                self.base_font_size_text = val.clone();
+                if let Ok(parsed) = val.trim().parse::<f32>() {
+                    let clamped = parsed.clamp(8.0, 32.0);
+                    if (clamped - self.config.base_font_size).abs() > f32::EPSILON {
+                        self.config.base_font_size = clamped;
+                        crate::ui::font::set_base(clamped);
+                        self.config.save();
+                    }
+                }
+            }
+
             Message::SonglengthUrlChanged(url) => {
                 self.config.songlength_url = url;
                 self.config.save();
@@ -1747,6 +1771,7 @@ impl App {
                 &self.stil_status,
                 self.http_remote_running,
                 &self.http_port_text,
+                &self.base_font_size_text,
             );
             column![
                 info_bar,
@@ -2794,6 +2819,9 @@ fn main() -> iced::Result {
     env_logger::init();
 
     let config_for_window = Config::load();
+    // Seed the global font scale before the first frame so the very first
+    // render already honours the user's configured base font size.
+    crate::ui::font::set_base(config_for_window.base_font_size);
 
     let icon = {
         let bytes = include_bytes!("../assets/phosphor.png");

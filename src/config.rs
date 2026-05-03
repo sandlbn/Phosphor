@@ -68,6 +68,10 @@ pub struct Config {
     /// Last known window size — restored on next launch.
     pub window_width_saved: f32,
     pub window_height_saved: f32,
+    /// Base font size in points. The UI scales every text element relative
+    /// to this — default 12.0 reproduces the original sizing exactly.
+    /// Clamped to [8.0, 32.0] on read/write to keep the layout legible.
+    pub base_font_size: f32,
 }
 
 impl Default for Config {
@@ -97,6 +101,7 @@ impl Default for Config {
             window_y: None,
             window_width_saved: DEFAULT_WINDOW_WIDTH,
             window_height_saved: DEFAULT_WINDOW_HEIGHT,
+            base_font_size: 12.0,
         }
     }
 }
@@ -269,6 +274,11 @@ impl Config {
                         config.window_height_saved = n;
                     }
                 }
+            } else if let Some(rest) = line.strip_prefix("\"base_font_size\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Ok(n) = val.parse::<f32>() {
+                    config.base_font_size = n.clamp(8.0, 32.0);
+                }
             }
         }
 
@@ -315,7 +325,8 @@ impl Config {
                 "  \"window_x\": {},\n",
                 "  \"window_y\": {},\n",
                 "  \"window_width_saved\": {},\n",
-                "  \"window_height_saved\": {}\n",
+                "  \"window_height_saved\": {},\n",
+                "  \"base_font_size\": {}\n",
                 "}}\n",
             ),
             self.skip_rsid,
@@ -342,6 +353,7 @@ impl Config {
             fmt_opt_i32(self.window_y),
             self.window_width_saved,
             self.window_height_saved,
+            self.base_font_size,
         )
     }
 

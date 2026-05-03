@@ -30,6 +30,7 @@ use iced::{
     mouse, Alignment, Color, Element, Font, Length, Padding, Point, Rectangle, Size, Theme,
 };
 
+use super::font;
 use super::Message;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -812,7 +813,7 @@ pub fn sid_panel<'a>(
             column![
                 Space::new().height(Length::Fixed(60.0)),
                 text("Load a tune to see SID register state")
-                    .size(13)
+                    .size(font::sized(13.0))
                     .color(Color::from_rgb(0.4, 0.4, 0.5)),
             ]
             .align_x(Alignment::Center)
@@ -886,7 +887,7 @@ fn sid_chip_panel<'a>(regs: &[u8], sid: usize, is_pal: bool) -> Element<'a, Mess
     let label = format!("SID {}", sid + 1);
 
     let mut col = Column::new().spacing(5);
-    col = col.push(text(label).size(11).color(accent));
+    col = col.push(text(label).size(font::sized(11.0)).color(accent));
     col = col.push(rule::horizontal(1));
 
     for voice in 0..3 {
@@ -991,19 +992,28 @@ fn voice_row<'a>(
     column![
         row![
             text(vl)
-                .size(11)
+                .size(font::sized(11.0))
                 .color(label_color)
                 .width(Length::Fixed(18.0)),
             Space::new().width(4),
-            text(wave).size(11).color(vc).width(Length::Fixed(58.0)),
-            text(flags).size(10).color(dc).width(Length::Fill),
-            text(gate_label).size(10).color(gate_color),
+            text(wave)
+                .size(font::sized(11.0))
+                .color(vc)
+                .width(Length::Fixed(58.0)),
+            text(flags)
+                .size(font::sized(10.0))
+                .color(dc)
+                .width(Length::Fill),
+            text(gate_label).size(font::sized(10.0)).color(gate_color),
         ]
         .align_y(Alignment::Center),
         row![
             Space::new().width(22),
-            text(note).size(11).color(vc).width(Length::Fixed(34.0)),
-            text(hz_str).size(10).color(dc),
+            text(note)
+                .size(font::sized(11.0))
+                .color(vc)
+                .width(Length::Fixed(34.0)),
+            text(hz_str).size(font::sized(10.0)).color(dc),
         ]
         .align_y(Alignment::Center),
         row![
@@ -1101,7 +1111,7 @@ fn global_row<'a>(regs: &[u8], base: usize, accent: Color) -> Element<'a, Messag
     .into();
 
     column![
-        text("GLOBAL").size(10).color(hc),
+        text("GLOBAL").size(font::sized(10.0)).color(hc),
         row![
             lbl("VOL", dc),
             Space::new().width(3),
@@ -1138,5 +1148,8 @@ fn global_row<'a>(regs: &[u8], base: usize, accent: Color) -> Element<'a, Messag
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn lbl<'a>(s: impl ToString, color: Color) -> Element<'a, Message> {
-    text(s.to_string()).size(10).color(color).into()
+    text(s.to_string())
+        .size(font::sized(10.0))
+        .color(color)
+        .into()
 }
