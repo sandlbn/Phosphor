@@ -1,0 +1,23 @@
+# Reproducible Linux x86_64 build environment for Phosphor.
+# Used by `make linux_deb_docker` to produce a Debian package
+# from any host (notably macOS) without needing a Linux VM.
+#
+# Build the image once:
+#   docker build -f Dockerfile.linux-build -t phosphor-linux-build .
+#
+# Run a build:
+#   docker run --rm -v "$PWD":/src -e CARGO_TARGET_DIR=/src/target-linux \
+#       phosphor-linux-build cargo deb
+
+FROM --platform=linux/amd64 rust:1.94.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libudev-dev \
+        libasound2-dev \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-deb --locked
+
+WORKDIR /src

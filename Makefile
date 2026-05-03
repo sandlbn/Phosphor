@@ -12,13 +12,18 @@ UNAME_S := $(shell uname -s)
 MAC_OUT := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-macOS.pkg
 LIN_OUT := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64.deb
 
-.PHONY: help clean dist linux_deb macos_pkg
+DOCKER_IMAGE := phosphor-linux-build
+DOCKERFILE   := Dockerfile.linux-build
+
+.PHONY: help clean dist linux_deb linux_deb_docker linux_image macos_pkg
 
 help:
 	@echo "Targets:"
-	@echo "  make linux_deb   - build .deb via cargo deb"
-	@echo "  make macos_pkg   - rename/copy macOS pkg"
-	@echo "  make dist        - build for current OS"
+	@echo "  make linux_deb         - build .deb via cargo deb (must run on Linux)"
+	@echo "  make linux_deb_docker  - build Linux x86_64 .deb via Docker (works on macOS too)"
+	@echo "  make linux_image       - (re)build the Docker image only"
+	@echo "  make macos_pkg         - rename/copy macOS pkg"
+	@echo "  make dist              - build for current OS"
 	@echo "  make clean"
 	@echo ""
 	@echo "Detected OS=$(UNAME_S) VERSION=$(VERSION)"
@@ -44,6 +49,28 @@ linux_deb:
 	@mkdir -p $(DIST_DIR)
 	cargo deb
 	@DEB_PATH=$$(ls -1 target/debian/*.deb | head -n 1); \
+	cp "$$DEB_PATH" "$(LIN_OUT)"; \
+	echo "Built: $(LIN_OUT)"
+
+# -----------------------
+# Linux via Docker (works on macOS / any host with Docker)
+# -----------------------
+# Builds the .deb inside a containerised x86_64 Linux toolchain so we can
+# release Linux packages without a Linux box. Output lands in dist/ exactly
+# like `make linux_deb`. Build artefacts go to ./target-linux to keep the
+# host's macOS `target/` cache clean.
+linux_image:
+	docker build --platform linux/amd64 -f $(DOCKERFILE) -t $(DOCKER_IMAGE) .
+
+linux_deb_docker: linux_image
+	@mkdir -p $(DIST_DIR)
+	docker run --rm \
+	  --platform linux/amd64 \
+	  -v "$(CURDIR)":/src \
+	  -e CARGO_TARGET_DIR=/src/target-linux \
+	  $(DOCKER_IMAGE) \
+	  cargo deb
+	@DEB_PATH=$$(ls -1 target-linux/debian/*.deb | head -n 1); \
 	cp "$$DEB_PATH" "$(LIN_OUT)"; \
 	echo "Built: $(LIN_OUT)"
 
