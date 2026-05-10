@@ -438,13 +438,34 @@ fn player_loop(
                                 // rather than host wall-clock + start latency.
                                 // The on-screen clock has 1 s resolution, so
                                 // any cadence finer than that is wasted.
+                                //
+                                // Skip the poll for the first ~1 s of any fresh
+                                // PlayContext: after SetSubtune the C64 is mid-
+                                // reset and screen RAM at $3F98 still holds the
+                                // *previous* subsong's elapsed digits. Reading
+                                // them as the new song would repeatedly trigger
+                                // auto-advance and cascade through every
+                                // remaining subsong. Wall-clock fallback covers
+                                // the grace window (it starts at 0 here).
                                 let frame_hz = (1_000_000 / ctx.frame_us.max(1)) as u32;
                                 let poll_period = (frame_hz / 2).max(1);
-                                if ctx.frame_count % poll_period == 0 {
+                                let grace_frames = frame_hz;
+                                if ctx.frame_count >= grace_frames
+                                    && ctx.frame_count % poll_period == 0
+                                {
                                     if let Some(ref mut br) = bridge {
                                         if let Some(secs) = br.read_screen_elapsed() {
-                                            ctx.u64_screen_elapsed_secs = Some(secs);
-                                            ctx.u64_screen_read_at = Some(Instant::now());
+                                            // Defence in depth: a fresh ctx's
+                                            // wall-clock is the upper bound on
+                                            // legitimate elapsed time. Anything
+                                            // > +5 s ahead is stale screen
+                                            // content from before the most
+                                            // recent sid_play() landed.
+                                            let wall_secs = ctx.elapsed.as_secs() as u32;
+                                            if secs <= wall_secs.saturating_add(5) {
+                                                ctx.u64_screen_elapsed_secs = Some(secs);
+                                                ctx.u64_screen_read_at = Some(Instant::now());
+                                            }
                                         }
                                         // Total only changes per song; only fetch
                                         // until we've successfully captured it.
@@ -821,6 +842,17 @@ fn handle_cmd(
                         match br.resume_machine() {
                             Ok(()) => {
                                 *state = PlayState::Playing;
+                                // Discard the U64 screen-timer cache: while
+                                // the machine was paused the screen-clock was
+                                // frozen but the host's `Instant` kept ticking,
+                                // so the existing `read_at` would inflate the
+                                // interpolated elapsed by however long we were
+                                // paused. Force the next poll to re-base from
+                                // a fresh read.
+                                if let Some(ref mut ctx) = play_ctx {
+                                    ctx.u64_screen_elapsed_secs = None;
+                                    ctx.u64_screen_read_at = None;
+                                }
                                 eprintln!("[phosphor] U64 machine resumed");
                             }
                             Err(e) => {
