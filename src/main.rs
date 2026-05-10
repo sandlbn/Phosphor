@@ -670,6 +670,7 @@ impl App {
                     let next = (info.current_song + 1).min(info.songs);
                     if next != info.current_song {
                         let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next));
+                        self.clear_advance_status();
                         self.update_entry_subtune(next);
                     }
                 }
@@ -680,6 +681,7 @@ impl App {
                     let prev = info.current_song.saturating_sub(1).max(1);
                     if prev != info.current_song {
                         let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(prev));
+                        self.clear_advance_status();
                         self.update_entry_subtune(prev);
                     }
                 }
@@ -2035,6 +2037,23 @@ impl App {
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
+    /// Reset all timing-related status fields the auto-advance check reads.
+    ///
+    /// Must be called whenever we queue a `Play` or `SetSubtune` command —
+    /// without this, `Tick` (every 33 ms) keeps reading the previous song's
+    /// elapsed time while the player thread is busy processing the queued
+    /// command (notably U64's `sid_play` REST call, ~300 ms). Each Tick
+    /// re-fires SetSubtune on the same stale data, queueing 5-15 extra
+    /// transitions before the player can respond — visibly skipping
+    /// subtunes at ~3 per second.
+    fn clear_advance_status(&mut self) {
+        self.status.elapsed = Duration::ZERO;
+        self.status.u64_screen_elapsed_secs = None;
+        self.status.u64_screen_read_at = None;
+        self.status.u64_screen_total_secs = None;
+        self.silence_frames = 0;
+    }
+
     fn play_track(&mut self, idx: usize) {
         if let Some(entry) = self.playlist.entries.get(idx) {
             if self.config.skip_rsid && entry.is_rsid {
@@ -2098,6 +2117,7 @@ impl App {
                 audio_port,
                 restart_usb_on_load: self.config.restart_usb_on_load,
             });
+            self.clear_advance_status();
             // entry borrow ends here; now safe to call &mut self method.
             self.refresh_stil_entry();
         }
@@ -2369,6 +2389,7 @@ impl App {
                                 }
                             });
                         let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next_song));
+                        self.clear_advance_status();
                         if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
                             e.selected_song = next_song;
                             e.duration_secs = next_dur;
@@ -2513,6 +2534,7 @@ impl App {
                 }
                 remote::RemoteCmd::SetSubtune(n) => {
                     let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(n));
+                    self.clear_advance_status();
                 }
             }
         }
