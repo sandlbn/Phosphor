@@ -266,7 +266,9 @@ pkgbuild \
 # ── Resources for the installer UI ──────────────────────────────────────────
 cat > "$BUILD_DIR/staging/resources/welcome.html" << 'WELCOME'
 <html>
-<head><style>
+<head>
+<meta charset="utf-8">
+<style>
   body { font-family: -apple-system, Helvetica Neue, sans-serif; padding: 20px; }
   h1 { font-size: 22px; }
   p { font-size: 14px; line-height: 1.5; }
@@ -286,7 +288,9 @@ WELCOME
 
 cat > "$BUILD_DIR/staging/resources/conclusion.html" << 'CONCLUSION'
 <html>
-<head><style>
+<head>
+<meta charset="utf-8">
+<style>
   body { font-family: -apple-system, Helvetica Neue, sans-serif; padding: 20px; }
   h1 { font-size: 22px; color: #2d8a4e; }
   p { font-size: 14px; line-height: 1.5; }
