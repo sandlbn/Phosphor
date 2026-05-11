@@ -871,6 +871,7 @@ fn handle_cmd(
 
         PlayerCmd::SetSubtune(song) => {
             *last_error = None;
+            eprintln!("[player] SetSubtune({song}) received");
             if let Some(ref ctx) = play_ctx {
                 let path = ctx.track_info.path.clone();
                 let stereo = ctx.mirror_mono;

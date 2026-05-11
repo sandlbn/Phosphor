@@ -28,7 +28,7 @@ mod sid_sidlite;
 mod sid_u64;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::sync::{Arc, Mutex};
 
@@ -154,6 +154,16 @@ struct App {
     /// Consecutive frames with zero SID writes — used to detect end-of-song
     /// silence for MUS files that don't have songlength DB entries.
     silence_frames: u32,
+    /// When the last auto-advance (subtune or track) was issued. Used to
+    /// debounce a single auto-advance per 500 ms regardless of any stale-
+    /// status race we haven't located. Reset to `None` on every user-
+    /// initiated playback change (Play/Stop/Pause-resume) so the debounce
+    /// can't fight an intentional rapid action.
+    last_advance_at: Option<Instant>,
+    /// Did we already log the SUPPRESSED diagnostic for the current debounce
+    /// window? Without this we'd emit one log line per Tick (~15 lines per
+    /// real subtune end) on slow engines like U64.
+    advance_suppress_logged: bool,
 
     /// Whether the visualiser is expanded to fill the whole window (overlay mode).
     /// Double-clicking the visualiser canvas toggles this.
@@ -361,6 +371,8 @@ impl App {
             pixel_ratio: 1.0,
             context_menu: None,
             silence_frames: 0,
+            last_advance_at: None,
+            advance_suppress_logged: false,
             vis_expanded: false,
             show_help: false,
             mini_mode: false,
@@ -635,6 +647,10 @@ impl App {
                     }
                 } else {
                     let _ = self.cmd_tx.send(PlayerCmd::TogglePause);
+                    // User-initiated pause/resume — drop the debounce so the
+                    // first auto-advance after resume isn't gated by a stale
+                    // timestamp from before pause.
+                    self.last_advance_at = None;
                 }
             }
 
@@ -644,6 +660,7 @@ impl App {
                 self.visualizer.reset();
                 self.tracker_history.reset();
                 self.tracker_view.reset();
+                self.last_advance_at = None;
             }
 
             Message::NextTrack => {
@@ -2048,6 +2065,12 @@ impl App {
     /// subtunes at ~3 per second.
     fn clear_advance_status(&mut self) {
         self.status.elapsed = Duration::ZERO;
+        // Zero writes_per_frame too — without this, while the player thread
+        // is blocked in a slow handler (notably U64 sid_play), every main.rs
+        // Tick increments silence_frames against a stale 0-writes status.
+        // It can't fire silence-advance because of the 5 s elapsed gate, but
+        // zeroing here means one fewer counter that can drift.
+        self.status.writes_per_frame = 0;
         self.status.u64_screen_elapsed_secs = None;
         self.status.u64_screen_read_at = None;
         self.status.u64_screen_total_secs = None;
@@ -2118,6 +2141,9 @@ impl App {
                 restart_usb_on_load: self.config.restart_usb_on_load,
             });
             self.clear_advance_status();
+            // Fresh track — drop the debounce so the auto-advance for THIS
+            // track's first subtune isn't gated by the previous track's fire.
+            self.last_advance_at = None;
             // entry borrow ends here; now safe to call &mut self method.
             self.refresh_stil_entry();
         }
@@ -2265,6 +2291,37 @@ impl App {
             self.status = status;
         }
 
+        // Drop stale timing data from statuses that pre-date our most recent
+        // SetSubtune. The player thread runs its drain at the START of each
+        // frame, so a SetSubtune cmd queued mid-frame doesn't get picked up
+        // until the NEXT frame — and the current frame still finishes engine
+        // + send_status using the OLD ctx. That status arrives in status_rx
+        // and, without this filter, would overwrite the cleared state we set
+        // in clear_advance_status(), causing auto-advance to re-fire on
+        // stale `elapsed` / `u64_screen_elapsed_secs`.
+        //
+        // Signal: the status carries `track_info.current_song` from the ctx
+        // that produced it. If main.rs has already moved the playlist
+        // entry's selected_song forward (post-SetSubtune), a mismatch means
+        // this status is from the previous subtune — zero the timing fields
+        // so auto-advance sees `elapsed=0 < dur` and doesn't fire.
+        let stale = match (
+            self.status.track_info.as_ref(),
+            self.playlist
+                .current
+                .and_then(|i| self.playlist.entries.get(i)),
+        ) {
+            (Some(info), Some(entry)) => info.current_song != entry.selected_song,
+            _ => false,
+        };
+        if stale {
+            self.status.elapsed = Duration::ZERO;
+            self.status.writes_per_frame = 0;
+            self.status.u64_screen_elapsed_secs = None;
+            self.status.u64_screen_read_at = None;
+            self.status.u64_screen_total_secs = None;
+        }
+
         // Advance karaoke line when new FLAG events are detected.
         if self.status.flag_count > self.last_flag_count {
             let new_flags = self.status.flag_count - self.last_flag_count;
@@ -2363,59 +2420,106 @@ impl App {
                         if silence_ended && dur.is_none() {
                             eprintln!("[phosphor] Silence detected after {}s — advancing", elapsed);
                         }
-                        Some((entry.selected_song, entry.songs, entry.md5.clone()))
+                        let trigger = if duration_ended {
+                            "duration"
+                        } else {
+                            "silence"
+                        };
+                        Some((
+                            entry.selected_song,
+                            entry.songs,
+                            entry.md5.clone(),
+                            elapsed,
+                            dur,
+                            trigger,
+                        ))
                     } else {
                         None
                     }
                 });
 
-                if let Some((cur_song, total_songs, md5)) = advance_info {
-                    if cur_song < total_songs {
-                        let next_song = cur_song + 1;
-                        let subtune_idx = (next_song - 1) as usize;
-                        let next_dur = md5
-                            .as_ref()
-                            .and_then(|m| {
-                                self.songlength_db
-                                    .as_ref()
-                                    .and_then(|db| db.lookup(m, subtune_idx))
-                            })
-                            .or_else(|| {
-                                let d = self.config.default_song_length_secs;
-                                if d > 0 {
-                                    Some(d)
-                                } else {
-                                    None
-                                }
-                            });
-                        let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next_song));
-                        self.clear_advance_status();
-                        if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
-                            e.selected_song = next_song;
-                            e.duration_secs = next_dur;
+                if let Some((cur_song, total_songs, md5, elapsed, dur, trigger)) = advance_info {
+                    // Debounce: cap auto-advance at one per 500 ms.  Even if there's
+                    // a stale-status race we haven't located, this bounds the
+                    // user-visible symptom (subtune skipping by 1 every transition)
+                    // to at most one advance per real subtune end.
+                    let now = Instant::now();
+                    let suppressed = self
+                        .last_advance_at
+                        .map(|t| now.duration_since(t) < Duration::from_millis(500))
+                        .unwrap_or(false);
+                    if suppressed {
+                        // Log only once per debounce window — we only care about
+                        // the FIRST suppressed candidate per real subtune end.
+                        // Subsequent Ticks within the window are normal artefacts
+                        // of the stale-status race and would just spam stderr.
+                        if !self.advance_suppress_logged {
+                            let since = self
+                                .last_advance_at
+                                .map(|t| now.duration_since(t))
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[advance] SUPPRESSED by debounce ({:?} since last)  cur_song={}/{} elapsed={} dur={:?} u64_secs={:?} silence_frames={} trigger={}",
+                                since, cur_song, total_songs, elapsed, dur,
+                                self.status.u64_screen_elapsed_secs, self.silence_frames, trigger,
+                            );
+                            self.advance_suppress_logged = true;
                         }
                     } else {
-                        let first_dur = md5
-                            .as_ref()
-                            .and_then(|m| {
-                                self.songlength_db.as_ref().and_then(|db| db.lookup(m, 0))
-                            })
-                            .or_else(|| {
-                                let d = self.config.default_song_length_secs;
-                                if d > 0 {
-                                    Some(d)
-                                } else {
-                                    None
-                                }
-                            });
-                        if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
-                            e.selected_song = 1;
-                            e.duration_secs = first_dur;
-                        }
-                        if let Some(idx) = self.playlist.next() {
-                            self.play_track(idx);
+                        eprintln!(
+                            "[advance] cur_song={}/{} elapsed={} dur={:?} u64_secs={:?} silence_frames={} trigger={}",
+                            cur_song, total_songs, elapsed, dur,
+                            self.status.u64_screen_elapsed_secs, self.silence_frames, trigger,
+                        );
+                        self.last_advance_at = Some(now);
+                        self.advance_suppress_logged = false;
+                        if cur_song < total_songs {
+                            let next_song = cur_song + 1;
+                            let subtune_idx = (next_song - 1) as usize;
+                            let next_dur = md5
+                                .as_ref()
+                                .and_then(|m| {
+                                    self.songlength_db
+                                        .as_ref()
+                                        .and_then(|db| db.lookup(m, subtune_idx))
+                                })
+                                .or_else(|| {
+                                    let d = self.config.default_song_length_secs;
+                                    if d > 0 {
+                                        Some(d)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next_song));
+                            self.clear_advance_status();
+                            if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
+                                e.selected_song = next_song;
+                                e.duration_secs = next_dur;
+                            }
                         } else {
-                            let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                            let first_dur = md5
+                                .as_ref()
+                                .and_then(|m| {
+                                    self.songlength_db.as_ref().and_then(|db| db.lookup(m, 0))
+                                })
+                                .or_else(|| {
+                                    let d = self.config.default_song_length_secs;
+                                    if d > 0 {
+                                        Some(d)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
+                                e.selected_song = 1;
+                                e.duration_secs = first_dur;
+                            }
+                            if let Some(idx) = self.playlist.next() {
+                                self.play_track(idx);
+                            } else {
+                                let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                            }
                         }
                     }
                 }
