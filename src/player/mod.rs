@@ -72,6 +72,11 @@ pub struct PlayerStatus {
     /// slot. Used as a duration fallback when HVSC has no entry. `None` for
     /// non-U64 engines or until the first successful read.
     pub u64_screen_total_secs: Option<u32>,
+    /// Whether the active SID device reports itself as reachable. Always
+    /// `true` for non-network engines; `false` on the U64 path after a
+    /// failed REST call (network drop, device offline). GUI renders a
+    /// "Disconnected" pill when this is false.
+    pub device_connected: bool,
     /// Raw SID register shadow — 128 bytes (4 SIDs × 32 bytes each).
     /// Indices 0x00–0x1F = SID1, 0x20–0x3F = SID2, etc.
     pub sid_regs: Vec<u8>,
@@ -94,6 +99,7 @@ impl Default for PlayerStatus {
             u64_screen_elapsed_secs: None,
             u64_screen_read_at: None,
             u64_screen_total_secs: None,
+            device_connected: true,
         }
     }
 }
@@ -513,6 +519,11 @@ fn player_loop(
 
                         ctx.frame_count += 1;
                         ctx.elapsed += frame_dur;
+                        // Refresh the device-connected flag every frame so
+                        // the GUI's pill follows the device state within ~1
+                        // frame of any reconnect/disconnect.
+                        ctx.device_connected =
+                            bridge.as_ref().map(|b| b.is_connected()).unwrap_or(false);
                     }
 
                     send_status(&state, &play_ctx, &last_error, &status_tx);
@@ -574,6 +585,7 @@ fn send_status(
         s.u64_screen_elapsed_secs = c.u64_screen_elapsed_secs;
         s.u64_screen_read_at = c.u64_screen_read_at;
         s.u64_screen_total_secs = c.u64_screen_total_secs;
+        s.device_connected = c.device_connected;
     }
     let _ = tx.try_send(s);
 }
@@ -791,6 +803,7 @@ fn handle_cmd(
                     u64_screen_elapsed_secs: None,
                     u64_screen_read_at: None,
                     u64_screen_total_secs: None,
+                    device_connected: true,
                 });
             } else {
                 let mut ctx = setup_playback(
@@ -1001,6 +1014,7 @@ fn handle_cmd(
                                             u64_screen_elapsed_secs: None,
                                             u64_screen_read_at: None,
                                             u64_screen_total_secs: None,
+                                            device_connected: true,
                                         });
                                         *state = PlayState::Playing;
                                     }
@@ -1120,6 +1134,10 @@ struct PlayContext {
     /// On-screen total song length, captured at the first successful poll.
     /// Used as a duration fallback when HVSC has no entry for this tune.
     u64_screen_total_secs: Option<u32>,
+    /// Mirrors the current bridge's `is_connected()` result. Refreshed on
+    /// every player frame so the GUI's "Disconnected" indicator stays
+    /// current within one frame of the device coming/going.
+    device_connected: bool,
 }
 
 enum PlayEngine {
@@ -1566,6 +1584,7 @@ fn setup_playback(
         u64_screen_elapsed_secs: None,
         u64_screen_read_at: None,
         u64_screen_total_secs: None,
+        device_connected: true,
     }
 }
 

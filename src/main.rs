@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[allow(dead_code)]
+mod audio_volume;
 mod c64_emu;
 mod config;
 mod heard_db;
@@ -228,6 +229,7 @@ impl App {
         // Re-seed the global font scale to match the (possibly newer) config
         // boot reads; main() also seeds before the window opens.
         crate::ui::font::set_base(config.base_font_size);
+        crate::audio_volume::set(config.master_volume);
         eprintln!(
             "[phosphor] Config: skip_rsid={}, default_length={}s, engine={}",
             config.skip_rsid, config.default_song_length_secs, config.output_engine,
@@ -1174,6 +1176,15 @@ impl App {
                 }
             }
 
+            Message::VolumeChanged(v) => {
+                let clamped = v.clamp(0.0, 1.0);
+                if (clamped - self.config.master_volume).abs() > 1e-4 {
+                    self.config.master_volume = clamped;
+                    crate::audio_volume::set(clamped);
+                    self.config.save();
+                }
+            }
+
             Message::BaseFontSizeChanged(val) => {
                 // Echo the keystroke back into the input buffer so the
                 // field remains editable mid-type. On a successful parse
@@ -1769,6 +1780,7 @@ impl App {
             self.stil_entry.is_some() || !self.stil_display_text.is_empty(),
             self.window_width,
             &self.config.output_engine,
+            self.config.master_volume,
         );
         let controls = ui::controls_bar(
             &self.status,
@@ -2948,6 +2960,8 @@ fn main() -> iced::Result {
     // Seed the global font scale before the first frame so the very first
     // render already honours the user's configured base font size.
     crate::ui::font::set_base(config_for_window.base_font_size);
+    // Seed master volume too so the audio thread starts at the saved level.
+    crate::audio_volume::set(config_for_window.master_volume);
 
     let icon = {
         let bytes = include_bytes!("../assets/phosphor.png");

@@ -72,6 +72,11 @@ pub struct Config {
     /// to this — default 12.0 reproduces the original sizing exactly.
     /// Clamped to [8.0, 32.0] on read/write to keep the layout legible.
     pub base_font_size: f32,
+    /// Host-side master volume in [0.0, 1.0]. Applied in the cpal output
+    /// callbacks of emulated / sidlite / U64-streaming engines. Has no
+    /// effect on the USB hardware engine (analog output, not reachable
+    /// from host). Default 1.0 = unity gain (no change vs prior versions).
+    pub master_volume: f32,
 }
 
 impl Default for Config {
@@ -102,6 +107,7 @@ impl Default for Config {
             window_width_saved: DEFAULT_WINDOW_WIDTH,
             window_height_saved: DEFAULT_WINDOW_HEIGHT,
             base_font_size: 12.0,
+            master_volume: 1.0,
         }
     }
 }
@@ -279,6 +285,11 @@ impl Config {
                 if let Ok(n) = val.parse::<f32>() {
                     config.base_font_size = n.clamp(8.0, 32.0);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"master_volume\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Ok(n) = val.parse::<f32>() {
+                    config.master_volume = n.clamp(0.0, 1.0);
+                }
             }
         }
 
@@ -326,7 +337,8 @@ impl Config {
                 "  \"window_y\": {},\n",
                 "  \"window_width_saved\": {},\n",
                 "  \"window_height_saved\": {},\n",
-                "  \"base_font_size\": {}\n",
+                "  \"base_font_size\": {},\n",
+                "  \"master_volume\": {}\n",
                 "}}\n",
             ),
             self.skip_rsid,
@@ -354,6 +366,7 @@ impl Config {
             self.window_width_saved,
             self.window_height_saved,
             self.base_font_size,
+            self.master_volume,
         )
     }
 

@@ -335,11 +335,12 @@ impl AudioStream {
                                             return;
                                         }
                                     }
+                                    let vol = crate::audio_volume::scale();
                                     // Stereo pairs; upmix to N channels if needed.
                                     let frames = data.len() / channels;
                                     for f in 0..frames {
-                                        let l = r.samples.pop_front().unwrap_or(0.0);
-                                        let r_samp = r.samples.pop_front().unwrap_or(0.0);
+                                        let l = r.samples.pop_front().unwrap_or(0.0) * vol;
+                                        let r_samp = r.samples.pop_front().unwrap_or(0.0) * vol;
                                         let base = f * channels;
                                         data[base] = l;
                                         if channels > 1 {
@@ -431,6 +432,11 @@ pub struct U64Device {
     rest: Rest,
     address: String,
     audio: Option<AudioStream>,
+    /// Whether the most recent REST call succeeded. Set to `false` whenever
+    /// a call returns Err (network drop, device powered off, etc.) and back
+    /// to `true` on the next success. The GUI surfaces this via the
+    /// engine-name pill in the info bar.
+    connected: bool,
     /// Cached base address of the C64 screen RAM, computed once after
     /// `play_sid_native()` returns. The U64's SID-player UI renders the
     /// elapsed playback time as 5 ASCII screen-code digits at row 23
@@ -470,13 +476,17 @@ impl U64Device {
             .map_err(|e| format!("Cannot connect to Ultimate 64 at {}: {}", address, e))?;
 
         // Quick connectivity check: request device info.
-        match rest.version() {
-            Ok(ver) => eprintln!("[u64] Connected to Ultimate 64 at {} ({})", address, ver),
+        let connected = match rest.version() {
+            Ok(ver) => {
+                eprintln!("[u64] Connected to Ultimate 64 at {} ({})", address, ver);
+                true
+            }
             Err(e) => {
                 eprintln!("[u64] Warning: device at {} not responding: {}", address, e);
                 // Don't fail here — the device might come online later.
+                false
             }
-        }
+        };
 
         Ok(Self {
             rest,
@@ -484,16 +494,36 @@ impl U64Device {
             audio: None,
             screen_base: None,
             screen_layout_ok: false,
+            connected,
         })
+    }
+
+    /// Update the connection flag based on a fresh REST call result. The
+    /// transition is logged so the user-visible "Disconnected" pill has a
+    /// matching breadcrumb in stderr.
+    fn note_call<T, E: std::fmt::Display>(&mut self, label: &str, result: &Result<T, E>) {
+        let now_connected = result.is_ok();
+        if now_connected != self.connected {
+            if now_connected {
+                eprintln!("[u64] reconnected (via {label})");
+            } else if let Err(e) = result {
+                eprintln!("[u64] disconnected (via {label}): {e}");
+            }
+            self.connected = now_connected;
+        }
     }
 
     /// Compute the C64 screen-RAM base address from VIC-II + CIA2 registers.
     /// On firmware 1.1.0 the SID-player UI uses VIC bank 0 and screen offset
     /// 0xF, giving `$3C00`. Other firmware versions may differ, so we read it
     /// rather than hardcoding.
-    fn compute_screen_base(&self) -> Option<u16> {
-        let vic_d018 = self.rest.read_mem(0xD018, 1).ok()?;
-        let cia2_pa = self.rest.read_mem(0xDD00, 1).ok()?;
+    fn compute_screen_base(&mut self) -> Option<u16> {
+        let vic_d018 = self.rest.read_mem(0xD018, 1);
+        self.note_call("read_mem(D018)", &vic_d018);
+        let vic_d018 = vic_d018.ok()?;
+        let cia2_pa = self.rest.read_mem(0xDD00, 1);
+        self.note_call("read_mem(DD00)", &cia2_pa);
+        let cia2_pa = cia2_pa.ok()?;
         let screen_offset = ((vic_d018[0] >> 4) & 0x0F) as u16;
         // CIA2 PA bits 0-1 select VIC bank, inverted: 11→bank0, 10→bank1, etc.
         let bank = (!cia2_pa[0]) & 0x03;
@@ -522,8 +552,10 @@ impl U64Device {
     }
 
     /// Read 5 screen-code bytes at `addr` and parse as `MM:SS`. Internal helper.
-    fn read_screen_mmss(&self, addr: u16) -> Option<u32> {
-        let bytes = self.rest.read_mem(addr, 5).ok()?;
+    fn read_screen_mmss(&mut self, addr: u16) -> Option<u32> {
+        let r = self.rest.read_mem(addr, 5);
+        self.note_call("read_mem(screen)", &r);
+        let bytes = r.ok()?;
         Self::parse_mmss(&bytes)
     }
 
@@ -570,9 +602,15 @@ impl SidDevice for U64Device {
     }
 
     fn reset(&mut self) {
-        if let Err(e) = self.rest.reset() {
+        let r = self.rest.reset();
+        self.note_call("reset", &r);
+        if let Err(e) = r {
             eprintln!("[u64] Reset failed: {e}");
         }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
     }
 
     fn set_stereo(&mut self, _mode: i32) {
@@ -614,9 +652,9 @@ impl SidDevice for U64Device {
     fn play_sid_native(&mut self, data: &[u8], song: u16) -> Result<bool, String> {
         let song_num = if song > 0 { Some(song as u8) } else { None };
 
-        self.rest
-            .sid_play(data, song_num)
-            .map_err(|e| format!("U64 sid_play failed: {e}"))?;
+        let result = self.rest.sid_play(data, song_num);
+        self.note_call("sid_play", &result);
+        result.map_err(|e| format!("U64 sid_play failed: {e}"))?;
 
         // The U64 redraws its player UI for each new song, so the screen
         // base + validation must be recomputed. The next read_screen_*
@@ -641,16 +679,16 @@ impl SidDevice for U64Device {
 
     /// Freeze the C64 mid-frame — clock and SID output both pause instantly.
     fn pause_machine(&mut self) -> Result<(), String> {
-        self.rest
-            .pause()
-            .map_err(|e| format!("U64 pause failed: {e}"))
+        let r = self.rest.pause();
+        self.note_call("pause", &r);
+        r.map_err(|e| format!("U64 pause failed: {e}"))
     }
 
     /// Resume the C64 from exactly where it was frozen.
     fn resume_machine(&mut self) -> Result<(), String> {
-        self.rest
-            .resume()
-            .map_err(|e| format!("U64 resume failed: {e}"))
+        let r = self.rest.resume();
+        self.note_call("resume", &r);
+        r.map_err(|e| format!("U64 resume failed: {e}"))
     }
 
     /// Start streaming audio from the U64 back to this machine on `port`.
