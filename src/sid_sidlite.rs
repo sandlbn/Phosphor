@@ -135,12 +135,13 @@ fn spawn_audio_thread(audio_buf: AudioBuffer, shutdown: Arc<AtomicBool>) -> Resu
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             let mut ring = buf.lock().unwrap();
+                            let vol = crate::audio_volume::scale();
                             let frames = data.len() / 2;
                             for f in 0..frames {
                                 let idx = f * 2;
                                 if let Some((l, r)) = ring.pop_front() {
-                                    data[idx] = l as f32 / 32768.0;
-                                    data[idx + 1] = r as f32 / 32768.0;
+                                    data[idx] = (l as f32 / 32768.0) * vol;
+                                    data[idx + 1] = (r as f32 / 32768.0) * vol;
                                 } else {
                                     data[idx] = 0.0;
                                     data[idx + 1] = 0.0;

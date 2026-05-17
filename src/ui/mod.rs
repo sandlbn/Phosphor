@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use iced::widget::canvas::{self, Frame, Geometry};
 use iced::widget::{
-    button, column, container, mouse_area, row, rule, scrollable, text, text_input, Canvas, Column,
-    Space,
+    button, column, container, mouse_area, row, rule, scrollable, text, text_input,
+    vertical_slider, Canvas, Column, Space,
 };
 use iced::{mouse, Alignment, Color, Element, Length, Padding, Point, Rectangle, Size, Theme};
 
@@ -171,6 +171,7 @@ pub enum Message {
     ToggleForceStereo2sid,
     DefaultSongLengthChanged(String),
     BaseFontSizeChanged(String),
+    VolumeChanged(f32),
     SonglengthUrlChanged(String),
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
@@ -259,6 +260,7 @@ pub fn track_info_bar<'a>(
     has_stil_info: bool,
     window_width: f32,
     engine_name: &str,
+    master_volume: f32,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let title_size = if compact { 15.0_f32 } else { 18.0 };
@@ -329,9 +331,23 @@ pub fn track_info_bar<'a>(
         text(extra)
             .size(font::sized(extra_size))
             .color(Color::from_rgb(0.5, 0.5, 0.6)),
-        text(format!("Engine: {engine_label}"))
-            .size(font::sized(extra_size))
-            .color(Color::from_rgb(0.4, 0.55, 0.45)),
+        row![
+            text(format!("Engine: {engine_label}"))
+                .size(font::sized(extra_size))
+                .color(Color::from_rgb(0.4, 0.55, 0.45)),
+            if !status.device_connected {
+                row![
+                    Space::new().width(Length::Fixed(8.0)),
+                    text("• Disconnected")
+                        .size(font::sized(extra_size))
+                        .color(Color::from_rgb(1.0, 0.35, 0.35)),
+                ]
+                .into()
+            } else {
+                Element::from(Space::new().width(Length::Shrink))
+            },
+        ]
+        .align_y(Alignment::Center),
     ]
     .spacing(2)
     .width(Length::Fill);
@@ -398,12 +414,47 @@ pub fn track_info_bar<'a>(
         column![].into()
     };
 
+    // Volume control on the right of the visualizer — vertical slider, full
+    // visualiser height. USB engine is analog-out so we can't scale it from
+    // host; show a static "HW" label instead with a muted tooltip-ish hint.
+    let volume_icon = if master_volume <= 0.001 {
+        "🔇"
+    } else if master_volume < 0.5 {
+        "🔉"
+    } else {
+        "🔊"
+    };
+    let volume_block: Element<'a, Message> = if engine_name == "usb" {
+        column![
+            text("🔊")
+                .size(font::sized(extra_size))
+                .color(Color::from_rgb(0.45, 0.47, 0.52)),
+            text("HW")
+                .size(font::sized(extra_size))
+                .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        ]
+        .spacing(2)
+        .align_x(Alignment::Center)
+        .into()
+    } else {
+        column![
+            text(volume_icon).size(font::sized(extra_size)),
+            vertical_slider(0.0..=1.0, master_volume, Message::VolumeChanged)
+                .step(0.01)
+                .height(Length::Fixed(vis_height - 18.0)),
+        ]
+        .spacing(2)
+        .align_x(Alignment::Center)
+        .into()
+    };
+
     let content = row![
         info_col,
         now_playing_buttons,
         container(visualizer.view(tracker))
             .width(Length::Fixed(vis_width))
             .height(Length::Fixed(vis_height)),
+        volume_block,
     ]
     .spacing(8)
     .align_y(Alignment::Center);

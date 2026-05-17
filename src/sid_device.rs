@@ -77,6 +77,15 @@ pub trait SidDevice: Send {
     fn read_screen_total(&mut self) -> Option<u32> {
         None
     }
+
+    /// Whether the device is reachable. Default `true` for engines that are
+    /// always-local (USB / emulated / sidlite). The U64 implementation flips
+    /// this to `false` whenever a REST call fails (network drop, device
+    /// reboot, etc.) and back to `true` on the next successful call.  Used
+    /// by the GUI to render a "Disconnected" indicator.
+    fn is_connected(&self) -> bool {
+        true
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
