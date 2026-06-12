@@ -1,3 +1,4 @@
+pub mod device_panel;
 pub mod font;
 pub mod right_click;
 pub mod sid_panel;
@@ -76,6 +77,20 @@ impl SortDirection {
             Self::Descending => " ▼",
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Device config snapshot — what we render in the Device tab
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Bundle of everything the Device tab needs from one device round-trip.
+/// Produced by the player thread (it owns the SidDevice / Transport) and
+/// shipped to the GUI in a `DeviceConfigResult` message.
+#[derive(Debug, Clone)]
+pub struct DeviceConfigSnapshot {
+    pub firmware_version: String,
+    pub pcb_version: String,
+    pub config: usbsid_pico_config::DeviceConfig,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,6 +179,17 @@ pub enum Message {
     // Chained post-processing
     ProcessPendingEntries,
     FinalizePendingEntries,
+
+    // Device config (USBSID-Pico)
+    ToggleDeviceConfig,
+    DeviceConfigRefresh,
+    DeviceConfigApplyPreset(usbsid_pico_config::Preset),
+    DeviceConfigSetClock(usbsid_pico_config::ClockRate),
+    DeviceConfigEdit(crate::player::DeviceConfigEdit),
+    DeviceConfigSave,
+    DeviceConfigReset,
+    DeviceConfigAutoDetect,
+    DeviceConfigResult(Result<DeviceConfigSnapshot, String>),
 
     // Settings
     ToggleSettings,
@@ -696,6 +722,7 @@ pub fn controls_bar<'a>(
             small_button("🗑", Message::ClearPlaylist),
             recent_btn,
             sid_btn,
+            small_button("🔧", Message::ToggleDeviceConfig),
             small_button("⚙", Message::ToggleSettings),
         ]
         .spacing(3)
@@ -708,6 +735,7 @@ pub fn controls_bar<'a>(
             small_button("🗑 Clear", Message::ClearPlaylist),
             recent_btn,
             sid_btn,
+            small_button("🔧 Device", Message::ToggleDeviceConfig),
             small_button("⚙", Message::ToggleSettings),
         ]
         .spacing(4)

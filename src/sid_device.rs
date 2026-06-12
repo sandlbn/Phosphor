@@ -78,6 +78,22 @@ pub trait SidDevice: Send {
         None
     }
 
+    /// Run a USBSID-Pico configuration operation against this device.
+    ///
+    /// Implemented only by the USB engines (`DirectDevice`, `BridgeDevice`).
+    /// Other engines return an "unsupported" error so the GUI can surface
+    /// it cleanly.
+    ///
+    /// Returns `Some(snapshot)` after a successful `Refresh`, `None` for
+    /// action-only operations (preset, save, reset, auto-detect) that
+    /// succeed without producing a payload.
+    fn run_device_config(
+        &mut self,
+        _op: &crate::player::DeviceConfigCmd,
+    ) -> Result<Option<crate::ui::DeviceConfigSnapshot>, String> {
+        Err("device configuration is only available on the USB engine".into())
+    }
+
     /// Whether the device is reachable. Default `true` for engines that are
     /// always-local (USB / emulated / sidlite). The U64 implementation flips
     /// this to `false` whenever a REST call fails (network drop, device
