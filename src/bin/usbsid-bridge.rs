@@ -48,6 +48,12 @@ mod unix_main {
     const CMD_CLOSE: u8 = 0x08;
     const CMD_RING: u8 = 0x09;
     const CMD_FLUSH: u8 = 0x0A;
+    // Raw config-protocol passthrough — payload-len-prefixed bytes forwarded
+    // verbatim to the device's bulk OUT / IN endpoints. Used by the
+    // `usbsid-pico-config` integration in the Phosphor "Device Config" tab.
+    const CMD_CFG_SEND: u8 = 0x0B;
+    const CMD_CFG_RECV: u8 = 0x0C;
+    const CMD_CFG_DRAIN: u8 = 0x0D;
     const CMD_QUIT: u8 = 0xFF;
 
     const RESP_OK: u8 = 0x00;
@@ -174,6 +180,68 @@ mod unix_main {
                             pending_writes.clear();
                         }
                         d.set_flush();
+                    }
+                }
+
+                CMD_CFG_SEND => {
+                    // Payload: [len: u8, bytes: [u8; len]]
+                    let mut hdr = [0u8; 1];
+                    if reader.read_exact(&mut hdr).is_err() {
+                        break;
+                    }
+                    let len = hdr[0] as usize;
+                    let mut payload = vec![0u8; len];
+                    if reader.read_exact(&mut payload).is_err() {
+                        break;
+                    }
+                    if let Some(ref d) = dev {
+                        match d.send_raw(&payload) {
+                            Ok(()) => send_ok(&mut writer),
+                            Err(e) => send_err(&mut writer, &format!("send_raw: {e}")),
+                        }
+                    } else {
+                        send_err(&mut writer, "device not initialised");
+                    }
+                }
+
+                CMD_CFG_RECV => {
+                    // Payload: [len: u8] — max bytes to read.
+                    // Response on success: [RESP_OK, n: u8, bytes: [u8; n]]
+                    let mut hdr = [0u8; 1];
+                    if reader.read_exact(&mut hdr).is_err() {
+                        break;
+                    }
+                    let len = hdr[0] as usize;
+                    if let Some(ref d) = dev {
+                        match d.recv_raw(len) {
+                            Ok(buf) => {
+                                let n = buf.len().min(255) as u8;
+                                let _ = writer.write_all(&[RESP_OK, n]);
+                                let _ = writer.write_all(&buf[..n as usize]);
+                                let _ = writer.flush();
+                            }
+                            Err(e) => send_err(&mut writer, &format!("recv_raw: {e}")),
+                        }
+                    } else {
+                        send_err(&mut writer, "device not initialised");
+                    }
+                }
+
+                CMD_CFG_DRAIN => {
+                    // No payload. Best-effort drain: up to 8 short reads
+                    // with 10 ms timeout each, stopping at the first
+                    // Timeout or empty read.
+                    if let Some(ref d) = dev {
+                        for _ in 0..8 {
+                            match d.recv_raw_timeout(64, 10) {
+                                Ok(buf) if buf.is_empty() => break,
+                                Ok(_) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                        send_ok(&mut writer);
+                    } else {
+                        send_err(&mut writer, "device not initialised");
                     }
                 }
 

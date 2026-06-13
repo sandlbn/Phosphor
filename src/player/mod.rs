@@ -45,7 +45,52 @@ pub enum PlayerCmd {
     SetSubtune(u16),
     SetEngine(String, String, String), // (engine_name, u64_address, u64_password)
     UpdateU64Config(String, String),   // (u64_address, u64_password) — no device teardown
+    /// Run a device-config operation on the active USB hardware (no-op on
+    /// other engines). The result is shipped back via the response channel
+    /// that's already part of the GUI's command dispatch.
+    DeviceConfig(DeviceConfigCmd),
     Quit,
+}
+
+/// One of the device-config operations exposed in the Device tab.
+#[derive(Debug, Clone)]
+pub enum DeviceConfigCmd {
+    /// Read firmware + PCB + full config; reply with a `DeviceConfigSnapshot`.
+    Refresh,
+    ApplyPreset(usbsid_pico_config::Preset),
+    SetClock(usbsid_pico_config::ClockRate),
+    /// Mutate a single field of the current DeviceConfig and push it back
+    /// to the device. The player reads the current config, applies the
+    /// edit, writes the whole thing back, then re-reads so the GUI sees
+    /// the device's view of the world (not just the local edit).
+    Edit(DeviceConfigEdit),
+    /// Save to flash without rebooting (keeps playback alive).
+    Save,
+    /// Reset to factory defaults.
+    Reset,
+    /// Trigger the firmware's full chip + SID detection.
+    AutoDetect,
+}
+
+/// One discrete edit a Device-tab control can dispatch. Each variant maps
+/// to a single field in [`usbsid_pico_config::DeviceConfig`].
+///
+/// `u8` socket indices are 1 or 2 (matching the physical labels). `u8`
+/// SID indices are 1 or 2 (the two slots within a socket).
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceConfigEdit {
+    SocketEnabled(u8, bool),
+    SocketDualSid(u8, bool),
+    SocketChipType(u8, usbsid_pico_config::ChipType),
+    SocketSidType(u8, u8, usbsid_pico_config::SidType),
+    StereoEnabled(bool),
+    LockAudioSwitch(bool),
+    Mirrored(bool),
+    Flipped(bool),
+    Mixed(bool),
+    FmoplEnabled(bool),
+    LockClockrate(bool),
+    ExternalClock(bool),
 }
 
 /// Status updates sent from player thread → GUI.
@@ -237,28 +282,46 @@ fn run_until(cpu: &mut CPU<C64Memory, Nmos6502>, halt: u16, max_steps: u32) {
 //  Player thread
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Result of a `DeviceConfigCmd`, delivered to the GUI on a separate
+/// bounded channel so device-config ops don't compete with the per-frame
+/// `PlayerStatus` flow.
+pub type DeviceConfigEvent = Result<crate::ui::DeviceConfigSnapshot, String>;
+
 pub fn spawn_player(
     engine_name: String,
     u64_address: String,
     u64_password: String,
-) -> (Sender<PlayerCmd>, Receiver<PlayerStatus>) {
+) -> (
+    Sender<PlayerCmd>,
+    Receiver<PlayerStatus>,
+    Receiver<DeviceConfigEvent>,
+) {
     let (cmd_tx, cmd_rx) = bounded::<PlayerCmd>(64);
     let (status_tx, status_rx) = bounded::<PlayerStatus>(16);
+    let (device_cfg_tx, device_cfg_rx) = bounded::<DeviceConfigEvent>(16);
 
     thread::Builder::new()
         .name("sid-player".into())
         .stack_size(4 * 1024 * 1024) // 4MB — shadow CPU needs space for C64 memory
         .spawn(move || {
-            player_loop(cmd_rx, status_tx, engine_name, u64_address, u64_password);
+            player_loop(
+                cmd_rx,
+                status_tx,
+                device_cfg_tx,
+                engine_name,
+                u64_address,
+                u64_password,
+            );
         })
         .expect("Failed to spawn player thread");
 
-    (cmd_tx, status_rx)
+    (cmd_tx, status_rx, device_cfg_rx)
 }
 
 fn player_loop(
     cmd_rx: Receiver<PlayerCmd>,
     status_tx: Sender<PlayerStatus>,
+    device_cfg_tx: Sender<DeviceConfigEvent>,
     mut engine_name: String,
     mut u64_address: String,
     mut u64_password: String,
@@ -280,6 +343,7 @@ fn player_loop(
                             Ok(cmd) => handle_cmd(
                                 cmd, &mut state, &mut play_ctx,
                                 &mut bridge, &mut last_error, &status_tx,
+                                &device_cfg_tx,
                                 &mut engine_name, &mut u64_address, &mut u64_password,
                             ),
                             Err(_) => break,
@@ -308,6 +372,7 @@ fn player_loop(
                                 &mut bridge,
                                 &mut last_error,
                                 &status_tx,
+                                &device_cfg_tx,
                                 &mut engine_name,
                                 &mut u64_address,
                                 &mut u64_password,
@@ -597,6 +662,7 @@ fn handle_cmd(
     bridge: &mut Option<Box<dyn SidDevice>>,
     last_error: &mut Option<String>,
     status_tx: &Sender<PlayerStatus>,
+    device_cfg_tx: &Sender<DeviceConfigEvent>,
     engine_name: &mut String,
     u64_address: &mut String,
     u64_password: &mut String,
@@ -1065,6 +1131,35 @@ fn handle_cmd(
                 }
                 *bridge = None;
             }
+        }
+
+        PlayerCmd::DeviceConfig(op) => {
+            // The hardware must already be open (Play has been called at
+            // least once) before any config op can run. If not, ensure_hardware
+            // tries to bring it up here.
+            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
+                let _ = device_cfg_tx.try_send(Err(e));
+                return;
+            }
+            let result = match bridge.as_mut() {
+                Some(br) => br.run_device_config(&op),
+                None => Err("device not initialised".into()),
+            };
+            let payload = match result {
+                Ok(Some(snap)) => Ok(snap),
+                Ok(None) => {
+                    // Action-only op (Save / preset apply). Refresh so the
+                    // GUI gets the post-op state.
+                    if let Some(br) = bridge.as_mut() {
+                        br.run_device_config(&DeviceConfigCmd::Refresh)
+                            .and_then(|o| o.ok_or_else(|| "refresh returned None".into()))
+                    } else {
+                        Err("device disappeared after op".into())
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            let _ = device_cfg_tx.try_send(payload);
         }
 
         PlayerCmd::Quit => {}

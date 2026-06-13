@@ -4,6 +4,7 @@
 mod audio_volume;
 mod c64_emu;
 mod config;
+mod device_config;
 mod heard_db;
 mod petscii;
 mod player;
@@ -94,6 +95,16 @@ struct App {
     config: Config,
     /// Whether the settings panel is currently visible.
     show_settings: bool,
+    /// Whether the USBSID-Pico Device Config panel is currently visible.
+    show_device_config: bool,
+    /// Cached state for the Device Config panel. `None` means we haven't
+    /// successfully read the device yet.
+    device_cfg: Option<ui::DeviceConfigSnapshot>,
+    /// One-line status banner shown above the panel (e.g. "Reading…",
+    /// "Saved!", "Error: …").
+    device_cfg_status: String,
+    /// Channel the player thread sends DeviceConfigEvent results on.
+    device_cfg_rx: crossbeam_channel::Receiver<player::DeviceConfigEvent>,
     /// Raw text from the default-song-length input field (may be mid-edit).
     default_length_text: String,
     /// Raw text from the base-font-size input field. Holds intermediate
@@ -246,7 +257,7 @@ impl App {
             }
         }
 
-        let (cmd_tx, status_rx) = player::spawn_player(
+        let (cmd_tx, status_rx, device_cfg_rx) = player::spawn_player(
             config.output_engine(),
             config.u64_address.clone(),
             config.u64_password.clone(),
@@ -347,6 +358,10 @@ impl App {
             sort_direction: SortDirection::Ascending,
             config,
             show_settings: false,
+            show_device_config: false,
+            device_cfg: None,
+            device_cfg_status: String::new(),
+            device_cfg_rx,
             default_length_text,
             base_font_size_text,
             download_status: String::new(),
@@ -1149,8 +1164,83 @@ impl App {
                 if self.show_settings {
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
+                    self.show_device_config = false;
                 }
             }
+
+            Message::ToggleDeviceConfig => {
+                self.context_menu = None;
+                self.show_device_config = !self.show_device_config;
+                if self.show_device_config {
+                    self.show_settings = false;
+                    self.show_recently_played = false;
+                    self.show_sid_panel = false;
+                    // Auto-load on open.
+                    self.device_cfg_status = "Reading device…".into();
+                    let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                        player::DeviceConfigCmd::Refresh,
+                    ));
+                }
+            }
+
+            Message::DeviceConfigRefresh => {
+                self.device_cfg_status = "Reading device…".into();
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::Refresh,
+                ));
+            }
+
+            Message::DeviceConfigApplyPreset(p) => {
+                self.device_cfg_status = format!("Applying preset: {}…", p.label());
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::ApplyPreset(p),
+                ));
+            }
+
+            Message::DeviceConfigSetClock(rate) => {
+                self.device_cfg_status = format!("Setting clock: {}…", rate.label());
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::SetClock(rate),
+                ));
+            }
+
+            Message::DeviceConfigEdit(edit) => {
+                self.device_cfg_status = "Updating…".into();
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::Edit(edit),
+                ));
+            }
+
+            Message::DeviceConfigSave => {
+                self.device_cfg_status = "Saving to flash…".into();
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::Save,
+                ));
+            }
+
+            Message::DeviceConfigReset => {
+                self.device_cfg_status = "Resetting to factory defaults…".into();
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::Reset,
+                ));
+            }
+
+            Message::DeviceConfigAutoDetect => {
+                self.device_cfg_status = "Auto-detecting (≈3 s)…".into();
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::AutoDetect,
+                ));
+            }
+
+            Message::DeviceConfigResult(result) => match result {
+                Ok(snap) => {
+                    self.device_cfg = Some(snap);
+                    self.device_cfg_status = "Loaded.".into();
+                }
+                Err(e) => {
+                    self.device_cfg_status = format!("Error: {e}");
+                }
+            },
 
             Message::ToggleSkipRsid => {
                 self.config.skip_rsid = !self.config.skip_rsid;
@@ -1794,7 +1884,19 @@ impl App {
         let progress = ui::progress_bar(&self.status, current_duration);
 
         // Build the main content area
-        let main_content: Element<'_, Message> = if self.show_settings {
+        let main_content: Element<'_, Message> = if self.show_device_config {
+            let panel =
+                ui::device_panel::device_panel(self.device_cfg.as_ref(), &self.device_cfg_status);
+            column![
+                info_bar,
+                progress,
+                rule::horizontal(1),
+                controls,
+                rule::horizontal(1),
+                panel
+            ]
+            .into()
+        } else if self.show_settings {
             let settings = ui::settings_panel(
                 &self.config,
                 &self.default_length_text,
@@ -2301,6 +2403,20 @@ impl App {
     fn poll_status(&mut self) {
         while let Ok(status) = self.status_rx.try_recv() {
             self.status = status;
+        }
+        // Pump device-config results from the player thread into the same
+        // update flow as everything else. Each event populates / resets
+        // device_cfg + device_cfg_status.
+        while let Ok(event) = self.device_cfg_rx.try_recv() {
+            match event {
+                Ok(snap) => {
+                    self.device_cfg = Some(snap);
+                    self.device_cfg_status = "Loaded.".into();
+                }
+                Err(e) => {
+                    self.device_cfg_status = format!("Error: {e}");
+                }
+            }
         }
 
         // Drop stale timing data from statuses that pre-date our most recent

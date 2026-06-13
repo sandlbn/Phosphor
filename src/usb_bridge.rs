@@ -9,6 +9,7 @@
 use crate::sid_device::SidDevice;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use usbsid_pico_config::transport::{Transport, TransportError};
 
 const SOCKET_PATH: &str = "/tmp/usbsid-bridge.sock";
 
@@ -21,6 +22,10 @@ const CMD_MUTE: u8 = 0x07;
 const CMD_CLOSE: u8 = 0x08;
 const CMD_RING: u8 = 0x09;
 const CMD_FLUSH: u8 = 0x0A;
+/// Raw config-protocol passthrough (Phosphor "Device Config" tab).
+const CMD_CFG_SEND: u8 = 0x0B;
+const CMD_CFG_RECV: u8 = 0x0C;
+const CMD_CFG_DRAIN: u8 = 0x0D;
 const CMD_QUIT: u8 = 0xFF;
 
 const RESP_OK: u8 = 0x00;
@@ -176,10 +181,87 @@ impl SidDevice for BridgeDevice {
         let _ = self.stream.write_all(&[CMD_QUIT]);
         let _ = self.stream.flush();
     }
+
+    fn run_device_config(
+        &mut self,
+        op: &crate::player::DeviceConfigCmd,
+    ) -> Result<Option<crate::ui::DeviceConfigSnapshot>, String> {
+        self.run_device_config_op(op)
+    }
 }
 
 impl Drop for BridgeDevice {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+impl BridgeDevice {
+    /// Forward to the shared config helper, borrowing `self` as Transport.
+    pub fn run_device_config_op(
+        &mut self,
+        op: &crate::player::DeviceConfigCmd,
+    ) -> Result<Option<crate::ui::DeviceConfigSnapshot>, String> {
+        crate::device_config::run(&mut *self, op)
+    }
+}
+
+/// Forwards `usbsid-pico-config` protocol bytes through the daemon's
+/// `CMD_CFG_SEND` / `CMD_CFG_RECV` passthrough. The daemon performs the
+/// actual bulk transfer on the device; we just pipe bytes over the Unix
+/// socket. Requires daemon ≥ the version that exposes those commands.
+impl Transport for BridgeDevice {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        if bytes.len() > 255 {
+            return Err(TransportError::Io(format!(
+                "bridge CFG_SEND payload too large: {} bytes (max 255)",
+                bytes.len()
+            )));
+        }
+        let mut frame = Vec::with_capacity(2 + bytes.len());
+        frame.push(CMD_CFG_SEND);
+        frame.push(bytes.len() as u8);
+        frame.extend_from_slice(bytes);
+        self.send_cmd(&frame);
+        self.read_response()
+            .map_err(|e| TransportError::Io(format!("CFG_SEND: {e}")))
+    }
+
+    fn recv(&mut self, len: usize) -> Result<Vec<u8>, TransportError> {
+        let n = len.min(255) as u8;
+        self.send_cmd(&[CMD_CFG_RECV, n]);
+        // Response: [RESP_OK, n, ...bytes] or RESP_ERR + msg (read_response).
+        let mut resp = [0u8; 1];
+        if self.stream.read_exact(&mut resp).is_err() {
+            return Err(TransportError::Io("bridge disconnected".into()));
+        }
+        if resp[0] == RESP_OK {
+            let mut nbuf = [0u8; 1];
+            if self.stream.read_exact(&mut nbuf).is_err() {
+                return Err(TransportError::Io("CFG_RECV truncated length".into()));
+            }
+            let got = nbuf[0] as usize;
+            let mut data = vec![0u8; got];
+            if self.stream.read_exact(&mut data).is_err() {
+                return Err(TransportError::Io("CFG_RECV truncated data".into()));
+            }
+            Ok(data)
+        } else {
+            // RESP_ERR + len + msg
+            let mut lenbuf = [0u8; 1];
+            let _ = self.stream.read_exact(&mut lenbuf);
+            let mut msg = vec![0u8; lenbuf[0] as usize];
+            let _ = self.stream.read_exact(&mut msg);
+            Err(TransportError::Io(format!(
+                "CFG_RECV: {}",
+                String::from_utf8_lossy(&msg)
+            )))
+        }
+    }
+
+    fn drain(&mut self) -> Result<(), TransportError> {
+        self.send_cmd(&[CMD_CFG_DRAIN]);
+        self.read_response()
+            .map_err(|e| TransportError::Io(format!("CFG_DRAIN: {e}")))
     }
 }
