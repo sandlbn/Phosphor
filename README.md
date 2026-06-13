@@ -14,6 +14,7 @@ https://github.com/sandlbn/Phosphor/releases
 ## Features
 
 - **Four playback engines** — USB hardware, software emulation (reSID or SIDLite), or Commodore Ultimate 64 over the network
+- **USBSID-Pico device config** — built-in Device panel (🔧 button) for chip routing, clock rate, presets, and save-to-flash, all without leaving Phosphor
 - **HTTP remote control** — built-in web server for controlling playback from any browser on the network (phone, tablet, another PC)
 - **Playlist management** — add files and folders, drag & drop, save/load M3U playlists; duplicate detection on import
 - **Session restore** — playlist automatically saved on exit and restored on next launch
