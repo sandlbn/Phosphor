@@ -113,15 +113,15 @@ impl Transport for DirectDevice {
     }
 
     fn drain(&mut self) -> Result<(), TransportError> {
-        // Up to 8 short reads with a 10 ms timeout each. Stop on the first
-        // read that times out (= pipe is idle) or any successful read of
-        // zero bytes. Any actual transport error is bubbled up.
+        // Up to 8 short reads with a 10 ms timeout each. Drain is
+        // best-effort: any error (timeout / disconnect / anything else)
+        // just means "stop draining"; bubbling it up would force callers
+        // to handle a non-actionable failure on every operation.
         for _ in 0..8 {
             match self.dev.recv_raw_timeout(64, 10) {
                 Ok(buf) if buf.is_empty() => return Ok(()),
                 Ok(_) => continue,
-                Err(usbsid_pico::UsbSidError::Usb(rusb::Error::Timeout)) => return Ok(()),
-                Err(e) => return Err(TransportError::Io(format!("drain: {e}"))),
+                Err(_) => return Ok(()),
             }
         }
         Ok(())
