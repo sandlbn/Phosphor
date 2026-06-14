@@ -602,10 +602,20 @@ pub fn controls_bar<'a>(
     };
 
     let sep = || -> Element<'a, Message> {
-        text(" │ ")
-            .size(font::sized(btn_size))
-            .color(Color::from_rgb(0.3, 0.3, 0.35))
-            .into()
+        // Vertical-rule separator. Sized to match the buttons so groups
+        // visually align. Slightly muted colour so it reads as a divider
+        // rather than competing with the buttons themselves.
+        container(
+            Space::new()
+                .width(Length::Fixed(1.0))
+                .height(Length::Fixed(if compact { 16.0 } else { 20.0 })),
+        )
+        .padding(Padding::from([0, 4]))
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.30, 0.32, 0.36))),
+            ..Default::default()
+        })
+        .into()
     };
 
     let transport = row![
@@ -713,13 +723,30 @@ pub fn controls_bar<'a>(
             })
             .into();
 
-    let playlist_controls = if compact {
+    // File-ops sub-group (add to playlist, open/save/clear).
+    let file_ops = if compact {
         row![
-            small_button("+Files", Message::AddFiles),
-            small_button("+Dir", Message::AddFolder),
+            small_button("➕", Message::AddFiles),
+            small_button("📁", Message::AddFolder),
             small_button("📂", Message::LoadPlaylist),
             small_button("💾", Message::SavePlaylist),
             small_button("🗑", Message::ClearPlaylist),
+        ]
+        .spacing(3)
+    } else {
+        row![
+            small_button("➕ Files", Message::AddFiles),
+            small_button("📁 Folder", Message::AddFolder),
+            small_button("📂 Open", Message::LoadPlaylist),
+            small_button("💾 Save", Message::SavePlaylist),
+            small_button("🗑 Clear", Message::ClearPlaylist),
+        ]
+        .spacing(4)
+    };
+
+    // Panel-toggles sub-group (history / SID panel / device config / settings).
+    let panel_toggles = if compact {
+        row![
             recent_btn,
             sid_btn,
             small_button("🔧", Message::ToggleDeviceConfig),
@@ -728,15 +755,10 @@ pub fn controls_bar<'a>(
         .spacing(3)
     } else {
         row![
-            small_button("+ Files", Message::AddFiles),
-            small_button("+ Folder", Message::AddFolder),
-            small_button("📂 Open", Message::LoadPlaylist),
-            small_button("💾 Save", Message::SavePlaylist),
-            small_button("🗑 Clear", Message::ClearPlaylist),
             recent_btn,
             sid_btn,
             small_button("🔧 Device", Message::ToggleDeviceConfig),
-            small_button("⚙", Message::ToggleSettings),
+            small_button("⚙ Settings", Message::ToggleSettings),
         ]
         .spacing(4)
     };
@@ -764,38 +786,30 @@ pub fn controls_bar<'a>(
         .into()
     };
 
-    let bar: Element<'a, Message> = if compact {
-        let top_row = row![transport, sep(), subtune_controls, sep(), mode_controls]
-            .spacing(6)
-            .align_y(Alignment::Center);
-        let mut bottom_row = row![Space::new().width(Length::Fill)]
-            .spacing(4)
-            .align_y(Alignment::Center);
-        if let Some(info) = new_version {
-            bottom_row = bottom_row.push(update_badge(&info.version));
-        }
-        bottom_row = bottom_row.push(playlist_controls);
-        column![top_row, bottom_row]
-            .spacing(4)
-            .padding(Padding::from([bar_pad, 12]))
-            .into()
-    } else {
-        let mut bar_row = row![
-            transport,
-            sep(),
-            subtune_controls,
-            sep(),
-            mode_controls,
-            Space::new().width(Length::Fill)
-        ]
-        .spacing(8)
+    // Two rows, always — same logical split wide or narrow.
+    //   Row 1: PLAYBACK (transport ┃ subtune ┃ mode)
+    //   Row 2: LIBRARY  (file ops ┃ panel toggles)  + optional update badge
+    let row_spacing = if compact { 6 } else { 8 };
+    let top_row = row![transport, sep(), subtune_controls, sep(), mode_controls]
+        .spacing(row_spacing)
         .align_y(Alignment::Center);
-        if let Some(info) = new_version {
-            bar_row = bar_row.push(update_badge(&info.version));
-        }
-        bar_row = bar_row.push(playlist_controls);
-        bar_row.padding(Padding::from([bar_pad, 16])).into()
-    };
+
+    let mut bottom_row = row![
+        file_ops,
+        sep(),
+        panel_toggles,
+        Space::new().width(Length::Fill)
+    ]
+    .spacing(row_spacing)
+    .align_y(Alignment::Center);
+    if let Some(info) = new_version {
+        bottom_row = bottom_row.push(update_badge(&info.version));
+    }
+
+    let bar: Element<'a, Message> = column![top_row, bottom_row]
+        .spacing(if compact { 4 } else { 6 })
+        .padding(Padding::from([bar_pad, if compact { 12 } else { 16 }]))
+        .into();
 
     container(bar)
         .width(Length::Fill)
