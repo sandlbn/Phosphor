@@ -105,6 +105,9 @@ struct App {
     device_cfg_status: String,
     /// Channel the player thread sends DeviceConfigEvent results on.
     device_cfg_rx: crossbeam_channel::Receiver<player::DeviceConfigEvent>,
+    /// Have we already auto-fetched USB device info for the engine-label
+    /// suffix? One-shot — fires on the first USB playback per app session.
+    usb_info_fetched: bool,
     /// Raw text from the default-song-length input field (may be mid-edit).
     default_length_text: String,
     /// Raw text from the base-font-size input field. Holds intermediate
@@ -361,6 +364,7 @@ impl App {
             show_device_config: false,
             device_cfg: None,
             device_cfg_status: String::new(),
+            usb_info_fetched: false,
             device_cfg_rx,
             default_length_text,
             base_font_size_text,
@@ -1861,6 +1865,14 @@ impl App {
         } else {
             None
         };
+        // Engine label suffix: when we're on USB and the device has been
+        // probed at least once, show what chips are actually on the board
+        // (e.g. "2× MOS8580" or "MOS6581 + MOS8580"). Other engines: none.
+        let engine_suffix = if self.config.output_engine == "usb" {
+            self.device_cfg.as_ref().map(format_usb_chip_summary)
+        } else {
+            None
+        };
         let info_bar = ui::track_info_bar(
             &self.status,
             &self.visualizer,
@@ -1871,6 +1883,7 @@ impl App {
             self.window_width,
             &self.config.output_engine,
             self.config.master_volume,
+            engine_suffix.as_deref(),
         );
         let controls = ui::controls_bar(
             &self.status,
@@ -2258,6 +2271,16 @@ impl App {
             // Fresh track — drop the debounce so the auto-advance for THIS
             // track's first subtune isn't gated by the previous track's fire.
             self.last_advance_at = None;
+            // First USB playback this session → ask the bridge for the
+            // device's actual SID chip layout once. The result goes into
+            // self.device_cfg via DeviceConfigResult, and from there into
+            // the engine label suffix in track_info_bar.
+            if self.config.output_engine == "usb" && !self.usb_info_fetched {
+                self.usb_info_fetched = true;
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::Refresh,
+                ));
+            }
             // entry borrow ends here; now safe to call &mut self method.
             self.refresh_stil_entry();
         }
@@ -3005,6 +3028,53 @@ fn write_m3u(
 // ─────────────────────────────────────────────────────────────────────────────
 //  CLI helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Compact human summary of the SID chips actually present on a USBSID-Pico.
+/// Reads each enabled socket's chip type / SID model and joins them.
+///
+/// SID models come from `SidType::label()`; clone chips come from
+/// `ChipType::label()` and cover **every non-`Real`, non-`Unknown` variant**
+/// in `usbsid-pico-config` — i.e. SKPico, ARMSID, ARM2SID, FPGASID,
+/// RedipSID, PDSID, BackSID, SIDEmu. No per-chip special-casing here.
+///
+/// Examples:
+///   - `"2× MOS8580"`              both sockets enabled, same chip
+///   - `"MOS6581 + MOS8580"`       different real chips per socket
+///   - `"MOS8580 (FPGASID)"`       clone chip emulating an 8580
+///   - `"SKPico + ARMSID"`         two different clones, no real SID
+///   - `""`                        firmware gave us nothing useful
+fn format_usb_chip_summary(snap: &ui::DeviceConfigSnapshot) -> String {
+    use usbsid_pico_config::{ChipType, SidType};
+    fn one(s: &usbsid_pico_config::SocketConfig) -> Option<String> {
+        if !s.enabled {
+            return None;
+        }
+        let sid = match s.sid1.kind {
+            SidType::Unknown | SidType::Na => None,
+            other => Some(other.label().to_string()),
+        };
+        let chip = match s.chip_type {
+            ChipType::Real | ChipType::Unknown => None,
+            other => Some(other.label().to_string()),
+        };
+        match (sid, chip) {
+            (Some(s), Some(c)) => Some(format!("{s} ({c})")),
+            (Some(s), None) => Some(s),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        }
+    }
+    let parts: Vec<String> = [&snap.config.socket1, &snap.config.socket2]
+        .iter()
+        .filter_map(|s| one(s))
+        .collect();
+    match parts.len() {
+        0 => String::new(),
+        1 => parts.into_iter().next().unwrap(),
+        2 if parts[0] == parts[1] => format!("2× {}", parts[0]),
+        _ => parts.join(" + "),
+    }
+}
 
 fn parse_sid4_from_args() -> u16 {
     let args: Vec<String> = std::env::args().collect();
