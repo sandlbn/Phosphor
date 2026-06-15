@@ -287,6 +287,10 @@ pub fn track_info_bar<'a>(
     window_width: f32,
     engine_name: &str,
     master_volume: f32,
+    // Optional engine-specific suffix appended to the engine label (e.g.
+    // "2× MOS8580" for USB). Caller-formatted so this module stays free
+    // of device-config types.
+    engine_suffix: Option<&str>,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let title_size = if compact { 15.0_f32 } else { 18.0 };
@@ -295,13 +299,17 @@ pub fn track_info_bar<'a>(
     let vis_width = if compact { 200.0_f32 } else { 300.0 };
     let vis_height = if compact { 48.0_f32 } else { 60.0 };
 
-    let engine_label = match engine_name {
+    let engine_base: &str = match engine_name {
         "usb" => "USB Hardware (USBSID-Pico)",
         "emulated" => "Software Emulation (reSID)",
         "sidlite" => "SIDLite Emulation (libsidplayfp)",
         "u64" => "Ultimate 64 (Network)",
         "auto" => "Auto",
         other => other,
+    };
+    let engine_label: String = match engine_suffix {
+        Some(s) if !s.is_empty() => format!("{engine_base} — {s}"),
+        _ => engine_base.to_string(),
     };
 
     let (title, author, extra) = match &status.track_info {
