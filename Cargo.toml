@@ -15,7 +15,7 @@ rfd = "0.15"
 
 # 6502 emulation + USBSID hardware
 mos6502 = "0.8"
-usbsid-pico = { version = "0.1.10", features = ["usb"] }
+usbsid-pico = { version = "0.1.11", features = ["usb"] }
 usbsid-pico-config = { version = "0.1.1", default-features = false }
 
 # Software SID emulation
