@@ -243,8 +243,13 @@ cat > "$BUILD_DIR/staging/component.plist" << 'CPLIST'
         <true/>
         <key>BundleIsRelocatable</key>
         <false/>
+        <!-- false → allow downgrade + same-version reinstall.
+             true would make Installer.app skip the install whenever the
+             on-disk Phosphor.app reports a CFBundleShortVersionString >=
+             the pkg's version, forcing users to delete the app manually
+             before they can downgrade or repair. -->
         <key>BundleIsVersionChecked</key>
-        <true/>
+        <false/>
         <key>BundleOverwriteAction</key>
         <string>upgrade</string>
         <key>RootRelativeBundlePath</key>
@@ -371,11 +376,122 @@ else
     echo "    (unsigned — skipping signature check)"
 fi
 
+# ── Uninstaller .pkg ────────────────────────────────────────────────────────
+# Separate double-clickable installer that REMOVES Phosphor + the daemon.
+# Dragging Phosphor.app to Trash leaves the LaunchDaemon orphaned (it lives
+# in /Library/LaunchDaemons and is invisible to the Finder), and on every
+# boot launchd keeps trying to spawn a /Applications/Phosphor.app/... that
+# no longer exists. This pkg fixes that in one click.
+echo ""
+echo "==> Building uninstaller package ..."
+
+UNINSTALL_DIR="$BUILD_DIR/uninstall"
+mkdir -p "$UNINSTALL_DIR/scripts" "$UNINSTALL_DIR/empty_payload"
+
+cat > "$UNINSTALL_DIR/scripts/postinstall" << 'UNINSTALL_POST'
+#!/bin/bash
+# Best-effort: log failures but never abort — partial cleanup is still
+# better than a wedged install.
+LABEL="com.phosphor.usbsid-bridge"
+PLIST="/Library/LaunchDaemons/$LABEL.plist"
+SOCKET="/tmp/usbsid-bridge.sock"
+APP="/Applications/Phosphor.app"
+
+/bin/launchctl bootout system/"$LABEL" 2>/dev/null || \
+    /bin/launchctl unload "$PLIST" 2>/dev/null || true
+killall usbsid-bridge 2>/dev/null || true
+rm -f "$SOCKET"
+rm -f "$PLIST"
+rm -f /usr/local/bin/usbsid-bridge 2>/dev/null || true
+rm -rf "$APP"
+
+# Tell the user we finished — visible if they ran via `installer` CLI.
+echo "Phosphor and the usbsid-bridge daemon have been removed." >&2
+exit 0
+UNINSTALL_POST
+chmod +x "$UNINSTALL_DIR/scripts/postinstall"
+
+UNINSTALL_COMPONENT_PKG="$UNINSTALL_DIR/UninstallComponent.pkg"
+UNINSTALL_FINAL_PKG="$BUILD_DIR/out/Phosphor-${VERSION}-Uninstaller.pkg"
+
+# Empty payload — the pkg is effectively "run scripts then do nothing".
+pkgbuild \
+    --root "$UNINSTALL_DIR/empty_payload" \
+    --scripts "$UNINSTALL_DIR/scripts" \
+    --identifier "com.phosphor.uninstaller" \
+    --version "$VERSION" \
+    --nopayload \
+    "$UNINSTALL_COMPONENT_PKG"
+
+cat > "$UNINSTALL_DIR/distribution.xml" << UNINSTALL_DISTXML
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Uninstall Phosphor ${VERSION}</title>
+    <welcome file="welcome.html"/>
+    <conclusion file="conclusion.html"/>
+    <options customize="never"/>
+    <domains enable_localSystem="true"/>
+    <os-version min="11.0"/>
+    <pkg-ref id="com.phosphor.uninstaller"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.phosphor.uninstaller"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.phosphor.uninstaller" visible="false">
+        <pkg-ref id="com.phosphor.uninstaller"/>
+    </choice>
+    <pkg-ref id="com.phosphor.uninstaller" version="${VERSION}">UninstallComponent.pkg</pkg-ref>
+</installer-gui-script>
+UNINSTALL_DISTXML
+
+mkdir -p "$UNINSTALL_DIR/resources"
+cat > "$UNINSTALL_DIR/resources/welcome.html" << 'UNINSTALL_WELCOME'
+<html><head><meta charset="utf-8"><style>
+body { font-family: -apple-system, Helvetica Neue, sans-serif; padding: 20px; }
+h1 { font-size: 22px; color: #b04444; }
+p, li { font-size: 14px; line-height: 1.5; }
+</style></head>
+<body>
+<h1>Uninstall Phosphor</h1>
+<p>This will completely remove:</p>
+<ul>
+  <li><b>Phosphor.app</b> from /Applications</li>
+  <li>The <b>usbsid-bridge</b> LaunchDaemon (/Library/LaunchDaemons)</li>
+  <li>The bridge socket and any legacy binary at /usr/local/bin</li>
+</ul>
+<p>Your config, playlists, and HVSC files in <code>~/Library/Application Support/phosphor</code> are <b>not</b> touched.</p>
+</body></html>
+UNINSTALL_WELCOME
+
+cat > "$UNINSTALL_DIR/resources/conclusion.html" << 'UNINSTALL_CONCLUSION'
+<html><head><meta charset="utf-8"><style>
+body { font-family: -apple-system, Helvetica Neue, sans-serif; padding: 20px; }
+h1 { font-size: 22px; color: #2d8a4e; }
+p { font-size: 14px; line-height: 1.5; }
+</style></head>
+<body>
+<h1>✓ Phosphor Uninstalled</h1>
+<p>Phosphor and the USB bridge daemon have been removed.</p>
+<p>Personal data in <code>~/Library/Application Support/phosphor</code> remains.</p>
+</body></html>
+UNINSTALL_CONCLUSION
+
+productbuild \
+    --distribution "$UNINSTALL_DIR/distribution.xml" \
+    --package-path "$UNINSTALL_DIR" \
+    --resources "$UNINSTALL_DIR/resources" \
+    "${SIGN_ARGS[@]}" \
+    "$UNINSTALL_FINAL_PKG"
+
+echo "    ✓ $(basename "$UNINSTALL_FINAL_PKG")"
+
 # ── Clean up intermediate artifacts ──────────────────────────────────────────
-# Only the final .pkg should exist in out/ — nothing else
+# Only the final .pkg files should exist in out/ — nothing else
 echo ""
 echo "==> Cleaning up staging files ..."
-rm -rf "$BUILD_DIR/staging"
+rm -rf "$BUILD_DIR/staging" "$UNINSTALL_DIR"
 
 # ── Notarize ─────────────────────────────────────────────────────────────────
 if $NOTARIZE; then
@@ -394,7 +510,32 @@ if $NOTARIZE; then
 
     xcrun stapler staple "$FINAL_PKG"
     echo "    ✓ Notarization complete"
+
+    # Notarise the uninstaller too so it doesn't trip Gatekeeper.
+    if [[ -f "$UNINSTALL_FINAL_PKG" ]]; then
+        echo "==> Notarizing uninstaller ..."
+        xcrun notarytool submit "$UNINSTALL_FINAL_PKG" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASS" \
+            --wait
+        xcrun stapler staple "$UNINSTALL_FINAL_PKG"
+    fi
 fi
+
+# ── Copy to dist/ with release-friendly names ────────────────────────────────
+# Mirrors the Makefile's MAC_OUT convention so users don't need a separate
+# `make dist PKG_IN=…` step. dist/ is the canonical "ready to upload" dir.
+DIST_DIR="dist"
+mkdir -p "$DIST_DIR"
+DIST_PKG="$DIST_DIR/Phosphor-${VERSION}-macOS.pkg"
+DIST_UNINSTALL_PKG="$DIST_DIR/Phosphor-${VERSION}-macOS-Uninstaller.pkg"
+cp "$FINAL_PKG" "$DIST_PKG"
+cp "$UNINSTALL_FINAL_PKG" "$DIST_UNINSTALL_PKG"
+echo ""
+echo "==> Released artifacts:"
+echo "    $DIST_PKG"
+echo "    $DIST_UNINSTALL_PKG"
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
