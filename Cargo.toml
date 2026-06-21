@@ -22,6 +22,10 @@ usbsid-pico-config = { version = "0.1.1", default-features = false }
 resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
 cpal = "0.15"
 
+# ASID engine (MIDI SysEx-based SID streaming, alternative to vendor-bulk USB).
+# Cross-platform: CoreMIDI / WinMM / ALSA — single dep, no native build deps.
+midir = "0.10"
+
 # SIDLite emulation from libsidplayfp
 sidlite-sys = "0.1.1"
 

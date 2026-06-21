@@ -110,16 +110,18 @@ pub trait SidDevice: Send {
 
 /// List of engine names available at runtime.
 pub fn available_engines() -> Vec<&'static str> {
-    vec!["usb", "emulated", "sidlite", "u64"]
+    vec!["usb", "emulated", "sidlite", "u64", "asid"]
 }
 
 /// Create a SidDevice for the given engine name.
 ///
 /// "auto" tries USB first, then emulated, then U64 (if address configured).
+/// `asid_midi_port` is only consulted when `name == "asid"`.
 pub fn create_engine(
     name: &str,
     u64_address: &str,
     u64_password: &str,
+    asid_midi_port: &str,
 ) -> Result<Box<dyn SidDevice>, String> {
     match name {
         "auto" => create_auto(u64_address, u64_password),
@@ -127,6 +129,7 @@ pub fn create_engine(
         "emulated" => create_emulated(),
         "sidlite" => create_sidlite(),
         "u64" => create_u64(u64_address, u64_password),
+        "asid" => create_asid(asid_midi_port),
         other => Err(format!(
             "Unknown engine '{}'. Available: {:?}",
             other,
@@ -194,5 +197,14 @@ fn create_sidlite() -> Result<Box<dyn SidDevice>, String> {
 fn create_u64(address: &str, password: &str) -> Result<Box<dyn SidDevice>, String> {
     eprintln!("[phosphor] Connecting to Ultimate 64 at {address}…");
     let dev = crate::sid_u64::U64Device::connect(address, password)?;
+    Ok(Box::new(dev))
+}
+
+/// ASID over MIDI — works with any ASID-compatible device the host can see
+/// as a MIDI output port (USBSID-Pico's MIDI mode, TherapSID, SidFactoryII
+/// MIDI box, …). Cross-platform via the `midir` crate.
+fn create_asid(midi_port: &str) -> Result<Box<dyn SidDevice>, String> {
+    eprintln!("[phosphor] Opening ASID over MIDI on port '{midi_port}'…");
+    let dev = crate::sid_asid::AsidDevice::open(midi_port)?;
     Ok(Box::new(dev))
 }

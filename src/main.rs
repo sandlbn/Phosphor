@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[allow(dead_code)]
+mod asid_protocol;
 mod audio_volume;
 mod c64_emu;
 mod config;
@@ -25,6 +26,7 @@ mod daemon_installer;
 mod sid_direct;
 
 mod remote;
+mod sid_asid;
 mod sid_emulated;
 mod sid_sidlite;
 mod sid_u64;
@@ -114,6 +116,10 @@ struct App {
     /// keystrokes (e.g. just `"1"` while typing `"14"`) so the field stays
     /// editable; only successful parses commit to config.
     base_font_size_text: String,
+    /// Cached list of MIDI output ports detected on the last
+    /// `Message::RefreshAsidPorts` click. Rendered as a hint under the
+    /// ASID port input. Empty on app boot; populated lazily.
+    asid_midi_ports: Vec<String>,
     /// Status message shown below the Songlength download button.
     download_status: String,
     /// Combined status for auto-downloads shown in the search bar.
@@ -264,6 +270,7 @@ impl App {
             config.output_engine(),
             config.u64_address.clone(),
             config.u64_password.clone(),
+            config.asid_midi_port.clone(),
         );
 
         let playlist = Playlist::new();
@@ -368,6 +375,7 @@ impl App {
             device_cfg_rx,
             default_length_text,
             base_font_size_text,
+            asid_midi_ports: Vec::new(),
             download_status: String::new(),
             auto_download_status: String::new(),
             pending_auto_downloads: 0,
@@ -1310,6 +1318,7 @@ impl App {
                         engine,
                         self.config.u64_address.clone(),
                         self.config.u64_password.clone(),
+                        self.config.asid_midi_port.clone(),
                     ));
                     // Auto-resume on the new engine.
                     if was_playing {
@@ -1336,6 +1345,25 @@ impl App {
                     self.config.u64_address.clone(),
                     self.config.u64_password.clone(),
                 ));
+            }
+
+            Message::SetAsidPort(port) => {
+                self.config.asid_midi_port = port;
+                self.config.save();
+                let _ = self.cmd_tx.try_send(PlayerCmd::UpdateAsidPort(
+                    self.config.asid_midi_port.clone(),
+                ));
+            }
+
+            Message::RefreshAsidPorts => {
+                // Cheap-ish (~200 ms on first CoreMIDI call on macOS); fine
+                // for a user-triggered button. Errors surface in the GUI as
+                // an empty list with the existing "no ports detected" hint.
+                self.asid_midi_ports = sid_asid::AsidDevice::list_ports().unwrap_or_default();
+                eprintln!(
+                    "[phosphor] ASID port scan: {} port(s) found",
+                    self.asid_midi_ports.len()
+                );
             }
 
             Message::DownloadSonglength => {
@@ -1918,6 +1946,7 @@ impl App {
                 self.http_remote_running,
                 &self.http_port_text,
                 &self.base_font_size_text,
+                &self.asid_midi_ports,
             );
             column![
                 info_bar,

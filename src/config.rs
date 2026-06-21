@@ -30,6 +30,9 @@ pub struct Config {
     pub u64_address: String,
     /// Ultimate 64 network password (optional, empty = none).
     pub u64_password: String,
+    /// MIDI output port name for the ASID engine. Empty = "no port chosen"
+    /// (the engine refuses to open). The user picks this in Settings.
+    pub asid_midi_port: String,
     /// Last directory used when opening SID files / folders.
     pub last_sid_dir: Option<String>,
     /// Last directory used when loading Songlength.md5.
@@ -88,6 +91,7 @@ impl Default for Config {
             output_engine: "auto".to_string(),
             u64_address: String::new(),
             u64_password: String::new(),
+            asid_midi_port: String::new(),
             last_sid_dir: None,
             last_songlength_dir: None,
             last_songlength_file: None,
@@ -187,6 +191,11 @@ impl Config {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if let Some(s) = strip_json_string(val) {
                     config.u64_address = s;
+                }
+            } else if let Some(rest) = line.strip_prefix("\"asid_midi_port\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    config.asid_midi_port = s;
                 }
             } else if let Some(rest) = line.strip_prefix("\"u64_password\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
@@ -338,7 +347,8 @@ impl Config {
                 "  \"window_width_saved\": {},\n",
                 "  \"window_height_saved\": {},\n",
                 "  \"base_font_size\": {},\n",
-                "  \"master_volume\": {}\n",
+                "  \"master_volume\": {},\n",
+                "  \"asid_midi_port\": \"{}\"\n",
                 "}}\n",
             ),
             self.skip_rsid,
@@ -367,6 +377,9 @@ impl Config {
             self.window_height_saved,
             self.base_font_size,
             self.master_volume,
+            self.asid_midi_port
+                .replace('\\', "\\\\")
+                .replace('"', "\\\""),
         )
     }
 

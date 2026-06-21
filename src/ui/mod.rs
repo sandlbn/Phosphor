@@ -203,6 +203,8 @@ pub enum Message {
     SonglengthDownloaded(Result<PathBuf, String>),
     SetOutputEngine(String),
     SetU64Address(String),
+    SetAsidPort(String),
+    RefreshAsidPorts,
     SetU64Password(String),
 
     // Remote control
@@ -1599,6 +1601,10 @@ pub fn settings_panel<'a>(
     http_remote_running: bool,
     http_port_text: &'a str,
     base_font_size_text: &'a str,
+    // Snapshot of MIDI output ports detected at the last Refresh click.
+    // Rendered as a hint below the ASID port text input so the user
+    // knows what to type.
+    asid_midi_ports: &'a [String],
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -1718,6 +1724,39 @@ pub fn settings_panel<'a>(
         )
         .push(
             text("When enabled, the U64 streams its SID audio over UDP to this machine. Use a different port to the video stream.")
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        )
+        .push(rule::horizontal(1))
+        .push(
+            text("ASID MIDI port:")
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.65, 0.67, 0.72)),
+        )
+        .push(
+            row![
+                text_input("e.g. USBSID-Pico", &config.asid_midi_port)
+                    .on_input(Message::SetAsidPort)
+                    .size(font::sized(12.0))
+                    .padding(Padding::from([4, 8]))
+                    .width(Length::Fill),
+                Space::new().width(6),
+                tool_button("↻ Refresh ports", Message::RefreshAsidPorts),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .push({
+            let hint = if asid_midi_ports.is_empty() {
+                "No MIDI ports detected yet. Click ↻ Refresh ports to scan.".to_string()
+            } else {
+                format!("Detected ports: {}", asid_midi_ports.join(" • "))
+            };
+            text(hint)
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.45, 0.47, 0.52))
+        })
+        .push(
+            text("Engine \"asid\" sends register writes as MIDI SysEx — works with USBSID-Pico's MIDI mode, TherapSID, SidFactoryII MIDI box, etc.")
                 .size(font::sized(11.0))
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         );

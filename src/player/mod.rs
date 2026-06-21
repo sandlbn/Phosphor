@@ -43,8 +43,9 @@ pub enum PlayerCmd {
     Stop,
     TogglePause,
     SetSubtune(u16),
-    SetEngine(String, String, String), // (engine_name, u64_address, u64_password)
-    UpdateU64Config(String, String),   // (u64_address, u64_password) — no device teardown
+    SetEngine(String, String, String, String), // (engine_name, u64_address, u64_password, asid_midi_port)
+    UpdateU64Config(String, String),           // (u64_address, u64_password) — no device teardown
+    UpdateAsidPort(String), // (asid_midi_port) — no device teardown unless engine == "asid"
     /// Run a device-config operation on the active USB hardware (no-op on
     /// other engines). The result is shipped back via the response channel
     /// that's already part of the GUI's command dispatch.
@@ -291,6 +292,7 @@ pub fn spawn_player(
     engine_name: String,
     u64_address: String,
     u64_password: String,
+    asid_midi_port: String,
 ) -> (
     Sender<PlayerCmd>,
     Receiver<PlayerStatus>,
@@ -311,6 +313,7 @@ pub fn spawn_player(
                 engine_name,
                 u64_address,
                 u64_password,
+                asid_midi_port,
             );
         })
         .expect("Failed to spawn player thread");
@@ -325,6 +328,7 @@ fn player_loop(
     mut engine_name: String,
     mut u64_address: String,
     mut u64_password: String,
+    mut asid_midi_port: String,
 ) {
     let mut bridge: Option<Box<dyn SidDevice>> = None;
     let mut state = PlayState::Stopped;
@@ -345,6 +349,7 @@ fn player_loop(
                                 &mut bridge, &mut last_error, &status_tx,
                                 &device_cfg_tx,
                                 &mut engine_name, &mut u64_address, &mut u64_password,
+                                &mut asid_midi_port,
                             ),
                             Err(_) => break,
                         }
@@ -376,6 +381,7 @@ fn player_loop(
                                 &mut engine_name,
                                 &mut u64_address,
                                 &mut u64_password,
+                                &mut asid_midi_port,
                             ),
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -619,11 +625,12 @@ fn ensure_hardware(
     engine_name: &str,
     u64_address: &str,
     u64_password: &str,
+    asid_midi_port: &str,
 ) -> Result<(), String> {
     if bridge.is_some() {
         return Ok(());
     }
-    let mut br = create_engine(engine_name, u64_address, u64_password)?;
+    let mut br = create_engine(engine_name, u64_address, u64_password, asid_midi_port)?;
     br.init()?;
     *bridge = Some(br);
     Ok(())
@@ -666,6 +673,7 @@ fn handle_cmd(
     engine_name: &mut String,
     u64_address: &mut String,
     u64_password: &mut String,
+    asid_midi_port: &mut String,
 ) {
     match cmd {
         PlayerCmd::Play {
@@ -689,7 +697,13 @@ fn handle_cmd(
                 }
             }
 
-            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
+            if let Err(e) = ensure_hardware(
+                bridge,
+                engine_name,
+                u64_address,
+                u64_password,
+                asid_midi_port,
+            ) {
                 *last_error = Some(e);
                 *state = PlayState::Stopped;
                 send_status(state, play_ctx, last_error, status_tx);
@@ -1103,7 +1117,7 @@ fn handle_cmd(
             send_status(state, play_ctx, last_error, status_tx);
         }
 
-        PlayerCmd::SetEngine(name, addr, pass) => {
+        PlayerCmd::SetEngine(name, addr, pass, asid_port) => {
             eprintln!("[phosphor] Engine switch → '{name}'");
             stop_playback(play_ctx, bridge);
             // Drop old device.
@@ -1116,6 +1130,7 @@ fn handle_cmd(
             *engine_name = name;
             *u64_address = addr;
             *u64_password = pass;
+            *asid_midi_port = asid_port;
             *state = PlayState::Stopped;
             send_status(state, play_ctx, last_error, status_tx);
         }
@@ -1133,11 +1148,30 @@ fn handle_cmd(
             }
         }
 
+        PlayerCmd::UpdateAsidPort(port) => {
+            eprintln!("[phosphor] ASID port updated → '{port}'");
+            *asid_midi_port = port;
+            // Drop existing ASID connection so next Play reopens with the
+            // new port name; harmless if engine is currently something else.
+            if engine_name == "asid" {
+                if let Some(ref mut br) = bridge {
+                    br.close();
+                }
+                *bridge = None;
+            }
+        }
+
         PlayerCmd::DeviceConfig(op) => {
             // The hardware must already be open (Play has been called at
             // least once) before any config op can run. If not, ensure_hardware
             // tries to bring it up here.
-            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
+            if let Err(e) = ensure_hardware(
+                bridge,
+                engine_name,
+                u64_address,
+                u64_password,
+                asid_midi_port,
+            ) {
                 let _ = device_cfg_tx.try_send(Err(e));
                 return;
             }
