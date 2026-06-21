@@ -85,26 +85,38 @@ The web UI supports server-side search across large collections with paginated l
 
 ### macOS
 
-The bridge daemon runs as root via launchd to handle USB access:
+Two-step build: `.app` bundle (with the bridge daemon embedded as a Helper), then the `.pkg` installer that drops it into `/Applications` and registers the LaunchDaemon.
 
 ```bash
-chmod +x install.sh
-./install.sh
+# 1. Build Phosphor.app (ad-hoc signed; pass --sign "Developer ID ..." for distribution)
+./macos/build_bundle.sh
+
+# 2. Wrap the bundle in a double-clickable installer + matching uninstaller
+./macos/build_pkg.sh
 ```
 
-This builds Phosphor and the bridge daemon, installs the LaunchDaemon, and starts it. Run with:
+`build_pkg.sh` produces two files in `dist/`:
+
+- `Phosphor-<version>.pkg` — installs Phosphor.app to /Applications, registers + starts the `com.phosphor.usbsid-bridge` LaunchDaemon.
+- `Phosphor-<version>-Uninstaller.pkg` — removes both in one click.
+
+Double-click either, or use the CLI:
 
 ```bash
-./target/release/phosphor
+sudo installer -pkg dist/Phosphor-<version>.pkg -target /
 ```
 
-To uninstall the daemon:
+For signing + notarisation flags see the comment headers in `build_bundle.sh` and `build_pkg.sh`.
+
+#### Uninstalling on macOS
+
+Dragging `Phosphor.app` to Trash leaves the bridge LaunchDaemon orphaned — launchd keeps trying to relaunch a binary that no longer exists. Use the matching uninstaller pkg from the same release:
 
 ```bash
-sudo launchctl unload /Library/LaunchDaemons/com.phosphor.usbsid-bridge.plist
-sudo rm /usr/local/bin/usbsid-bridge
-sudo rm /Library/LaunchDaemons/com.phosphor.usbsid-bridge.plist
+sudo installer -pkg Phosphor-<version>-Uninstaller.pkg -target /
 ```
+
+This removes `/Applications/Phosphor.app`, stops + deletes the `com.phosphor.usbsid-bridge` LaunchDaemon, and cleans the bridge socket. Your personal data in `~/Library/Application Support/phosphor` (config, playlists, HVSC cache) is preserved on purpose — delete it manually if you want a full wipe.
 
 ### Windows
 
