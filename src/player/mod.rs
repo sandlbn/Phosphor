@@ -620,6 +620,17 @@ fn ensure_hardware(
     u64_address: &str,
     u64_password: &str,
 ) -> Result<(), String> {
+    // If we have a handle but it's reporting disconnected, drop it so
+    // we reopen below. Handles the "USB unplugged, replugged, user
+    // hits Play" flow without forcing a full app restart.
+    if let Some(ref br) = bridge {
+        if !br.is_connected() {
+            eprintln!("[phosphor] device handle is stale (disconnected) — reopening…");
+            if let Some(mut old) = bridge.take() {
+                old.close();
+            }
+        }
+    }
     if bridge.is_some() {
         return Ok(());
     }

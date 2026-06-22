@@ -13,6 +13,11 @@ use usbsid_pico_config::transport::{Transport, TransportError};
 
 pub struct DirectDevice {
     dev: UsbSid,
+    /// Tracked connection state for the GUI's "Disconnected" indicator.
+    /// Starts `true`, flips to `false` the first time a USB call errors
+    /// (likely a yank or device reset), and back to `true` on the next
+    /// successful call. Logged on transitions so stderr has a breadcrumb.
+    connected: bool,
 }
 
 impl DirectDevice {
@@ -21,7 +26,22 @@ impl DirectDevice {
         dev.init(true, true)
             .map_err(|e| format!("USB init failed: {e}"))?;
         eprintln!("[sid-direct] USBSID-Pico opened (threaded, cycled)");
-        Ok(Self { dev })
+        Ok(Self { dev, connected: true })
+    }
+
+    /// Update `connected` based on a fresh USB call result and log the
+    /// transition. Used after any libusb-touching call so the GUI's
+    /// "Disconnected" pill reflects reality.
+    fn note_call<T, E: std::fmt::Display>(&mut self, label: &str, result: &Result<T, E>) {
+        let now_connected = result.is_ok();
+        if now_connected != self.connected {
+            if now_connected {
+                eprintln!("[sid-direct] reconnected (via {label})");
+            } else if let Err(e) = result {
+                eprintln!("[sid-direct] disconnected (via {label}): {e}");
+            }
+            self.connected = now_connected;
+        }
     }
 }
 
@@ -51,17 +71,29 @@ impl SidDevice for DirectDevice {
         // Use single_write (not write()) because write() is blocked
         // in threaded mode. single_write goes straight to USB.
         let buf = [0x00, reg, val];
-        let _ = self.dev.single_write(&buf);
+        let r = self.dev.single_write(&buf);
+        self.note_call("write", &r);
     }
 
     fn ring_cycled(&mut self, writes: &[(u16, u8, u8)]) {
         for &(cycles, reg, val) in writes {
-            let _ = self.dev.write_ring_cycled(reg, val, cycles);
+            let r = self.dev.write_ring_cycled(reg, val, cycles);
+            self.note_call("ring_cycled", &r);
+            // If the device went away mid-batch, stop hammering it —
+            // subsequent writes will fail the same way and just spam
+            // the log. The next user-initiated action will retry.
+            if !self.connected {
+                break;
+            }
         }
     }
 
     fn flush(&mut self) {
         self.dev.set_flush();
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
     }
 
     fn mute(&mut self) {

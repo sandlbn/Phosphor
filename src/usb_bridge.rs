@@ -34,6 +34,11 @@ const RESP_ERR: u8 = 0x01;
 
 pub struct BridgeDevice {
     stream: UnixStream,
+    /// Tracked connection state for the GUI's "Disconnected" indicator.
+    /// Flips to `false` the first time a socket op errors (daemon died,
+    /// USB yanked → daemon panic, etc.) and back to `true` after a
+    /// successful reconnect. Logged on transitions.
+    connected: bool,
 }
 
 impl BridgeDevice {
@@ -44,7 +49,7 @@ impl BridgeDevice {
         match UnixStream::connect(SOCKET_PATH) {
             Ok(stream) => {
                 eprintln!("[usb-bridge] connected");
-                return Ok(Self { stream });
+                return Ok(Self { stream, connected: true });
             }
             Err(first_err) => {
                 eprintln!("[usb-bridge] socket not available: {first_err}");
@@ -61,34 +66,67 @@ impl BridgeDevice {
                     )
                 })?;
                 eprintln!("[usb-bridge] connected (after daemon install)");
-                return Ok(Self { stream });
+                return Ok(Self { stream, connected: true });
             }
         }
     }
 
     fn send_cmd(&mut self, data: &[u8]) {
-        let _ = self.stream.write_all(data);
-        let _ = self.stream.flush();
+        let w = self.stream.write_all(data);
+        let f = w.and_then(|_| self.stream.flush());
+        self.note_socket("send_cmd", &f);
     }
 
     fn read_response(&mut self) -> Result<(), String> {
         let mut resp = [0u8; 1];
         if self.stream.read_exact(&mut resp).is_err() {
+            self.mark_disconnected("read_response: socket closed");
             return Err("Bridge daemon disconnected".into());
         }
         if resp[0] == RESP_OK {
+            self.mark_connected("read_response");
             return Ok(());
         }
         let mut len_buf = [0u8; 1];
         if self.stream.read_exact(&mut len_buf).is_err() {
+            self.mark_disconnected("read_response: truncated length");
             return Err("Bridge error (no message)".into());
         }
         let msg_len = len_buf[0] as usize;
         let mut msg_buf = vec![0u8; msg_len];
         if self.stream.read_exact(&mut msg_buf).is_err() {
+            self.mark_disconnected("read_response: truncated body");
             return Err("Bridge error (truncated)".into());
         }
+        // RESP_ERR from the daemon: usually means a transient device-side
+        // error (libusb call failed). Don't flip connected to false on
+        // these — the socket is still healthy and the user can retry.
         Err(String::from_utf8_lossy(&msg_buf).to_string())
+    }
+
+    /// Update `connected` based on a fresh socket-level call result and
+    /// log the transition. Only socket / stream errors flip the flag —
+    /// daemon-reported errors (RESP_ERR) leave it alone, because the
+    /// pipe is fine, the device just barfed on one call.
+    fn note_socket<T>(&mut self, label: &str, result: &std::io::Result<T>) {
+        match result {
+            Ok(_) => self.mark_connected(label),
+            Err(e) => self.mark_disconnected(&format!("{label}: {e}")),
+        }
+    }
+
+    fn mark_connected(&mut self, label: &str) {
+        if !self.connected {
+            eprintln!("[usb-bridge] reconnected (via {label})");
+            self.connected = true;
+        }
+    }
+
+    fn mark_disconnected(&mut self, why: &str) {
+        if self.connected {
+            eprintln!("[usb-bridge] disconnected: {why}");
+            self.connected = false;
+        }
     }
 }
 
@@ -187,6 +225,10 @@ impl SidDevice for BridgeDevice {
         op: &crate::player::DeviceConfigCmd,
     ) -> Result<Option<crate::ui::DeviceConfigSnapshot>, String> {
         self.run_device_config_op(op)
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
     }
 }
 
