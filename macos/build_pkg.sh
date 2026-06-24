@@ -34,9 +34,21 @@
 #
 #  Environment variables:
 #    MACOS_INSTALLER_IDENTITY  — productbuild signing identity (overridden by --sign)
-#    MACOS_TEAM_ID             — Apple team ID for notarization
-#    MACOS_APPLE_ID            — Apple ID for notarization
-#    MACOS_APP_PASSWORD        — App-specific password for notarization
+#    MACOS_NOTARY_PROFILE      — `notarytool store-credentials` keychain
+#                                profile name (preferred, no password in env).
+#                                Overridden by --notary-profile.
+#    MACOS_TEAM_ID             — Apple team ID for notarization (fallback if
+#                                MACOS_NOTARY_PROFILE isn't set)
+#    MACOS_APPLE_ID            — Apple ID for notarization (fallback)
+#    MACOS_APP_PASSWORD        — App-specific password for notarization (fallback)
+#
+#  Notarization details:
+#    --notarize submits the .app to Apple, stamps a stapled ticket on the
+#    BUNDLE INSIDE THE PKG, then re-builds the .pkg around it, then notarizes
+#    + staples the .pkg too. Stapling the bundle (not just the pkg) is what
+#    lets the in-process USB engine see USBSID-Pico on macOS 26+ — without it
+#    libusb silently filters the device for non-root processes even though
+#    com.apple.security.device.usb is declared in entitlements.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -52,15 +64,17 @@ VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 BUNDLE_DIR="target/macos-bundle/Phosphor.app"
 BUILD_DIR="target/macos-pkg"
 INSTALLER_IDENTITY="${MACOS_INSTALLER_IDENTITY:-}"
+NOTARY_PROFILE="${MACOS_NOTARY_PROFILE:-}"
 NOTARIZE=false
 
 # ── Parse args ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --sign)     INSTALLER_IDENTITY="$2"; shift 2 ;;
-        --notarize) NOTARIZE=true;           shift   ;;
-        --bundle)   BUNDLE_DIR="$2";         shift 2 ;;
-        *) echo "Unknown option: $1"; exit 1         ;;
+        --sign)            INSTALLER_IDENTITY="$2"; shift 2 ;;
+        --notarize)        NOTARIZE=true;           shift   ;;
+        --notary-profile)  NOTARY_PROFILE="$2";     shift 2 ;;
+        --bundle)          BUNDLE_DIR="$2";         shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1                ;;
     esac
 done
 
@@ -133,6 +147,29 @@ mkdir -p "$BUILD_DIR/staging/payload"
 mkdir -p "$BUILD_DIR/staging/resources"
 mkdir -p "$BUILD_DIR/out"
 
+# ── Notarytool credential helper ────────────────────────────────────────────
+# notarize_submit <path> — submit + wait. Prefers MACOS_NOTARY_PROFILE
+# (a `notarytool store-credentials` keychain profile name); falls back to
+# the three env-var combo if the profile isn't set.
+notarize_submit() {
+    local path="$1"
+    if [[ -n "$NOTARY_PROFILE" ]]; then
+        xcrun notarytool submit "$path" \
+            --keychain-profile "$NOTARY_PROFILE" \
+            --wait
+    else
+        local team apple_id app_pass
+        team="${MACOS_TEAM_ID:?Set MACOS_NOTARY_PROFILE or MACOS_TEAM_ID for notarization}"
+        apple_id="${MACOS_APPLE_ID:?Set MACOS_NOTARY_PROFILE or MACOS_APPLE_ID for notarization}"
+        app_pass="${MACOS_APP_PASSWORD:?Set MACOS_NOTARY_PROFILE or MACOS_APP_PASSWORD for notarization}"
+        xcrun notarytool submit "$path" \
+            --apple-id "$apple_id" \
+            --team-id "$team" \
+            --password "$app_pass" \
+            --wait
+    fi
+}
+
 # ── Staging ──────────────────────────────────────────────────────────────────
 echo ""
 echo "==> Staging payload ..."
@@ -152,6 +189,33 @@ echo "    Payload contains $APP_COUNT files"
 if [[ "$APP_COUNT" -lt 3 ]]; then
     echo "Error: payload looks empty — something went wrong with the bundle."
     exit 1
+fi
+
+# ── Notarize + staple the .app BEFORE pkgbuild ───────────────────────────────
+# Critical: the stapled ticket has to be on the BUNDLE that ends up in
+# /Applications, not just on the surrounding .pkg. macOS 26+ silently denies
+# libusb USB enumeration to non-root processes whose bundle isn't notarized
+# (even with com.apple.security.device.usb in entitlements), so without this
+# step the in-process Direct USB engine breaks for end users.
+if $NOTARIZE; then
+    echo ""
+    echo "==> Notarizing .app bundle (this enables Direct USB mode) ..."
+    APP_ZIP="$BUILD_DIR/staging/Phosphor.app.zip"
+    ditto -c -k --keepParent \
+        "$BUILD_DIR/staging/payload/Phosphor.app" \
+        "$APP_ZIP"
+    notarize_submit "$APP_ZIP"
+    rm -f "$APP_ZIP"
+
+    # Staple the ticket onto the on-disk bundle inside the staged payload.
+    # pkgbuild later wraps this stapled bundle into the .pkg, so users get
+    # a notarized bundle when they install.
+    xcrun stapler staple "$BUILD_DIR/staging/payload/Phosphor.app"
+
+    # Verify Gatekeeper sees the bundle as notarized.
+    spctl -a -vvv "$BUILD_DIR/staging/payload/Phosphor.app" \
+        || { echo "Error: stapled .app failed spctl assessment"; exit 1; }
+    echo "    ✓ .app stapled — Direct USB mode will work post-install"
 fi
 
 # ── postinstall script ───────────────────────────────────────────────────────
@@ -493,33 +557,22 @@ echo ""
 echo "==> Cleaning up staging files ..."
 rm -rf "$BUILD_DIR/staging" "$UNINSTALL_DIR"
 
-# ── Notarize ─────────────────────────────────────────────────────────────────
+# ── Notarize the .pkg files themselves ──────────────────────────────────────
+# The .app inside was already notarized + stapled before pkgbuild (see above),
+# so this pass is just for the outer .pkg containers so Gatekeeper accepts
+# the installer when users double-click it.
 if $NOTARIZE; then
     echo ""
-    echo "==> Notarizing ..."
-
-    TEAM_ID="${MACOS_TEAM_ID:?Set MACOS_TEAM_ID for notarization}"
-    APPLE_ID="${MACOS_APPLE_ID:?Set MACOS_APPLE_ID for notarization}"
-    APP_PASS="${MACOS_APP_PASSWORD:?Set MACOS_APP_PASSWORD for notarization}"
-
-    xcrun notarytool submit "$FINAL_PKG" \
-        --apple-id "$APPLE_ID" \
-        --team-id "$TEAM_ID" \
-        --password "$APP_PASS" \
-        --wait
-
+    echo "==> Notarizing installer .pkg ..."
+    notarize_submit "$FINAL_PKG"
     xcrun stapler staple "$FINAL_PKG"
-    echo "    ✓ Notarization complete"
+    echo "    ✓ Installer .pkg notarized + stapled"
 
-    # Notarise the uninstaller too so it doesn't trip Gatekeeper.
     if [[ -f "$UNINSTALL_FINAL_PKG" ]]; then
-        echo "==> Notarizing uninstaller ..."
-        xcrun notarytool submit "$UNINSTALL_FINAL_PKG" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID" \
-            --password "$APP_PASS" \
-            --wait
+        echo "==> Notarizing uninstaller .pkg ..."
+        notarize_submit "$UNINSTALL_FINAL_PKG"
         xcrun stapler staple "$UNINSTALL_FINAL_PKG"
+        echo "    ✓ Uninstaller .pkg notarized + stapled"
     fi
 fi
 

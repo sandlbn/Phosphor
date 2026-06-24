@@ -36,14 +36,13 @@ fn plist_installed() -> bool {
 ///
 /// Falls back to /usr/local/bin/usbsid-bridge for non-bundle installs.
 fn find_bridge_binary() -> Option<PathBuf> {
-    // Try app bundle path first
     if let Ok(exe) = std::env::current_exe() {
-        // exe = .../Contents/MacOS/phosphor
-        if let Some(macos_dir) = exe.parent() {
-            let bundle_bridge = macos_dir
-                .parent() // Contents/
+        if let Some(parent) = exe.parent() {
+            // Bundle layout: exe = .../Phosphor.app/Contents/MacOS/phosphor,
+            // bridge lives at .../Phosphor.app/Contents/Helpers/usbsid-bridge
+            let bundle_bridge = parent
+                .parent()
                 .map(|p| p.join("Helpers").join("usbsid-bridge"));
-
             if let Some(ref path) = bundle_bridge {
                 if path.is_file() {
                     eprintln!(
@@ -53,10 +52,22 @@ fn find_bridge_binary() -> Option<PathBuf> {
                     return Some(path.clone());
                 }
             }
+
+            // Dev layout: exe = .../target/release/phosphor, bridge lives
+            // at .../target/release/usbsid-bridge (sibling). Lets
+            // `cargo run --release` and ad-hoc local builds find it.
+            let sibling = parent.join("usbsid-bridge");
+            if sibling.is_file() {
+                eprintln!(
+                    "[daemon-installer] Found bridge sibling: {}",
+                    sibling.display()
+                );
+                return Some(sibling);
+            }
         }
     }
 
-    // Fallback: check /usr/local/bin (legacy install.sh path)
+    // Legacy install.sh path
     let legacy = PathBuf::from("/usr/local/bin/usbsid-bridge");
     if legacy.is_file() {
         eprintln!(
@@ -239,6 +250,44 @@ pub fn ensure_daemon() -> Result<(), String> {
     // Full install
     run_privileged_install(&bridge_path)?;
     wait_for_socket()
+}
+
+/// Stop the bridge LaunchDaemon (bootout). Used when the user switches
+/// macOS USB mode to "direct" — we need to release the USB handle the
+/// daemon holds so libusb in the GUI process can claim it.
+///
+/// Idempotent: returns Ok(()) if the daemon was already stopped. Prompts
+/// for admin via osascript. Returns Err on cancel / failure.
+pub fn stop_daemon() -> Result<(), String> {
+    if !daemon_running() && !plist_installed() {
+        return Ok(());
+    }
+
+    eprintln!("[daemon-installer] Stopping bridge daemon (mode switched to direct)");
+
+    let apple_script = format!(
+        r#"do shell script "/bin/launchctl bootout system/{label} 2>/dev/null; /usr/bin/killall usbsid-bridge 2>/dev/null; /bin/rm -f {socket}; true" with administrator privileges with prompt "Phosphor needs to stop the USB bridge daemon to switch to direct mode.""#,
+        label = PLIST_LABEL,
+        socket = SOCKET_PATH,
+    );
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&apple_script)
+        .output()
+        .map_err(|e| format!("Failed to run osascript: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            return Err("Daemon stop cancelled by user".into());
+        }
+        return Err(format!("Failed to stop daemon: {stderr}"));
+    }
+
+    // Give launchd a moment to release the USB handle.
+    std::thread::sleep(Duration::from_millis(500));
+    Ok(())
 }
 
 /// Check if the installed daemon's binary path still matches our bundle.

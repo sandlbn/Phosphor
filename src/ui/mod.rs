@@ -195,6 +195,9 @@ pub enum Message {
     ToggleSettings,
     ToggleSkipRsid,
     ToggleForceStereo2sid,
+    /// macOS-only: switch USB transport between root bridge daemon and
+    /// in-process libusb. Payload is "bridge" or "direct".
+    SetMacosUsbMode(String),
     DefaultSongLengthChanged(String),
     BaseFontSizeChanged(String),
     VolumeChanged(f32),
@@ -1741,6 +1744,43 @@ pub fn settings_panel<'a>(
     ]
     .spacing(6);
 
+    // ── macOS USB transport (bridge daemon vs direct libusb) ─────
+    // Only meaningful on macOS — on Linux/Windows there is no daemon and
+    // we always use the direct path. We render the picker as an empty
+    // Space on those platforms so the layout below doesn't have to be
+    // conditionally compiled.
+    #[cfg(target_os = "macos")]
+    let macos_usb_section: Element<'a, Message> = {
+        let is_direct = config.macos_usb_mode == "direct";
+        column![
+            text("macOS USB transport:")
+                .size(font::sized(14.0))
+                .color(Color::from_rgb(0.75, 0.77, 0.82)),
+            iced::widget::row![
+                tool_button(
+                    if !is_direct { "✓ Bridge daemon" } else { "  Bridge daemon" },
+                    Message::SetMacosUsbMode("bridge".to_string()),
+                ),
+                tool_button(
+                    if is_direct { "✓ Direct (no daemon)" } else { "  Direct (no daemon)" },
+                    Message::SetMacosUsbMode("direct".to_string()),
+                ),
+            ]
+            .spacing(8),
+            text(
+                "Bridge runs the USB driver as a root LaunchDaemon (default — needed if your \
+                 user account doesn't have USB access). Direct opens the device in-process \
+                 with libusb — no daemon."
+            )
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        ]
+        .spacing(6)
+        .into()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let macos_usb_section: Element<'a, Message> = Space::new().into();
+
     // ── Force stereo ─────────────────────────────────────────────
     let stereo_section = column![
         text("Force stereo for 2SID tunes:").size(font::sized(14.0)).color(Color::from_rgb(0.75, 0.77, 0.82)),
@@ -1999,6 +2039,8 @@ pub fn settings_panel<'a>(
         header,
         rule::horizontal(1),
         engine_col,
+        rule::horizontal(1),
+        macos_usb_section,
         rule::horizontal(1),
         rsid_section,
         rule::horizontal(1),

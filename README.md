@@ -106,7 +106,7 @@ Double-click either, or use the CLI:
 sudo installer -pkg dist/Phosphor-<version>.pkg -target /
 ```
 
-For signing + notarisation flags see the comment headers in `build_bundle.sh` and `build_pkg.sh`.
+For signing + notarisation flags see the comment headers in `build_bundle.sh` and `build_pkg.sh`. Release builds should pass `--notarize` so Gatekeeper accepts the installer. The macOS USB transport toggle (Settings → Bridge / Direct) is covered in [MACOS_DEBUG.md](MACOS_DEBUG.md#direct-usb-mode-on-macos).
 
 #### Uninstalling on macOS
 
@@ -117,6 +117,10 @@ sudo installer -pkg Phosphor-<version>-Uninstaller.pkg -target /
 ```
 
 This removes `/Applications/Phosphor.app`, stops + deletes the `com.phosphor.usbsid-bridge` LaunchDaemon, and cleans the bridge socket. Your personal data in `~/Library/Application Support/phosphor` (config, playlists, HVSC cache) is preserved on purpose — delete it manually if you want a full wipe.
+
+#### Debugging the bridge daemon
+
+If you're hacking on the `usbsid-bridge` daemon and need to swap in a fresh local build, see [MACOS_DEBUG.md](MACOS_DEBUG.md) — covers stopping the LaunchDaemon, copying the new binary, restarting it, and tailing the logs.
 
 ### Windows
 

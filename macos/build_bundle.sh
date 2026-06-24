@@ -121,9 +121,11 @@ sed "s/0\.2\.0/$VERSION/g" macos/Info.plist > "$BUNDLE_DIR/Contents/Info.plist"
 # Copy launchd plist into Resources (for the daemon installer to find)
 cp macos/com.phosphor.usbsid-bridge.plist "$BUNDLE_DIR/Contents/Resources/"
 
-# Copy the daemon installer script into Resources
+# Copy the daemon installer + uninstaller scripts into Resources
 cp macos/install-daemon.sh "$BUNDLE_DIR/Contents/Resources/install-daemon.sh"
 chmod +x "$BUNDLE_DIR/Contents/Resources/install-daemon.sh"
+cp macos/uninstall-daemon.sh "$BUNDLE_DIR/Contents/Resources/uninstall-daemon.sh"
+chmod +x "$BUNDLE_DIR/Contents/Resources/uninstall-daemon.sh"
 
 # ── Embed dynamic libraries (libusb, etc.) ──────────────────────────────────
 #

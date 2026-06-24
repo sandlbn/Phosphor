@@ -21,7 +21,10 @@ mod usb_bridge;
 #[cfg(all(feature = "usb", target_os = "macos"))]
 mod daemon_installer;
 
-#[cfg(all(feature = "usb", not(target_os = "macos")))]
+// Direct libusb path. On macOS this is the alternative to the bridge daemon
+// (selected via Settings → macOS USB mode → Direct); on Linux/Windows it's
+// the only USB path.
+#[cfg(feature = "usb")]
 mod sid_direct;
 
 mod remote;
@@ -264,6 +267,7 @@ impl App {
             config.output_engine(),
             config.u64_address.clone(),
             config.u64_password.clone(),
+            config.macos_usb_mode.clone(),
         );
 
         let playlist = Playlist::new();
@@ -1254,6 +1258,27 @@ impl App {
                 self.config.force_stereo_2sid = !self.config.force_stereo_2sid;
                 self.config.save();
             }
+
+            #[cfg(target_os = "macos")]
+            Message::SetMacosUsbMode(mode) => {
+                if mode != self.config.macos_usb_mode {
+                    eprintln!("[phosphor] macOS USB mode → {mode}");
+                    // When switching to direct, stop the bridge daemon so it
+                    // releases the USB handle. When switching back to bridge,
+                    // ensure_daemon() will re-install / restart it on the
+                    // next Play (the existing BridgeDevice::connect path).
+                    if mode == "direct" {
+                        if let Err(e) = crate::daemon_installer::stop_daemon() {
+                            eprintln!("[phosphor] couldn't stop bridge daemon: {e}");
+                        }
+                    }
+                    self.config.macos_usb_mode = mode.clone();
+                    self.config.save();
+                    let _ = self.cmd_tx.send(PlayerCmd::SetMacosUsbMode(mode));
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            Message::SetMacosUsbMode(_) => {}
 
             Message::DefaultSongLengthChanged(val) => {
                 self.default_length_text = val.clone();
