@@ -1779,7 +1779,7 @@ pub fn settings_panel<'a>(
         .into()
     };
     #[cfg(not(target_os = "macos"))]
-    let macos_usb_section: Element<'a, Message> = Space::new(0, 0).into();
+    let macos_usb_section: Element<'a, Message> = Space::new().into();
 
     // ── Force stereo ─────────────────────────────────────────────
     let stereo_section = column![
