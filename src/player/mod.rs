@@ -45,6 +45,9 @@ pub enum PlayerCmd {
     SetSubtune(u16),
     SetEngine(String, String, String), // (engine_name, u64_address, u64_password)
     UpdateU64Config(String, String),   // (u64_address, u64_password) — no device teardown
+    /// Switch macOS USB transport ("bridge" or "direct"). Drops the current
+    /// USB device so the next Play reopens through the new path.
+    SetMacosUsbMode(String),
     /// Run a device-config operation on the active USB hardware (no-op on
     /// other engines). The result is shipped back via the response channel
     /// that's already part of the GUI's command dispatch.
@@ -291,6 +294,7 @@ pub fn spawn_player(
     engine_name: String,
     u64_address: String,
     u64_password: String,
+    macos_usb_mode: String,
 ) -> (
     Sender<PlayerCmd>,
     Receiver<PlayerStatus>,
@@ -311,6 +315,7 @@ pub fn spawn_player(
                 engine_name,
                 u64_address,
                 u64_password,
+                macos_usb_mode,
             );
         })
         .expect("Failed to spawn player thread");
@@ -325,6 +330,7 @@ fn player_loop(
     mut engine_name: String,
     mut u64_address: String,
     mut u64_password: String,
+    mut macos_usb_mode: String,
 ) {
     let mut bridge: Option<Box<dyn SidDevice>> = None;
     let mut state = PlayState::Stopped;
@@ -345,6 +351,7 @@ fn player_loop(
                                 &mut bridge, &mut last_error, &status_tx,
                                 &device_cfg_tx,
                                 &mut engine_name, &mut u64_address, &mut u64_password,
+                                &mut macos_usb_mode,
                             ),
                             Err(_) => break,
                         }
@@ -376,6 +383,7 @@ fn player_loop(
                                 &mut engine_name,
                                 &mut u64_address,
                                 &mut u64_password,
+                                &mut macos_usb_mode,
                             ),
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -605,6 +613,9 @@ fn player_loop(
 fn cleanup(bridge: &mut Option<Box<dyn SidDevice>>) {
     if let Some(ref mut br) = bridge {
         br.flush();
+        // Let the writer drain any in-flight ring entries so they can't
+        // re-trigger voices after mute/reset.
+        thread::sleep(Duration::from_millis(20));
         br.mute();
         br.reset();
         br.close();
@@ -619,6 +630,7 @@ fn ensure_hardware(
     engine_name: &str,
     u64_address: &str,
     u64_password: &str,
+    macos_usb_mode: &str,
 ) -> Result<(), String> {
     // If we have a handle but it's reporting disconnected, drop it so
     // we reopen below. Handles the "USB unplugged, replugged, user
@@ -634,7 +646,7 @@ fn ensure_hardware(
     if bridge.is_some() {
         return Ok(());
     }
-    let mut br = create_engine(engine_name, u64_address, u64_password)?;
+    let mut br = create_engine(engine_name, u64_address, u64_password, macos_usb_mode)?;
     br.init()?;
     *bridge = Some(br);
     Ok(())
@@ -677,6 +689,7 @@ fn handle_cmd(
     engine_name: &mut String,
     u64_address: &mut String,
     u64_password: &mut String,
+    macos_usb_mode: &mut String,
 ) {
     match cmd {
         PlayerCmd::Play {
@@ -700,7 +713,7 @@ fn handle_cmd(
                 }
             }
 
-            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
+            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password, macos_usb_mode) {
                 *last_error = Some(e);
                 *state = PlayState::Stopped;
                 send_status(state, play_ctx, last_error, status_tx);
@@ -1144,11 +1157,25 @@ fn handle_cmd(
             }
         }
 
+        PlayerCmd::SetMacosUsbMode(mode) => {
+            eprintln!("[phosphor] macOS USB mode → '{mode}'");
+            stop_playback(play_ctx, bridge);
+            if let Some(ref mut br) = bridge {
+                br.mute();
+                br.close();
+                br.shutdown();
+            }
+            *bridge = None;
+            *macos_usb_mode = mode;
+            *state = PlayState::Stopped;
+            send_status(state, play_ctx, last_error, status_tx);
+        }
+
         PlayerCmd::DeviceConfig(op) => {
             // The hardware must already be open (Play has been called at
             // least once) before any config op can run. If not, ensure_hardware
             // tries to bring it up here.
-            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password) {
+            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password, macos_usb_mode) {
                 let _ = device_cfg_tx.try_send(Err(e));
                 return;
             }
@@ -1199,6 +1226,10 @@ fn stop_playback_inner(
                 br.stop_audio();
             }
             br.flush();
+            // Give the writer thread a beat to drain any queued ring entries
+            // before we silence the chip — otherwise late voice/oscillator
+            // writes can land *after* mute and re-trigger sustained voices.
+            thread::sleep(Duration::from_millis(20));
             br.mute();
             br.set_stereo(0);
             br.reset();

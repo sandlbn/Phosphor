@@ -60,6 +60,9 @@ impl SidDevice for DirectDevice {
     }
 
     fn reset(&mut self) {
+        // Zero every SID register first (works on cloned/emulated SIDs that
+        // ignore the RES pin), then toggle RES for real chips.
+        self.dev.reset_all_registers();
         self.dev.reset();
     }
 
@@ -103,6 +106,7 @@ impl SidDevice for DirectDevice {
     fn close(&mut self) {
         self.dev.set_flush();
         self.dev.mute();
+        self.dev.reset_all_registers();
         self.dev.reset();
         self.dev.close();
     }

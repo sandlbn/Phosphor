@@ -85,6 +85,12 @@ mod unix_main {
         // Pending ring writes — collected locally and pushed to the driver
         // in one batch when CMD_FLUSH arrives.
         let mut pending_writes: Vec<(u8, u8, u16)> = Vec::with_capacity(512);
+        // Cumulative count of USB-send failures the writer thread has
+        // logged. We compare this to the current `writer_error_count()`
+        // on each CMD_FLUSH; a sudden jump (more than 3 in one frame)
+        // means the device is gone and we should exit so launchd
+        // (KeepAlive=true) can respawn us with a fresh USB handle.
+        let mut last_writer_errs: u64 = 0;
 
         eprintln!("[usbsid-bridge] client connected");
 
@@ -133,6 +139,9 @@ mod unix_main {
                 CMD_RESET => {
                     pending_writes.clear();
                     if let Some(ref mut d) = dev {
+                        // Zero every register (covers cloned/emulated SIDs
+                        // that ignore the RES pin), then toggle RES.
+                        d.reset_all_registers();
                         d.reset();
                     }
                     send_ok(&mut writer);
@@ -180,6 +189,24 @@ mod unix_main {
                             pending_writes.clear();
                         }
                         d.set_flush();
+
+                        // Cable-yank detector. The writer thread in
+                        // usbsid-pico bumps a `writer_error_count`
+                        // atomic on every libusb send failure. When it
+                        // grows past a small threshold (3 consecutive
+                        // failures across one frame is enough to be sure)
+                        // the device is gone — exit(1) and let launchd
+                        // respawn us with a fresh handle.
+                        let errs = d.writer_error_count();
+                        if errs > last_writer_errs.saturating_add(3) {
+                            eprintln!(
+                                "[usbsid-bridge] writer thread saw {} new USB errors; \
+                                 exiting so launchd respawns us with a fresh handle",
+                                errs - last_writer_errs
+                            );
+                            std::process::exit(1);
+                        }
+                        last_writer_errs = errs;
                     }
                 }
 
@@ -258,6 +285,7 @@ mod unix_main {
                     if let Some(ref mut d) = dev {
                         d.flush();
                         d.mute();
+                        d.reset_all_registers();
                         d.reset();
                         d.close();
                     }
@@ -270,6 +298,7 @@ mod unix_main {
                     if let Some(ref mut d) = dev {
                         d.flush();
                         d.mute();
+                        d.reset_all_registers();
                         d.reset();
                         d.close();
                     }
@@ -286,6 +315,7 @@ mod unix_main {
         // Clean up if client disconnected without CMD_QUIT
         if let Some(ref mut d) = dev {
             d.mute();
+            d.reset_all_registers();
             d.reset();
             d.close();
         }

@@ -1,7 +1,7 @@
 // Platform-agnostic SID output trait and engine registry.
 //
 // Current engines:
-//   "usb"      — USBSID-Pico hardware (BridgeDevice on macOS, DirectDevice elsewhere)
+//   "usb"      — USBSID-Pico hardware. 
 //   "emulated" — resid-rs software emulation + cpal audio output
 //   "u64"      — Ultimate 64 / Ultimate-II+ via REST API (native SID playback)
 
@@ -116,14 +116,16 @@ pub fn available_engines() -> Vec<&'static str> {
 /// Create a SidDevice for the given engine name.
 ///
 /// "auto" tries USB first, then emulated, then U64 (if address configured).
+/// `macos_usb_mode` is "bridge" or "direct"; ignored on Linux/Windows.
 pub fn create_engine(
     name: &str,
     u64_address: &str,
     u64_password: &str,
+    macos_usb_mode: &str,
 ) -> Result<Box<dyn SidDevice>, String> {
     match name {
-        "auto" => create_auto(u64_address, u64_password),
-        "usb" => create_usb(),
+        "auto" => create_auto(u64_address, u64_password, macos_usb_mode),
+        "usb" => create_usb(macos_usb_mode),
         "emulated" => create_emulated(),
         "sidlite" => create_sidlite(),
         "u64" => create_u64(u64_address, u64_password),
@@ -136,8 +138,12 @@ pub fn create_engine(
 }
 
 /// Auto: try USB → emulated → U64 (if address set).
-fn create_auto(u64_address: &str, u64_password: &str) -> Result<Box<dyn SidDevice>, String> {
-    match create_usb() {
+fn create_auto(
+    u64_address: &str,
+    u64_password: &str,
+    macos_usb_mode: &str,
+) -> Result<Box<dyn SidDevice>, String> {
+    match create_usb(macos_usb_mode) {
         Ok(dev) => return Ok(dev),
         Err(e) => eprintln!("[phosphor] USB unavailable: {e}"),
     }
@@ -156,10 +162,24 @@ fn create_auto(u64_address: &str, u64_password: &str) -> Result<Box<dyn SidDevic
     Err("No SID engine could be initialised".into())
 }
 
-/// USB hardware — macOS uses BridgeDevice, others use DirectDevice.
-fn create_usb() -> Result<Box<dyn SidDevice>, String> {
+/// USB hardware. On macOS the `macos_usb_mode` decides whether we go through
+/// the root bridge daemon or open the device in-process via libusb
+fn create_usb(_macos_usb_mode: &str) -> Result<Box<dyn SidDevice>, String> {
     #[cfg(all(feature = "usb", target_os = "macos"))]
     {
+        if _macos_usb_mode == "direct" {
+            eprintln!("[phosphor] Opening USBSID-Pico directly via libusb (macOS direct mode)…");
+            // No fallback to the daemon — the user explicitly picked
+            // "Direct (no daemon)". If libusb can't see the device,
+            // surface the real error and let them decide whether to
+            // replug or switch to Bridge mode.
+            return Ok(Box::new(crate::sid_direct::DirectDevice::open().map_err(|e| {
+                format!(
+                    "{e}\n\
+                     Replug the USB cable, or switch Settings → macOS USB transport → Bridge."
+                )
+            })?));
+        }
         eprintln!("[phosphor] Connecting to usbsid-bridge daemon…");
         let dev = crate::usb_bridge::BridgeDevice::connect()?;
         return Ok(Box::new(dev));

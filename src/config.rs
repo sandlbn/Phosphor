@@ -58,6 +58,10 @@ pub struct Config {
     pub force_stereo_2sid: bool,
     /// Restart the USB device when loading a new SID file (macOS only).
     pub restart_usb_on_load: bool,
+    /// macOS USB transport mode: "bridge" (default — talk to the root-owned
+    /// usbsid-bridge LaunchDaemon over a Unix socket) or "direct" 
+    /// on Linux/Windows, which always use the direct path.
+    pub macos_usb_mode: String,
     /// Enable the built-in HTTP server for remote control from a web browser.
     pub http_remote_enabled: bool,
     /// Port for the HTTP remote control server (default 8364).
@@ -100,6 +104,7 @@ impl Default for Config {
             u64_audio_port: 11001,
             force_stereo_2sid: false,
             restart_usb_on_load: false,
+            macos_usb_mode: "bridge".to_string(),
             http_remote_enabled: false,
             http_remote_port: 8364,
             window_x: None,
@@ -247,6 +252,14 @@ impl Config {
             } else if let Some(rest) = line.strip_prefix("\"restart_usb_on_load\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.restart_usb_on_load = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"macos_usb_mode\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    // Whitelist known values; fall back to default on garbage.
+                    if s == "bridge" || s == "direct" {
+                        config.macos_usb_mode = s;
+                    }
+                }
             } else if let Some(rest) = line.strip_prefix("\"http_remote_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.http_remote_enabled = val == "true";
@@ -331,6 +344,7 @@ impl Config {
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
                 "  \"restart_usb_on_load\": {},\n",
+                "  \"macos_usb_mode\": \"{}\",\n",
                 "  \"http_remote_enabled\": {},\n",
                 "  \"http_remote_port\": {},\n",
                 "  \"window_x\": {},\n",
@@ -359,6 +373,7 @@ impl Config {
             self.u64_audio_port,
             self.force_stereo_2sid,
             self.restart_usb_on_load,
+            self.macos_usb_mode,
             self.http_remote_enabled,
             self.http_remote_port,
             fmt_opt_i32(self.window_x),
