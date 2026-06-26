@@ -397,16 +397,40 @@ async fn run_sync(
                     Ok(DownloadEvent::Failed { id, error, retryable }) if pending.contains(&id) => {
                         pending.remove(&id);
                         files_done += 1;
-                        // Look up the URL + on-disk filename for the failed download
-                        // so the log line is actually diagnosable. Without this, we
-                        // only see the opaque DownloadId.
-                        let (url, filename) = engine
-                            .status(id)
-                            .map(|s| (s.metadata.url.unwrap_or_default(), s.metadata.filename.unwrap_or_default()))
+                        // Look up the URL + on-disk path so the log line is
+                        // actually diagnosable (vs an opaque DownloadId).
+                        let status = engine.status(id);
+                        let (url, save_dir, filename) = status
+                            .as_ref()
+                            .map(|s| (
+                                s.metadata.url.clone().unwrap_or_default(),
+                                s.metadata.save_dir.clone(),
+                                s.metadata.filename.clone().unwrap_or_default(),
+                            ))
                             .unwrap_or_default();
                         eprintln!(
                             "[hvsc-sync] file failed (retryable={retryable}): {filename}  url={url}  err={error}"
                         );
+                        // 416 means our local .part has reached or exceeded the
+                        // upstream Content-Length (download was already complete
+                        // but never got renamed to its final name, or mirror
+                        // drift produced a smaller upstream). Delete the stale
+                        // partial so the next sync starts fresh and succeeds.
+                        if error.contains("416") && !filename.is_empty() {
+                            let part = save_dir.join(format!("{filename}.part"));
+                            if part.exists() {
+                                match std::fs::remove_file(&part) {
+                                    Ok(_) => eprintln!(
+                                        "[hvsc-sync] removed stale .part for next sync: {}",
+                                        part.display()
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[hvsc-sync] cannot remove {}: {e}",
+                                        part.display()
+                                    ),
+                                }
+                            }
+                        }
                     }
                     Ok(_) => { /* other event types or unrelated ids */ }
                     // Lagged is recoverable: the broadcast channel had more
