@@ -1,7 +1,7 @@
 // Platform-agnostic SID output trait and engine registry.
 //
 // Current engines:
-//   "usb"      — USBSID-Pico hardware. 
+//   "usb"      — USBSID-Pico hardware.
 //   "emulated" — resid-rs software emulation + cpal audio output
 //   "u64"      — Ultimate 64 / Ultimate-II+ via REST API (native SID playback)
 
@@ -173,12 +173,14 @@ fn create_usb(_macos_usb_mode: &str) -> Result<Box<dyn SidDevice>, String> {
             // "Direct (no daemon)". If libusb can't see the device,
             // surface the real error and let them decide whether to
             // replug or switch to Bridge mode.
-            return Ok(Box::new(crate::sid_direct::DirectDevice::open().map_err(|e| {
-                format!(
-                    "{e}\n\
+            return Ok(Box::new(crate::sid_direct::DirectDevice::open().map_err(
+                |e| {
+                    format!(
+                        "{e}\n\
                      Replug the USB cable, or switch Settings → macOS USB transport → Bridge."
-                )
-            })?));
+                    )
+                },
+            )?));
         }
         eprintln!("[phosphor] Connecting to usbsid-bridge daemon…");
         let dev = crate::usb_bridge::BridgeDevice::connect()?;

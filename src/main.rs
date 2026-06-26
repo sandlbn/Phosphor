@@ -27,6 +27,7 @@ mod daemon_installer;
 #[cfg(feature = "usb")]
 mod sid_direct;
 
+mod hvsc_sync;
 mod remote;
 mod sid_emulated;
 mod sid_sidlite;
@@ -149,6 +150,16 @@ struct App {
     heard_db: HeardDb,
     /// Pre-formatted HVSC completion string for the status bar.
     heard_text: String,
+    /// Remote HVSC version reported by the boot-time `check_hvsc_update`
+    /// probe. None until the probe finishes (or if it fails).
+    hvsc_remote_version: Option<u32>,
+    /// Pre-formatted "HVSC v84 ✓" / "HVSC v72 → v84 ⚠" string for the
+    /// status bar. Recomputed by `refresh_hvsc_status()` whenever the
+    /// local STIL DB loads or the remote check returns.
+    hvsc_status_text: String,
+    /// True when the remote HVSC is newer than the local copy. Drives the
+    /// status bar's amber colour for the update marker.
+    hvsc_update_available: bool,
     /// Whether the recently played panel is visible instead of the playlist.
     show_recently_played: bool,
     /// Whether the SID register info panel is visible instead of the playlist.
@@ -209,6 +220,16 @@ struct App {
     show_stil_overlay: bool,
     /// Status text shown below the STIL download button in settings.
     stil_status: String,
+    /// HVSC rsync sync state. `Some` while a sync is in progress; dropped
+    /// to None on completion or cancel.
+    hvsc_sync: Option<hvsc_sync::HvscSyncHandle>,
+    /// Most recent status line for the HVSC sync section.
+    hvsc_sync_status: String,
+    /// Optional `(files_done, files_total)` shown as a progress bar in Settings.
+    /// Files (not bytes) because HVSC's HTTP index doesn't expose per-file
+    /// sizes in a form gosh-dl extracts, so a byte-based bar would always
+    /// read 0%. File counts are accurate.
+    hvsc_sync_progress: Option<(u32, u32)>,
     /// Pre-formatted STIL text for the currently playing tune + subtune.
     /// Kept in App so view() can borrow it without a local String lifetime issue.
     stil_display_text: String,
@@ -243,6 +264,14 @@ struct App {
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let config = Config::load();
+        // Pre-seed the HVSC sync status from the persisted timestamp, while
+        // we still own `config` by reference (we'll move it into the struct
+        // literal below).
+        let initial_hvsc_status = config
+            .hvsc_last_sync
+            .as_deref()
+            .map(|t| format!("Last synced: {t}"))
+            .unwrap_or_default();
         // Re-seed the global font scale to match the (possibly newer) config
         // boot reads; main() also seeds before the window opens.
         crate::ui::font::set_base(config.base_font_size);
@@ -346,8 +375,9 @@ impl App {
         }
 
         // Snapshot fields needed for auto-download before config moves into app.
-        let auto_songlength_url = config.songlength_url.clone();
-        let auto_stil_url = config.stil_url.clone();
+        // Both Songlengths.md5 and STIL.txt are fetched as DOCUMENTS/*.* relative
+        // to the single hvsc_rsync_url — one source of truth.
+        let auto_hvsc_base = config.hvsc_rsync_url.clone();
         let auto_last_sl_file = config.last_songlength_file.clone();
         let auto_last_stil_file = config.last_stil_file.clone();
 
@@ -386,6 +416,9 @@ impl App {
             recently_played,
             heard_db,
             heard_text: String::new(),
+            hvsc_remote_version: None,
+            hvsc_status_text: String::new(),
+            hvsc_update_available: false,
             show_recently_played: false,
             show_sid_panel: false,
             playlist_scroll_offset_y: 0.0,
@@ -410,6 +443,9 @@ impl App {
             stil_entry: None,
             show_stil_overlay: false,
             stil_status: String::new(),
+            hvsc_sync: None,
+            hvsc_sync_status: initial_hvsc_status,
+            hvsc_sync_progress: None,
             stil_display_text: String::new(),
             karaoke_flag_times: Vec::new(),
             karaoke_has_flags: false,
@@ -431,9 +467,9 @@ impl App {
             Message::VersionCheckDone,
         );
 
-        // Kick off HVSC version check using the STIL URL.
-        // We only fetch the first 1 KB of the remote STIL so this is cheap.
-        let hvsc_check_url = auto_stil_url.clone();
+        // Kick off HVSC version check using the HVSC base URL — internally
+        // hits <base>/DOCUMENTS/STIL.txt with a 1 KB Range request.
+        let hvsc_check_url = auto_hvsc_base.clone();
         let hvsc_task = Task::perform(
             async move {
                 match stil::check_hvsc_update(&hvsc_check_url).await {
@@ -497,9 +533,9 @@ impl App {
 
         if songlength_missing {
             eprintln!("[phosphor] Songlength DB not found — auto-downloading");
-            let url = auto_songlength_url.clone();
+            let base = auto_hvsc_base.clone();
             tasks.push(Task::perform(
-                config::download_songlength(url),
+                config::download_songlength(base),
                 Message::SonglengthDownloaded,
             ));
             auto_status_parts.push("Songlengths");
@@ -507,9 +543,9 @@ impl App {
 
         if stil_missing {
             eprintln!("[phosphor] STIL.txt not found — auto-downloading");
-            let url = auto_stil_url.clone();
+            let base = auto_hvsc_base.clone();
             tasks.push(Task::perform(
-                stil::download_stil(url),
+                stil::download_stil(base),
                 Message::StilDownloaded,
             ));
             auto_status_parts.push("STIL");
@@ -521,6 +557,10 @@ impl App {
         if n > 0 {
             app.auto_download_status = format!("⬇ Downloading {}…", auto_status_parts.join(" & "));
         }
+        // If STIL.txt was loaded from disk above, the local HVSC version is
+        // already known. Seed the status-bar indicator now so it's visible
+        // immediately, before the remote check returns.
+        app.refresh_hvsc_status();
 
         (app, Task::batch(tasks))
     }
@@ -1319,11 +1359,6 @@ impl App {
                 }
             }
 
-            Message::SonglengthUrlChanged(url) => {
-                self.config.songlength_url = url;
-                self.config.save();
-            }
-
             Message::SetOutputEngine(engine) => {
                 if engine != self.config.output_engine {
                     self.config.output_engine = engine.clone();
@@ -1365,7 +1400,7 @@ impl App {
 
             Message::DownloadSonglength => {
                 self.download_status = "Downloading...".to_string();
-                let url = self.config.songlength_url.clone();
+                let url = self.config.hvsc_rsync_url.clone();
                 return Task::perform(
                     config::download_songlength(url),
                     Message::SonglengthDownloaded,
@@ -1600,6 +1635,8 @@ impl App {
             }
 
             Message::HvscCheckDone(Ok(remote_ver)) => {
+                self.hvsc_remote_version = Some(remote_ver);
+                self.refresh_hvsc_status();
                 let local_ver = self.stil_db.as_ref().and_then(|db| db.hvsc_version);
                 let info = stil::HvscUpdateInfo {
                     remote_version: remote_ver,
@@ -1612,14 +1649,14 @@ impl App {
                     self.auto_download_status =
                         format!("⬆ {} — updating databases…", info.description());
                     self.pending_auto_downloads = 2;
-                    let sl_url = self.config.songlength_url.clone();
-                    let stil_url = self.config.stil_url.clone();
+                    let base = self.config.hvsc_rsync_url.clone();
+                    let base2 = base.clone();
                     return Task::batch([
                         Task::perform(
-                            config::download_songlength(sl_url),
+                            config::download_songlength(base),
                             Message::SonglengthDownloaded,
                         ),
-                        Task::perform(stil::download_stil(stil_url), Message::StilDownloaded),
+                        Task::perform(stil::download_stil(base2), Message::StilDownloaded),
                     ]);
                 } else {
                     eprintln!("[phosphor] HVSC is up to date (v{remote_ver})");
@@ -1725,12 +1762,6 @@ impl App {
                 self.show_stil_overlay = false;
             }
 
-            // ── STIL settings ─────────────────────────────────────────────
-            Message::StilUrlChanged(url) => {
-                self.config.stil_url = url;
-                self.config.save();
-            }
-
             Message::HvscRootChanged(root) => {
                 self.config.hvsc_root = if root.trim().is_empty() {
                     None
@@ -1749,9 +1780,66 @@ impl App {
                 self.refresh_stil_entry();
             }
 
+            Message::HvscRsyncUrlChanged(url) => {
+                // Trim — a trailing space (easy to introduce by copy-paste)
+                // breaks every URL we derive from this base. Strip here so
+                // the saved config stays clean.
+                self.config.hvsc_rsync_url = url.trim().to_string();
+                self.config.save();
+            }
+
+            Message::HvscRsyncStart => {
+                if self.hvsc_sync.is_some() {
+                    // Already running — ignore.
+                } else {
+                    // Pick destination: hvsc_root if set, else platform default.
+                    let dest = match self
+                        .config
+                        .hvsc_root
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from)
+                        .or_else(hvsc_sync::default_hvsc_root)
+                    {
+                        Some(p) => p,
+                        None => {
+                            self.hvsc_sync_status =
+                                "Cannot determine destination — set HVSC root manually."
+                                    .to_string();
+                            return Task::none();
+                        }
+                    };
+                    let url = self.config.hvsc_rsync_url.clone();
+                    match hvsc_sync::HvscSyncHandle::start(&url, &dest) {
+                        Ok(handle) => {
+                            // Persist the destination so it survives restarts.
+                            self.config.hvsc_root = Some(dest.to_string_lossy().into_owned());
+                            self.config.save();
+                            self.hvsc_sync = Some(handle);
+                            self.hvsc_sync_status = "Connecting…".to_string();
+                            self.hvsc_sync_progress = None;
+                        }
+                        Err(e) => {
+                            self.hvsc_sync_status = format!("Error: {e}");
+                        }
+                    }
+                }
+            }
+
+            Message::HvscRsyncCancel => {
+                if let Some(h) = self.hvsc_sync.as_ref() {
+                    h.cancel();
+                    self.hvsc_sync_status = "Cancelling…".to_string();
+                }
+            }
+
+            Message::HvscRsyncPoll => {
+                // No-op — actual drain happens in poll_status() each Tick.
+            }
+
             Message::DownloadStil => {
                 self.stil_status = "Downloading…".to_string();
-                let url = self.config.stil_url.clone();
+                let url = self.config.hvsc_rsync_url.clone();
                 return Task::perform(stil::download_stil(url), Message::StilDownloaded);
             }
 
@@ -1765,6 +1853,7 @@ impl App {
                             self.stil_db = Some(db);
                             self.update_auto_download_status();
                             self.refresh_stil_entry();
+                            self.refresh_hvsc_status();
                         }
                         Err(e) => self.stil_status = format!("Error loading STIL: {e}"),
                     }
@@ -1790,6 +1879,7 @@ impl App {
                                 format!("Loaded {} entries from {}", count, path.display());
                             self.stil_db = Some(db);
                             self.refresh_stil_entry();
+                            self.refresh_hvsc_status();
                         }
                         Err(e) => self.stil_status = format!("Error: {e}"),
                     }
@@ -1943,6 +2033,9 @@ impl App {
                 self.http_remote_running,
                 &self.http_port_text,
                 &self.base_font_size_text,
+                self.hvsc_sync.is_some(),
+                &self.hvsc_sync_status,
+                self.hvsc_sync_progress,
             );
             column![
                 info_bar,
@@ -2048,7 +2141,11 @@ impl App {
                 rule::horizontal(1),
                 playlist_widget,
                 rule::horizontal(1),
-                ui::status_bar(&self.heard_text),
+                ui::status_bar(
+                    &self.heard_text,
+                    &self.hvsc_status_text,
+                    self.hvsc_update_available,
+                ),
             ]
             .into()
         };
@@ -2332,6 +2429,63 @@ impl App {
         }
     }
 
+    /// After a successful HVSC rsync, re-point the Songlength and STIL
+    /// databases at the freshly synced copies under `<hvsc_root>/DOCUMENTS/`
+    /// when (a) they're currently unset, or (b) they point outside the new
+    /// HVSC root. Then reload both DBs and refresh the now-playing entry.
+    /// Recompute the HVSC version indicator shown in the status bar.
+    /// Call whenever the local STIL DB or the cached remote version changes.
+    fn refresh_hvsc_status(&mut self) {
+        let local_v = self.stil_db.as_ref().and_then(|db| db.hvsc_version);
+        let (text, available) = match (local_v, self.hvsc_remote_version) {
+            (Some(l), Some(r)) if r > l => (format!("HVSC v{l} → v{r} ⚠"), true),
+            (Some(l), Some(r)) if l == r => (format!("HVSC v{l} ✓"), false),
+            (Some(l), _) => (format!("HVSC v{l}"), false),
+            (None, Some(r)) => (format!("HVSC v{r} available"), false),
+            (None, None) => (String::new(), false),
+        };
+        self.hvsc_status_text = text;
+        self.hvsc_update_available = available;
+    }
+
+    fn apply_post_hvsc_sync(&mut self) {
+        let Some(root) = self.config.hvsc_root.clone() else {
+            return;
+        };
+        let root = PathBuf::from(root);
+
+        let path_inside = |p: &Option<String>| -> bool {
+            p.as_deref()
+                .map(|s| PathBuf::from(s).starts_with(&root))
+                .unwrap_or(false)
+        };
+
+        // Songlengths.md5
+        let sl_candidate = root.join("DOCUMENTS").join("Songlengths.md5");
+        if sl_candidate.is_file() && !path_inside(&self.config.last_songlength_file) {
+            self.config.remember_songlength_path(&sl_candidate);
+            if let Ok(db) = SonglengthDb::load(&sl_candidate) {
+                let count = db.entries.len();
+                db.apply_to_playlist(&mut self.playlist);
+                self.songlength_db = Some(db);
+                self.download_status =
+                    format!("Loaded {} entries from {}", count, sl_candidate.display());
+            }
+        }
+
+        // STIL.txt
+        let stil_candidate = root.join("DOCUMENTS").join("STIL.txt");
+        if stil_candidate.is_file() && !path_inside(&self.config.last_stil_file) {
+            self.config.remember_stil_path(&stil_candidate);
+            if let Ok(db) = stil::StilDb::load(&stil_candidate) {
+                self.stil_status = format!("Loaded {} entries", db.count);
+                self.stil_db = Some(db);
+                self.refresh_stil_entry();
+                self.refresh_hvsc_status();
+            }
+        }
+    }
+
     /// Re-resolve STIL info for the currently playing track.
     /// Call whenever the track changes or the STIL db / hvsc_root is updated.
     fn refresh_stil_entry(&mut self) {
@@ -2463,6 +2617,78 @@ impl App {
                 }
                 Err(e) => {
                     self.device_cfg_status = format!("Error: {e}");
+                }
+            }
+        }
+
+        // Drain HVSC rsync sync events, if a sync is in flight. Same
+        // try_recv-loop pattern as status_rx — fires at 33ms cadence.
+        if let Some(handle) = self.hvsc_sync.as_ref() {
+            let mut done: Option<Result<(), String>> = None;
+            while let Ok(ev) = handle.rx.try_recv() {
+                match ev {
+                    hvsc_sync::HvscSyncEvent::Progress {
+                        files_done,
+                        files_total,
+                        bytes_done,
+                        bytes_total: _,
+                        current,
+                    } => {
+                        // Progress bar uses files (we know those exactly).
+                        // Hide the bar while files_total is 0 (early
+                        // listing phase) by leaving hvsc_sync_progress=None.
+                        self.hvsc_sync_progress = if files_total > 0 {
+                            Some((files_done, files_total))
+                        } else {
+                            None
+                        };
+                        let mb_done = bytes_done / (1024 * 1024);
+                        self.hvsc_sync_status = if current.is_empty() {
+                            format!("Listing… {} files queued", files_total)
+                        } else if files_total > 0 {
+                            // Show files for the headline metric + bytes
+                            // downloaded so far (no total — unknown).
+                            format!(
+                                "[{}/{} files] {} MB — {}",
+                                files_done, files_total, mb_done, current
+                            )
+                        } else {
+                            current
+                        };
+                    }
+                    hvsc_sync::HvscSyncEvent::Done(result) => {
+                        done = Some(result);
+                    }
+                }
+            }
+            if let Some(result) = done {
+                self.hvsc_sync = None;
+                self.hvsc_sync_progress = None;
+                match result {
+                    Ok(()) => {
+                        // Stamp the timestamp in the config.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        // Simple ISO-8601 from epoch — avoids pulling in chrono
+                        // at this layer (we already have it transitively via
+                        // arrsync-phosphor, but keep the boundary clean).
+                        self.config.hvsc_last_sync = Some(format_iso8601(now));
+                        self.config.save();
+
+                        // Auto-repoint Songlength + STIL paths to the newly
+                        // synced copies, if not already pointing into the
+                        // HVSC root.
+                        self.apply_post_hvsc_sync();
+                        self.hvsc_sync_status = format!(
+                            "Done. Last synced: {}",
+                            self.config.hvsc_last_sync.as_deref().unwrap_or("")
+                        );
+                    }
+                    Err(e) => {
+                        self.hvsc_sync_status = format!("Error: {e}");
+                    }
                 }
             }
         }
@@ -2882,6 +3108,37 @@ fn sort_indices(
             ord
         }
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Misc helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Format a Unix timestamp as "YYYY-MM-DD HH:MM:SS UTC" for display.
+/// Tiny date math — avoids pulling a date crate at this layer.
+fn format_iso8601(secs: u64) -> String {
+    // Days since 1970-01-01
+    let day = (secs / 86_400) as i64;
+    let time = secs % 86_400;
+    let hh = time / 3600;
+    let mm = (time % 3600) / 60;
+    let ss = time % 60;
+
+    // Howard Hinnant's algorithm — civil_from_days
+    let z = day + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y, m, d, hh, mm, ss
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

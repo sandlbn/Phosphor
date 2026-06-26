@@ -26,7 +26,10 @@ impl DirectDevice {
         dev.init(true, true)
             .map_err(|e| format!("USB init failed: {e}"))?;
         eprintln!("[sid-direct] USBSID-Pico opened (threaded, cycled)");
-        Ok(Self { dev, connected: true })
+        Ok(Self {
+            dev,
+            connected: true,
+        })
     }
 
     /// Update `connected` based on a fresh USB call result and log the
