@@ -468,44 +468,13 @@ fn append_continuation(target: &mut Option<String>, cont: &str) {
 //  Download helper (mirrors download_songlength in config.rs)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Download STIL.txt from `url` and save it to our config directory.
-/// Returns the path to the saved file on success.
-pub async fn download_stil(url: String) -> Result<PathBuf, String> {
+/// Refresh STIL.txt from the configured HVSC base URL.
+/// Pure-Rust path via `hvsc_sync::fetch_hvsc_document` — no subprocess.
+pub async fn download_stil(hvsc_base: String) -> Result<PathBuf, String> {
     let dest = crate::config::config_dir()
         .ok_or_else(|| "Cannot determine config directory".to_string())?
         .join("STIL.txt");
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {e}"))?;
-    }
-
-    eprintln!("[phosphor] Downloading STIL.txt from {url}...");
-
-    let output = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "120", // STIL.txt is several MB, allow more time
-            "-o",
-            &dest.to_string_lossy(),
-            &url,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run curl: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Download failed: {stderr}"));
-    }
-
-    let meta = std::fs::metadata(&dest).map_err(|e| format!("Downloaded file not found: {e}"))?;
-
-    eprintln!(
-        "[phosphor] STIL.txt saved to {} ({} bytes)",
-        dest.display(),
-        meta.len(),
-    );
-    Ok(dest)
+    crate::hvsc_sync::fetch_hvsc_document(hvsc_base, "STIL.txt", dest).await
 }
 
 /// Default path for STIL.txt in the config directory.
@@ -571,40 +540,49 @@ impl HvscUpdateInfo {
     }
 }
 
-/// Fetch the first 1 KB of the remote STIL.txt and parse the version from the header.
-/// This is a minimal request — we never download the full file just to check.
-pub async fn check_hvsc_update(stil_url: &str) -> Result<HvscUpdateInfo, String> {
-    use std::process::Command;
+/// Fetch the first 1 KB of `<hvsc_base>/DOCUMENTS/STIL.txt` and parse the
+/// version from the header. Pure-Rust via reqwest — single Range request,
+/// no subprocess.
+pub async fn check_hvsc_update(hvsc_base: &str) -> Result<HvscUpdateInfo, String> {
+    // Trim whitespace defensively — users often have a trailing space from
+    // copy-paste, which `url::Url::parse` happily percent-encodes into
+    // `…/%20`, producing a URL that 404s and confuses the parser downstream.
+    let hvsc_base = hvsc_base.trim();
+    let base = if hvsc_base.ends_with('/') {
+        hvsc_base.to_string()
+    } else {
+        format!("{hvsc_base}/")
+    };
+    let base_url = url::Url::parse(&base).map_err(|e| format!("bad HVSC base URL: {e}"))?;
+    let stil_url = base_url
+        .join("DOCUMENTS/")
+        .and_then(|u| u.join("STIL.txt"))
+        .map_err(|e| format!("URL join failed: {e}"))?;
 
-    // Use curl with --range 0-1023 to fetch only the first 1 KB
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--range",
-            "0-1023",
-            "--max-time",
-            "10",
-            "--location",
-            stil_url,
-        ])
-        .output()
-        .map_err(|e| format!("curl failed: {e}"))?;
-
-    if !output.status.success() && output.stdout.is_empty() {
-        return Err(format!("HTTP error checking HVSC version"));
+    let client = reqwest::Client::builder()
+        .user_agent("phosphor-hvsc-sync/0.4")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
+    let resp = client
+        .get(stil_url.as_str())
+        .header("Range", "bytes=0-1023")
+        .send()
+        .await
+        .map_err(|e| format!("GET {stil_url}: {e}"))?;
+    if !resp.status().is_success() && !resp.status().as_u16() == 206 {
+        return Err(format!("HTTP {}: checking HVSC version", resp.status()));
     }
-
+    let bytes = resp.bytes().await.map_err(|e| format!("body: {e}"))?;
     // Parse header as ISO-8859-1 (same as STIL loader)
-    let snippet: String = output.stdout.iter().map(|&b| b as char).collect();
-
+    let snippet: String = bytes.iter().map(|&b| b as char).collect();
     for line in snippet.lines().take(15) {
         if let Some(v) = parse_stil_version(line) {
             return Ok(HvscUpdateInfo {
                 remote_version: v,
-                local_version: None, // caller fills this in
+                local_version: None,
             });
         }
     }
-
     Err("Could not parse HVSC version from remote header".to_string())
 }

@@ -4,12 +4,12 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// Default HVSC Songlength.md5 download URL.
-pub const DEFAULT_SONGLENGTH_URL: &str =
-    "https://hvsc.c64.org/download/C64Music/DOCUMENTS/Songlengths.md5";
-
-/// Default HVSC STIL.txt download URL.
-pub const DEFAULT_STIL_URL: &str = "https://hvsc.c64.org/download/C64Music/DOCUMENTS/STIL.txt";
+/// Default HTTPS URL for the HVSC C64Music/ tree. Single source of truth:
+/// the full recursive sync crawls under this URL, AND `Songlengths.md5` +
+/// `STIL.txt` are refreshed from `<this>/DOCUMENTS/{Songlengths.md5,STIL.txt}`.
+/// prg.dtu.dk is the TU Denmark academic mirror — it serves real Apache
+/// HTML directory listings, which our crawler needs.
+pub const DEFAULT_HVSC_RSYNC_URL: &str = "https://www.prg.dtu.dk/HVSC/C64Music/";
 
 /// Default window dimensions — used on first launch.
 const DEFAULT_WINDOW_WIDTH: f32 = 900.0;
@@ -22,8 +22,6 @@ pub struct Config {
     /// Default song length in seconds when Songlength DB has no entry.
     /// 0 = disabled (no auto-advance for unknown lengths).
     pub default_song_length_secs: u32,
-    /// URL to download Songlength.md5 from.
-    pub songlength_url: String,
     /// Audio output engine name ("auto", "usb", "emulated", "u64").
     pub output_engine: String,
     /// Ultimate 64 IP address or hostname (for "u64" engine).
@@ -38,12 +36,16 @@ pub struct Config {
     pub last_songlength_file: Option<String>,
     /// Last directory used for playlists.
     pub last_playlist_dir: Option<String>,
-    /// URL to download STIL.txt from.
-    pub stil_url: String,
     /// Path to last successfully loaded STIL.txt file.
     pub last_stil_file: Option<String>,
-    /// Optional HVSC root directory — used to compute HVSC-relative paths for STIL lookup.
+    /// Optional HVSC root directory — used to compute HVSC-relative paths for STIL lookup
+    /// AND as the destination for the in-app rsync sync.
     pub hvsc_root: Option<String>,
+    /// rsync URL to pull HVSC from. Default is sidplay5's mirror, confirmed
+    /// working with our `arrsync-phosphor` fork.
+    pub hvsc_rsync_url: String,
+    /// ISO-8601 timestamp of the last successful HVSC sync (display only).
+    pub hvsc_last_sync: Option<String>,
     /// Last HVSC version string fetched from the CDN (e.g. "HVSC #80").
     /// Used to detect when a new release is available.
     pub hvsc_known_version: Option<String>,
@@ -59,7 +61,7 @@ pub struct Config {
     /// Restart the USB device when loading a new SID file (macOS only).
     pub restart_usb_on_load: bool,
     /// macOS USB transport mode: "bridge" (default — talk to the root-owned
-    /// usbsid-bridge LaunchDaemon over a Unix socket) or "direct" 
+    /// usbsid-bridge LaunchDaemon over a Unix socket) or "direct"
     /// on Linux/Windows, which always use the direct path.
     pub macos_usb_mode: String,
     /// Enable the built-in HTTP server for remote control from a web browser.
@@ -88,7 +90,6 @@ impl Default for Config {
         Self {
             skip_rsid: false,
             default_song_length_secs: 0,
-            songlength_url: DEFAULT_SONGLENGTH_URL.to_string(),
             output_engine: "auto".to_string(),
             u64_address: String::new(),
             u64_password: String::new(),
@@ -96,9 +97,10 @@ impl Default for Config {
             last_songlength_dir: None,
             last_songlength_file: None,
             last_playlist_dir: None,
-            stil_url: DEFAULT_STIL_URL.to_string(),
             last_stil_file: None,
             hvsc_root: None,
+            hvsc_rsync_url: DEFAULT_HVSC_RSYNC_URL.to_string(),
+            hvsc_last_sync: None,
             hvsc_known_version: None,
             u64_audio_enabled: false,
             u64_audio_port: 11001,
@@ -178,11 +180,6 @@ impl Config {
                 if let Ok(n) = val.parse::<u32>() {
                     config.default_song_length_secs = n;
                 }
-            } else if let Some(rest) = line.strip_prefix("\"songlength_url\"") {
-                let val = rest.trim().trim_start_matches(':').trim();
-                if let Some(s) = strip_json_string(val) {
-                    config.songlength_url = s;
-                }
             } else if let Some(rest) = line.strip_prefix("\"output_engine\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if let Some(s) = strip_json_string(val) {
@@ -218,11 +215,6 @@ impl Config {
                 if val != "null" {
                     config.last_playlist_dir = strip_json_string(val);
                 }
-            } else if let Some(rest) = line.strip_prefix("\"stil_url\"") {
-                let val = rest.trim().trim_start_matches(':').trim();
-                if let Some(s) = strip_json_string(val) {
-                    config.stil_url = s;
-                }
             } else if let Some(rest) = line.strip_prefix("\"last_stil_file\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if val != "null" {
@@ -237,6 +229,16 @@ impl Config {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if val != "null" {
                     config.hvsc_known_version = strip_json_string(val);
+                }
+            } else if let Some(rest) = line.strip_prefix("\"hvsc_rsync_url\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    config.hvsc_rsync_url = s;
+                }
+            } else if let Some(rest) = line.strip_prefix("\"hvsc_last_sync\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.hvsc_last_sync = strip_json_string(val);
                 }
             } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
@@ -328,7 +330,6 @@ impl Config {
                 "{{\n",
                 "  \"skip_rsid\": {},\n",
                 "  \"default_song_length_secs\": {},\n",
-                "  \"songlength_url\": \"{}\",\n",
                 "  \"output_engine\": \"{}\",\n",
                 "  \"u64_address\": \"{}\",\n",
                 "  \"u64_password\": \"{}\",\n",
@@ -336,10 +337,11 @@ impl Config {
                 "  \"last_songlength_dir\": {},\n",
                 "  \"last_songlength_file\": {},\n",
                 "  \"last_playlist_dir\": {},\n",
-                "  \"stil_url\": \"{}\",\n",
                 "  \"last_stil_file\": {},\n",
                 "  \"hvsc_root\": {},\n",
                 "  \"hvsc_known_version\": {},\n",
+                "  \"hvsc_rsync_url\": \"{}\",\n",
+                "  \"hvsc_last_sync\": {},\n",
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
@@ -357,7 +359,6 @@ impl Config {
             ),
             self.skip_rsid,
             self.default_song_length_secs,
-            self.songlength_url,
             self.output_engine,
             self.u64_address.replace('\\', "\\\\").replace('"', "\\\""),
             self.u64_password.replace('\\', "\\\\").replace('"', "\\\""),
@@ -365,10 +366,11 @@ impl Config {
             fmt_opt_str(&self.last_songlength_dir),
             fmt_opt_str(&self.last_songlength_file),
             fmt_opt_str(&self.last_playlist_dir),
-            self.stil_url,
             fmt_opt_str(&self.last_stil_file),
             fmt_opt_str(&self.hvsc_root),
             fmt_opt_str(&self.hvsc_known_version),
+            self.hvsc_rsync_url,
+            fmt_opt_str(&self.hvsc_last_sync),
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,
@@ -441,46 +443,12 @@ pub fn songlength_db_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("Songlengths.md5"))
 }
 
-/// Download Songlength.md5 from the given URL and save it.
-/// Returns the path on success.
-pub async fn download_songlength(url: String) -> Result<PathBuf, String> {
+/// Refresh Songlengths.md5 from the configured HVSC base URL.
+/// Pure-Rust path via `hvsc_sync::fetch_hvsc_document` — no subprocess.
+pub async fn download_songlength(hvsc_base: String) -> Result<PathBuf, String> {
     let dest =
         songlength_db_path().ok_or_else(|| "Cannot determine config directory".to_string())?;
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {e}"))?;
-    }
-
-    eprintln!("[phosphor] Downloading Songlength.md5 from {url}...");
-
-    // Use curl for the download (available on macOS and Linux).
-    // This blocks briefly but Task::perform runs it off the main thread.
-    let output = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "60",
-            "-o",
-            &dest.to_string_lossy(),
-            &url,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run curl: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Download failed: {stderr}"));
-    }
-
-    // Verify the file was actually written
-    let meta = std::fs::metadata(&dest).map_err(|e| format!("Downloaded file not found: {e}"))?;
-
-    eprintln!(
-        "[phosphor] Songlength.md5 saved to {} ({} bytes)",
-        dest.display(),
-        meta.len(),
-    );
-    Ok(dest)
+    crate::hvsc_sync::fetch_hvsc_document(hvsc_base, "Songlengths.md5", dest).await
 }
 
 /// Persistent set of favorite tunes, keyed by MD5 hash.

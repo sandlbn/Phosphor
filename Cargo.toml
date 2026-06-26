@@ -18,6 +18,20 @@ mos6502 = "0.8"
 usbsid-pico = { version = "0.1.13", features = ["usb"] }
 usbsid-pico-config = { version = "0.1.1", default-features = false }
 
+# HVSC sync over HTTP(S) — recursive directory mirror via gosh-dl. We crawl
+# an Apache-style index (e.g. www.prg.dtu.dk/HVSC/C64Music/) and download
+# every file we find. Failover + resume + multi-conn are built into the
+# engine. Pure-Rust, no subprocess, works on Windows.
+# Pinned to a sandlbn/gosh-dl fork commit, not the upstream crates.io
+# release, because we need two patches that aren't in 0.5.0:
+#   - configurable RecursiveOptions::max_files / max_pages (was 0.5.1)
+#   - normalize_url + extract_links strip Apache mod_autoindex sort links
+#     (?C=N;O=D etc.) so the crawler stops exploding request count 5×
+# Crate name `gosh-dl` on crates.io is owned upstream, so we pin by git
+# rev rather than publishing a *-phosphor fork. Swap to a tagged
+# crates.io release once upstream merges or we rename.
+gosh-dl = { git = "https://github.com/sandlbn/gosh-dl", rev = "4faf0530827f6879402ae5e78c49d0073c528a35", features = ["http", "recursive-http"] }
+
 # Software SID emulation
 resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
 cpal = "0.15"
@@ -51,7 +65,7 @@ tiny_http = "0.12"
 env_logger = "0.11"
 log = "0.4"
 image = "0.25.9"
-tokio = "1.49.0"
+tokio = { version = "1.49.0", features = ["rt", "fs", "io-util", "macros", "time"] }
 # Version checking
 reqwest = { version = "0.13.2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

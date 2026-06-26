@@ -713,7 +713,13 @@ fn handle_cmd(
                 }
             }
 
-            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password, macos_usb_mode) {
+            if let Err(e) = ensure_hardware(
+                bridge,
+                engine_name,
+                u64_address,
+                u64_password,
+                macos_usb_mode,
+            ) {
                 *last_error = Some(e);
                 *state = PlayState::Stopped;
                 send_status(state, play_ctx, last_error, status_tx);
@@ -1175,7 +1181,13 @@ fn handle_cmd(
             // The hardware must already be open (Play has been called at
             // least once) before any config op can run. If not, ensure_hardware
             // tries to bring it up here.
-            if let Err(e) = ensure_hardware(bridge, engine_name, u64_address, u64_password, macos_usb_mode) {
+            if let Err(e) = ensure_hardware(
+                bridge,
+                engine_name,
+                u64_address,
+                u64_password,
+                macos_usb_mode,
+            ) {
                 let _ = device_cfg_tx.try_send(Err(e));
                 return;
             }

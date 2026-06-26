@@ -201,7 +201,6 @@ pub enum Message {
     DefaultSongLengthChanged(String),
     BaseFontSizeChanged(String),
     VolumeChanged(f32),
-    SonglengthUrlChanged(String),
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
     SetOutputEngine(String),
@@ -262,13 +261,19 @@ pub enum Message {
     DismissStilOverlay,
 
     // STIL settings
-    StilUrlChanged(String),
     DownloadStil,
     StilDownloaded(Result<std::path::PathBuf, String>),
     LoadStil,
     StilFileChosen(Option<std::path::PathBuf>),
     HvscRootChanged(String),
     SetHvscRoot(String),
+
+    // HVSC rsync (pulls the full tune tree)
+    HvscRsyncUrlChanged(String),
+    HvscRsyncStart,
+    HvscRsyncCancel,
+    /// Per-Tick drain — UI consumes the queued progress events here.
+    HvscRsyncPoll,
 
     // No-op
     None,
@@ -1602,6 +1607,13 @@ pub fn settings_panel<'a>(
     http_remote_running: bool,
     http_port_text: &'a str,
     base_font_size_text: &'a str,
+    // `hvsc_sync_active` true while a HVSC rsync sync is running (swaps
+    // Sync/Cancel button + reveals progress bar).
+    hvsc_sync_active: bool,
+    // Status line for the HVSC sync section.
+    hvsc_sync_status: &'a str,
+    // Optional (files_done, files_total) — rendered as a progress bar.
+    hvsc_sync_progress: Option<(u32, u32)>,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -1758,11 +1770,19 @@ pub fn settings_panel<'a>(
                 .color(Color::from_rgb(0.75, 0.77, 0.82)),
             iced::widget::row![
                 tool_button(
-                    if !is_direct { "✓ Bridge daemon" } else { "  Bridge daemon" },
+                    if !is_direct {
+                        "✓ Bridge daemon"
+                    } else {
+                        "  Bridge daemon"
+                    },
                     Message::SetMacosUsbMode("bridge".to_string()),
                 ),
                 tool_button(
-                    if is_direct { "✓ Direct (no daemon)" } else { "  Direct (no daemon)" },
+                    if is_direct {
+                        "✓ Direct (no daemon)"
+                    } else {
+                        "  Direct (no daemon)"
+                    },
                     Message::SetMacosUsbMode("direct".to_string()),
                 ),
             ]
@@ -1874,23 +1894,9 @@ pub fn settings_panel<'a>(
         text("HVSC Songlength database:")
             .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
-        text_input("Songlength.md5 URL", &config.songlength_url)
-            .on_input(Message::SonglengthUrlChanged)
-            .size(font::sized(12.0))
-            .padding(Padding::from([6, 10]))
-            .width(Length::Fill)
-            .style(|_theme: &Theme, _st| text_input::Style {
-                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: Color::from_rgb(0.25, 0.27, 0.30)
-                },
-                icon: Color::from_rgb(0.5, 0.5, 0.6),
-                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
-                value: Color::from_rgb(0.85, 0.87, 0.9),
-                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
-            }),
+        text("Fetched from <HVSC base>/DOCUMENTS/Songlengths.md5 — set the HVSC URL above.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62)),
         tool_button(
             "⬇ Download / Refresh Songlength.md5",
             Message::DownloadSonglength
@@ -1915,23 +1921,9 @@ pub fn settings_panel<'a>(
         text("HVSC STIL.txt (song info & comments):")
             .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
-        text_input("STIL.txt URL", &config.stil_url)
-            .on_input(Message::StilUrlChanged)
-            .size(font::sized(12.0))
-            .padding(Padding::from([6, 10]))
-            .width(Length::Fill)
-            .style(|_theme: &Theme, _st| text_input::Style {
-                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: Color::from_rgb(0.25, 0.27, 0.30),
-                },
-                icon: Color::from_rgb(0.5, 0.5, 0.6),
-                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
-                value: Color::from_rgb(0.85, 0.87, 0.9),
-                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
-            }),
+        text("Fetched from <HVSC base>/DOCUMENTS/STIL.txt — set the HVSC URL above.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62)),
         tool_button("⬇ Download / Refresh STIL.txt", Message::DownloadStil),
         tool_button("📂 Load STIL.txt from file…", Message::LoadStil),
         text("HVSC root directory (optional — improves lookup accuracy):")
@@ -1961,6 +1953,71 @@ pub fn settings_panel<'a>(
             selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
         }),
         text(stil_status).size(font::sized(12.0)).color(stil_color),
+    ]
+    .spacing(6);
+
+    // ── HVSC rsync sync (experimental) ──────────────────────────
+    let hvsc_color = if hvsc_sync_status.contains("Error")
+        || hvsc_sync_status.contains("fail")
+        || hvsc_sync_status.contains("Cancelled")
+    {
+        Color::from_rgb(1.0, 0.4, 0.4)
+    } else if hvsc_sync_status.contains("Done") || hvsc_sync_status.contains("Last synced") {
+        Color::from_rgb(0.4, 0.9, 0.5)
+    } else {
+        Color::from_rgb(0.5, 0.5, 0.6)
+    };
+    let hvsc_progress_widget: Element<'a, Message> = if let Some((done, total)) = hvsc_sync_progress
+    {
+        let pct = if total > 0 {
+            (done as f32) / (total as f32)
+        } else {
+            0.0
+        };
+        iced::widget::progress_bar(0.0..=1.0, pct.clamp(0.0, 1.0)).into()
+    } else {
+        Space::new().into()
+    };
+    let hvsc_sync_button: Element<'a, Message> = if hvsc_sync_active {
+        tool_button("✗ Cancel sync", Message::HvscRsyncCancel)
+    } else {
+        tool_button("⬇ Sync HVSC now", Message::HvscRsyncStart)
+    };
+    let hvsc_section = column![
+        text("HVSC tunes (HTTPS mirror):")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text_input(
+            "HTTPS URL of an HVSC mirror's directory index",
+            &config.hvsc_rsync_url
+        )
+        .on_input(Message::HvscRsyncUrlChanged)
+        .size(font::sized(12.0))
+        .padding(Padding::from([6, 10]))
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _st| text_input::Style {
+            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.27, 0.30),
+            },
+            icon: Color::from_rgb(0.5, 0.5, 0.6),
+            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+            value: Color::from_rgb(0.85, 0.87, 0.9),
+            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+        }),
+        text(
+            "Destination: the HVSC root folder set above. \
+             If unset, defaults to your app-data dir."
+        )
+        .size(font::sized(11.0))
+        .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        hvsc_sync_button,
+        hvsc_progress_widget,
+        text(hvsc_sync_status)
+            .size(font::sized(12.0))
+            .color(hvsc_color),
     ]
     .spacing(6);
 
@@ -2053,6 +2110,8 @@ pub fn settings_panel<'a>(
         dl_section,
         rule::horizontal(1),
         stil_section,
+        rule::horizontal(1),
+        hvsc_section,
         rule::horizontal(1),
         remote_section,
         rule::horizontal(1),
@@ -2322,7 +2381,11 @@ pub fn filter_playlist(
 
 /// Thin right-aligned footer bar showing HVSC completion stats.
 /// Mimics the foobar2000 status bar style.
-pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
+pub fn status_bar<'a>(
+    heard_text: &'a str,
+    hvsc_version_text: &'a str,
+    hvsc_update_available: bool,
+) -> Element<'a, Message> {
     let help_btn = button(text("?").size(font::sized(10.0)))
         .on_press(Message::ShowHelp)
         .padding(Padding::from([1, 6]))
@@ -2336,11 +2399,30 @@ pub fn status_bar<'a>(heard_text: &'a str) -> Element<'a, Message> {
             ..Default::default()
         });
 
+    // HVSC version indicator. Dim grey when up-to-date; amber when an
+    // update is available. Empty string → render an empty Space so the
+    // status bar layout doesn't reflow before the boot-time check returns.
+    let hvsc_color = if hvsc_update_available {
+        Color::from_rgb(0.95, 0.70, 0.30) // amber
+    } else {
+        Color::from_rgb(0.42, 0.44, 0.52) // same dim grey as heard_text
+    };
+    let hvsc_element: Element<'a, Message> = if hvsc_version_text.is_empty() {
+        Space::new().into()
+    } else {
+        text(hvsc_version_text)
+            .size(font::sized(11.0))
+            .color(hvsc_color)
+            .into()
+    };
+
     container(
         row![
             Space::new().width(Length::Fixed(4.0)),
             help_btn,
             Space::new().width(Length::Fill),
+            hvsc_element,
+            Space::new().width(Length::Fixed(16.0)),
             text(heard_text)
                 .size(font::sized(11.0))
                 .color(Color::from_rgb(0.42, 0.44, 0.52)),

@@ -49,7 +49,10 @@ impl BridgeDevice {
         match UnixStream::connect(SOCKET_PATH) {
             Ok(stream) => {
                 eprintln!("[usb-bridge] connected");
-                return Ok(Self { stream, connected: true });
+                return Ok(Self {
+                    stream,
+                    connected: true,
+                });
             }
             Err(first_err) => {
                 eprintln!("[usb-bridge] socket not available: {first_err}");
@@ -66,7 +69,10 @@ impl BridgeDevice {
                     )
                 })?;
                 eprintln!("[usb-bridge] connected (after daemon install)");
-                return Ok(Self { stream, connected: true });
+                return Ok(Self {
+                    stream,
+                    connected: true,
+                });
             }
         }
     }
