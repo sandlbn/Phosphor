@@ -959,10 +959,16 @@ pub fn parse_playlist_file(
                 entries.extend(parse_directory(item.path, progress.clone()));
             } else {
                 count += 1;
-                // Fast path: if the M3U has cached metadata (from a
-                // Phosphor session save), create the entry directly
-                // without reading the SID file from disk.
-                let has_cache = item.title.is_some();
+                // Fast path: if the M3U has Phosphor cache metadata
+                // (specifically the md5 from a `#PHOSPHOR:` line), create
+                // the entry directly without reading the SID from disk.
+                //
+                // A bare `#EXTINF:…,Title` from a third-party M3U is NOT
+                // enough — without md5 we can't query the Songlength DB,
+                // so playlist rows would show "--" durations forever.
+                // Falling through to `from_path` reads the SID and
+                // computes the md5; EXTINF duration is preserved below.
+                let has_cache = item.md5.is_some();
                 if count % 50 == 0 || count == 1 {
                     if let Ok(mut pg) = progress.lock() {
                         let mode = if has_cache { "cached" } else { "reading SID" };
