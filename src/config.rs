@@ -46,6 +46,12 @@ pub struct Config {
     pub hvsc_rsync_url: String,
     /// ISO-8601 timestamp of the last successful HVSC sync (display only).
     pub hvsc_last_sync: Option<String>,
+    /// Browser source toggle. "local" (default) or "a64". Persisted so
+    /// the user's last-picked source survives restarts.
+    pub browser_source: String,
+    /// Last Assembly64 search query — restored into the search box on
+    /// browser open. Small QOL.
+    pub assembly64_last_query: Option<String>,
     /// Last HVSC version string fetched from the CDN (e.g. "HVSC #80").
     /// Used to detect when a new release is available.
     pub hvsc_known_version: Option<String>,
@@ -101,6 +107,8 @@ impl Default for Config {
             hvsc_root: None,
             hvsc_rsync_url: DEFAULT_HVSC_RSYNC_URL.to_string(),
             hvsc_last_sync: None,
+            browser_source: "local".to_string(),
+            assembly64_last_query: None,
             hvsc_known_version: None,
             u64_audio_enabled: false,
             u64_audio_port: 11001,
@@ -240,6 +248,16 @@ impl Config {
                 if val != "null" {
                     config.hvsc_last_sync = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"browser_source\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    config.browser_source = s;
+                }
+            } else if let Some(rest) = line.strip_prefix("\"assembly64_last_query\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.assembly64_last_query = strip_json_string(val);
+                }
             } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.u64_audio_enabled = val == "true";
@@ -342,6 +360,8 @@ impl Config {
                 "  \"hvsc_known_version\": {},\n",
                 "  \"hvsc_rsync_url\": \"{}\",\n",
                 "  \"hvsc_last_sync\": {},\n",
+                "  \"browser_source\": \"{}\",\n",
+                "  \"assembly64_last_query\": {},\n",
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
@@ -371,6 +391,8 @@ impl Config {
             fmt_opt_str(&self.hvsc_known_version),
             self.hvsc_rsync_url,
             fmt_opt_str(&self.hvsc_last_sync),
+            self.browser_source,
+            fmt_opt_str(&self.assembly64_last_query),
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,

@@ -261,6 +261,28 @@ pub enum Message {
     /// Add a tune from the flat search index to the playlist.
     HvscBrowserAddFlat(usize),
 
+    // Browse panel: source toggle (Local HVSC vs Assembly64)
+    BrowserSourceChanged(crate::hvsc_browser::BrowserSource),
+
+    // Assembly64 browser
+    Assembly64QueryChanged(String),
+    Assembly64SearchSubmit,
+    Assembly64SearchDone(Result<Vec<crate::assembly64::AsmEntry>, String>),
+    Assembly64SearchMore,
+    Assembly64SearchMoreDone(Result<Vec<crate::assembly64::AsmEntry>, String>),
+    /// Background prefetch of one search hit's file list completed.
+    /// Used to hide releases with zero playable SIDs.
+    Assembly64PrefetchDone(String, Result<Vec<crate::assembly64::AsmFile>, String>),
+    /// Toggle expansion of an entry's file list. (item_id, category_id).
+    Assembly64ToggleExpand(String, u32),
+    Assembly64ExpandDone(String, Result<Vec<crate::assembly64::AsmFile>, String>),
+    /// Play a file from an expanded entry. (item_id, category_id, file_id, file_path).
+    Assembly64PlayFile(String, u32, u32, String),
+    /// Add a file from an expanded entry to the playlist (no play).
+    Assembly64AddFile(String, u32, u32, String),
+    /// Async download completed. (Result<cached_path, error>, play_after, song).
+    Assembly64DownloadDone(Result<std::path::PathBuf, String>, bool, u16),
+
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,
@@ -773,7 +795,7 @@ pub fn controls_bar<'a>(
         .spacing(4)
     };
 
-    // Panel-toggles sub-group (history / SID panel / device config / settings / HVSC browser).
+    // Panel-toggles sub-group (history / SID panel / device config / settings / library browser).
     let panel_toggles = if compact {
         row![
             recent_btn,
@@ -787,7 +809,7 @@ pub fn controls_bar<'a>(
         row![
             recent_btn,
             sid_btn,
-            small_button("📚 HVSC", Message::ToggleHvscBrowser),
+            small_button("📚 Library", Message::ToggleHvscBrowser),
             small_button("🔧 Device", Message::ToggleDeviceConfig),
             small_button("⚙ Settings", Message::ToggleSettings),
         ]
@@ -1614,6 +1636,296 @@ fn playlist_row_content<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build the settings panel (shown instead of the playlist when ⚙ is toggled).
+/// Dispatcher for the Browse panel — renders a source toggle at the top
+/// (Local HVSC | Assembly64) and the appropriate sub-view below it.
+pub fn browser_view<'a>(
+    source: crate::hvsc_browser::BrowserSource,
+    hvsc: &'a crate::hvsc_browser::HvscBrowser,
+    a64: &'a crate::assembly64_browser::Assembly64Browser,
+) -> Element<'a, Message> {
+    use crate::hvsc_browser::BrowserSource;
+
+    let source_btn = |s: BrowserSource| -> Element<'a, Message> {
+        let active = source == s;
+        let label = if active {
+            format!("✓ {}", s.label())
+        } else {
+            s.label().to_string()
+        };
+        tool_button(
+            Box::leak(label.into_boxed_str()),
+            Message::BrowserSourceChanged(s),
+        )
+    };
+
+    let header = container(
+        row![
+            text("Source:")
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+            source_btn(BrowserSource::LocalHvsc),
+            source_btn(BrowserSource::Assembly64),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(6)
+        .padding(Padding::from([6, 12]))
+        .align_y(Alignment::Center),
+    )
+    .style(|_t: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.11, 0.12, 0.14))),
+        ..Default::default()
+    });
+
+    let body: Element<'a, Message> = match source {
+        BrowserSource::LocalHvsc => hvsc_browser_view(hvsc),
+        BrowserSource::Assembly64 => assembly64_browser_view(a64),
+    };
+
+    container(column![header, rule::horizontal(1), body])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Assembly64 browser — search bar on top, results list below, each
+/// result expandable to show its `.sid` files.
+pub fn assembly64_browser_view<'a>(
+    a64: &'a crate::assembly64_browser::Assembly64Browser,
+) -> Element<'a, Message> {
+    use crate::assembly64_browser::ExpansionState;
+
+    // ── Search bar + status line ──────────────────────────────────────────
+    let search_input = text_input(
+        r#"AQL query, e.g. name:"commando"  or  handle:"hubbard" category:music"#,
+        a64.query(),
+    )
+    .on_input(Message::Assembly64QueryChanged)
+    .on_submit(Message::Assembly64SearchSubmit)
+    .size(font::sized(12.0))
+    .padding(Padding::from([6, 10]))
+    .width(Length::Fill)
+    .style(|_t: &Theme, _st| text_input::Style {
+        background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+        border: iced::Border {
+            radius: 3.0.into(),
+            width: 1.0,
+            color: Color::from_rgb(0.25, 0.27, 0.30),
+        },
+        icon: Color::from_rgb(0.5, 0.5, 0.6),
+        placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+        value: Color::from_rgb(0.85, 0.87, 0.9),
+        selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+    });
+
+    let status_text: Element<'a, Message> = if let Some(err) = a64.last_error() {
+        text(format!("⚠ {err}"))
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(1.0, 0.45, 0.45))
+            .into()
+    } else if a64.search_in_flight() {
+        text("Searching…")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into()
+    } else if !a64.results_query().is_empty() {
+        let total = a64.results().len();
+        let hidden = a64
+            .results()
+            .iter()
+            .filter(|e| a64.is_hidden(&e.id))
+            .count();
+        let visible = total - hidden;
+        let pending = a64.prefetch_pending();
+        let msg = if pending > 0 {
+            format!("{visible}/{total} releases with playable SIDs — checking {pending} more…")
+        } else if hidden > 0 {
+            format!("{visible} releases with playable SIDs ({hidden} hidden — no .sid files)")
+        } else {
+            format!("{visible} releases with playable SIDs")
+        };
+        text(msg)
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into()
+    } else {
+        text("Press ENTER or click 🔎 to search.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.55))
+            .into()
+    };
+
+    let search_row = row![
+        search_input,
+        tool_button("🔎 Search", Message::Assembly64SearchSubmit),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    // ── Results list ──────────────────────────────────────────────────────
+    let mut results_col: Column<'a, Message> = column![].spacing(2);
+
+    if a64.results().is_empty() && !a64.search_in_flight() && a64.last_error().is_none() {
+        results_col = results_col.push(
+            container(
+                text(
+                    r#"Search Assembly64 for SID releases.
+Bare terms (e.g. commando) are filtered to category:music.
+For full AQL, include a colon — e.g. handle:"hubbard",
+group:Hubbard year:1985, or category:demos commando."#,
+                )
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+            )
+            .padding(Padding::from([20, 24])),
+        );
+    }
+
+    for entry in a64.results() {
+        if a64.is_hidden(&entry.id) {
+            continue;
+        }
+        let expanded = a64.expansion(&entry.id).is_some();
+        let chev = if expanded { "▾" } else { "▸" };
+        let toggle = tool_button(
+            Box::leak(format!("{} {}", chev, entry.name).into_boxed_str()),
+            Message::Assembly64ToggleExpand(entry.id.clone(), entry.category),
+        );
+
+        let mut sub_parts: Vec<String> = Vec::new();
+        if !entry.handle.is_empty() {
+            sub_parts.push(entry.handle.clone());
+        }
+        if !entry.group.is_empty() {
+            sub_parts.push(format!("/{}", entry.group));
+        }
+        if entry.year > 0 {
+            sub_parts.push(format!("· {}", entry.year));
+        }
+        if entry.rating > 0 {
+            sub_parts.push(format!("· ★ {}", entry.rating));
+        }
+        let subline = sub_parts.join(" ");
+
+        let entry_block = column![
+            toggle,
+            text(subline)
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        ]
+        .spacing(2);
+
+        results_col = results_col.push(
+            container(entry_block)
+                .padding(Padding::from([4, 10]))
+                .width(Length::Fill),
+        );
+
+        if expanded {
+            let exp = a64.expansion(&entry.id).unwrap();
+            let sub: Element<'a, Message> = match exp {
+                ExpansionState::Loading => text("  Loading files…")
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .into(),
+                ExpansionState::Failed(msg) => text(format!("  ⚠ {msg}"))
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(1.0, 0.45, 0.45))
+                    .into(),
+                ExpansionState::Loaded(files) => {
+                    let sid_files: Vec<&crate::assembly64::AsmFile> =
+                        files.iter().filter(|f| f.is_sid()).collect();
+                    if sid_files.is_empty() {
+                        text(format!(
+                            "  No .sid files in this release ({} other files).",
+                            files.len()
+                        ))
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.55, 0.57, 0.62))
+                        .into()
+                    } else {
+                        let mut sub_col: Column<'a, Message> = column![].spacing(1);
+                        for f in sid_files {
+                            sub_col = sub_col.push(
+                                row![
+                                    Space::new().width(Length::Fixed(24.0)),
+                                    text(&f.path)
+                                        .size(font::sized(12.0))
+                                        .color(Color::from_rgb(0.85, 0.87, 0.9))
+                                        .width(Length::Fill)
+                                        .wrapping(text::Wrapping::None),
+                                    text(format!("{} B", f.size))
+                                        .size(font::sized(11.0))
+                                        .color(Color::from_rgb(0.55, 0.57, 0.62))
+                                        .width(Length::Fixed(80.0)),
+                                    tool_button(
+                                        "▶",
+                                        Message::Assembly64PlayFile(
+                                            entry.id.clone(),
+                                            entry.category,
+                                            f.id,
+                                            f.path.clone(),
+                                        ),
+                                    ),
+                                    Space::new().width(Length::Fixed(4.0)),
+                                    tool_button(
+                                        "➕",
+                                        Message::Assembly64AddFile(
+                                            entry.id.clone(),
+                                            entry.category,
+                                            f.id,
+                                            f.path.clone(),
+                                        ),
+                                    ),
+                                ]
+                                .padding(Padding::from([2, 10]))
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                            );
+                        }
+                        sub_col.into()
+                    }
+                }
+            };
+            results_col = results_col.push(sub);
+        }
+        results_col = results_col.push(rule::horizontal(1));
+    }
+
+    if a64.more_available() {
+        results_col = results_col.push(
+            container(tool_button("⬇ Load more", Message::Assembly64SearchMore))
+                .padding(Padding::from([8, 12])),
+        );
+    }
+
+    let body = column![
+        search_row,
+        status_text,
+        scrollable(results_col).height(Length::Fill),
+    ]
+    .spacing(6)
+    .padding(Padding::from([8, 8]));
+
+    // Footer: Close
+    let footer = container(
+        row![
+            Space::new().width(Length::Fill),
+            tool_button("✕ Close", Message::ToggleHvscBrowser),
+        ]
+        .padding(Padding::from([6, 12]))
+        .align_y(Alignment::Center),
+    );
+
+    container(column![body, rule::horizontal(1), footer])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+            ..Default::default()
+        })
+        .into()
+}
+
 /// Two-column HVSC browser panel. Left: author list (alphabetical, sticky
 /// letter headers). Right: tunes belonging to the selected author. Footer
 /// has Add-all + category segmented control + Close.
