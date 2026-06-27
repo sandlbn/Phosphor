@@ -52,6 +52,9 @@ pub struct Config {
     /// Last Assembly64 search query — restored into the search box on
     /// browser open. Small QOL.
     pub assembly64_last_query: Option<String>,
+    /// UNIX timestamp (seconds) of the last successful Published Playlists
+    /// sync. Drives the "Last synced: 4 min ago" indicator.
+    pub published_playlists_last_synced: Option<i64>,
     /// Last HVSC version string fetched from the CDN (e.g. "HVSC #80").
     /// Used to detect when a new release is available.
     pub hvsc_known_version: Option<String>,
@@ -109,6 +112,7 @@ impl Default for Config {
             hvsc_last_sync: None,
             browser_source: "local".to_string(),
             assembly64_last_query: None,
+            published_playlists_last_synced: None,
             hvsc_known_version: None,
             u64_audio_enabled: false,
             u64_audio_port: 11001,
@@ -258,6 +262,15 @@ impl Config {
                 if val != "null" {
                     config.assembly64_last_query = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"published_playlists_last_synced\"") {
+                let val = rest
+                    .trim()
+                    .trim_start_matches(':')
+                    .trim()
+                    .trim_end_matches(',');
+                if val != "null" {
+                    config.published_playlists_last_synced = val.parse::<i64>().ok();
+                }
             } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.u64_audio_enabled = val == "true";
@@ -343,6 +356,12 @@ impl Config {
                 None => "null".to_string(),
             }
         };
+        let fmt_opt_i64 = |v: Option<i64>| -> String {
+            match v {
+                Some(n) => n.to_string(),
+                None => "null".to_string(),
+            }
+        };
         format!(
             concat!(
                 "{{\n",
@@ -362,6 +381,7 @@ impl Config {
                 "  \"hvsc_last_sync\": {},\n",
                 "  \"browser_source\": \"{}\",\n",
                 "  \"assembly64_last_query\": {},\n",
+                "  \"published_playlists_last_synced\": {},\n",
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
@@ -393,6 +413,7 @@ impl Config {
             fmt_opt_str(&self.hvsc_last_sync),
             self.browser_source,
             fmt_opt_str(&self.assembly64_last_query),
+            fmt_opt_i64(self.published_playlists_last_synced),
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,

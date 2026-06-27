@@ -283,6 +283,22 @@ pub enum Message {
     /// Async download completed. (Result<cached_path, error>, play_after, song).
     Assembly64DownloadDone(Result<std::path::PathBuf, String>, bool, u16),
 
+    // Published playlists (curated M3Us synced from the Phosphor repo)
+    PublishedPlaylistsSyncStart,
+    PublishedPlaylistsManifestDone(Result<crate::published_playlists::Manifest, String>),
+    /// One per-playlist delta download completed.
+    PublishedPlaylistsFileDone(String, Result<std::path::PathBuf, String>),
+    /// Toggle the inline preview (▾) on a playlist row.
+    PublishedPlaylistsToggleExpand(String),
+    /// Lightweight parsed preview ready to display.
+    PublishedPlaylistsPreviewDone(String, Result<Vec<crate::playlist::PreviewTrack>, String>),
+    /// User clicked ▶ Load on a published playlist row.
+    PublishedPlaylistsLoad(String),
+    PublishedPlaylistsLoadDone(Result<(String, Vec<crate::playlist::PlaylistEntry>), String>),
+    /// User clicked "↺ Restore my playlist" while a published playlist is active.
+    PublishedPlaylistsRestoreDefault,
+    PublishedPlaylistsRestoreDone(Vec<crate::playlist::PlaylistEntry>),
+
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,
@@ -1642,6 +1658,9 @@ pub fn browser_view<'a>(
     source: crate::hvsc_browser::BrowserSource,
     hvsc: &'a crate::hvsc_browser::HvscBrowser,
     a64: &'a crate::assembly64_browser::Assembly64Browser,
+    pub_pls: &'a crate::published_playlists_browser::PublishedPlaylistsBrowser,
+    hvsc_root_known: bool,
+    session_mode: &'a crate::SessionMode,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::BrowserSource;
 
@@ -1665,6 +1684,7 @@ pub fn browser_view<'a>(
                 .color(Color::from_rgb(0.55, 0.57, 0.62)),
             source_btn(BrowserSource::LocalHvsc),
             source_btn(BrowserSource::Assembly64),
+            source_btn(BrowserSource::PublishedPlaylists),
             Space::new().width(Length::Fill),
         ]
         .spacing(6)
@@ -1679,6 +1699,9 @@ pub fn browser_view<'a>(
     let body: Element<'a, Message> = match source {
         BrowserSource::LocalHvsc => hvsc_browser_view(hvsc),
         BrowserSource::Assembly64 => assembly64_browser_view(a64),
+        BrowserSource::PublishedPlaylists => {
+            published_playlists_view(pub_pls, hvsc_root_known, session_mode)
+        }
     };
 
     container(column![header, rule::horizontal(1), body])
@@ -1924,6 +1947,274 @@ group:Hubbard year:1985, or category:demos commando."#,
             ..Default::default()
         })
         .into()
+}
+
+/// Published Playlists view: list of curated M3Us synced from the
+/// phosphor GitHub repo, with ▶ Load and ▾ Preview affordances.
+pub fn published_playlists_view<'a>(
+    b: &'a crate::published_playlists_browser::PublishedPlaylistsBrowser,
+    hvsc_root_known: bool,
+    session_mode: &'a crate::SessionMode,
+) -> Element<'a, Message> {
+    use crate::published_playlists_browser::PreviewState;
+    use crate::SessionMode;
+
+    // ── Header: Sync button + status line ──────────────────────────
+    let pending = b.download_pending();
+    let last_synced_label = b.last_synced_unix().map(format_relative_time);
+
+    let status_text: Element<'a, Message> = if let Some(err) = b.last_error() {
+        text(format!("⚠ Sync failed: {err}"))
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(1.0, 0.45, 0.45))
+            .into()
+    } else if b.sync_in_flight() {
+        text("Syncing manifest…")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into()
+    } else if pending > 0 {
+        let total = b.playlists().len();
+        text(format!("Updating {pending} of {total} playlists…"))
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into()
+    } else if let Some(ago) = last_synced_label {
+        text(format!("Last synced: {ago}"))
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into()
+    } else {
+        text("Click Sync to fetch published playlists from GitHub.")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into()
+    };
+
+    let header_row = row![
+        tool_button("⟳ Sync now", Message::PublishedPlaylistsSyncStart),
+        status_text,
+        Space::new().width(Length::Fill),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    // ── Active-banner ──────────────────────────────────────────────
+    let active_banner: Option<Element<'a, Message>> = match session_mode {
+        SessionMode::PublishedReadOnly { file } => {
+            let name = b
+                .meta_for(file)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| file.clone());
+            Some(
+                container(
+                    row![
+                        text(format!("📌 Playing: {name}"))
+                            .size(font::sized(12.0))
+                            .color(Color::from_rgb(0.85, 0.87, 0.9)),
+                        Space::new().width(Length::Fill),
+                        tool_button(
+                            "↺ Restore my playlist",
+                            Message::PublishedPlaylistsRestoreDefault,
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([6, 10]))
+                .style(|_t: &Theme| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.16, 0.13, 0.20))),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.35, 0.28, 0.45),
+                    },
+                    ..Default::default()
+                })
+                .into(),
+            )
+        }
+        SessionMode::Default => None,
+    };
+
+    // ── HVSC root warning ─────────────────────────────────────────
+    let hvsc_warning: Option<Element<'a, Message>> = if hvsc_root_known {
+        None
+    } else {
+        Some(
+            container(
+                text("⚠ Configure HVSC root in Settings before loading playlists — these reference HVSC paths.")
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.95, 0.80, 0.40)),
+            )
+            .padding(Padding::from([6, 10]))
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.14, 0.08))),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.40, 0.30, 0.15),
+                },
+                ..Default::default()
+            })
+            .into(),
+        )
+    };
+
+    // ── Playlist rows ─────────────────────────────────────────────
+    let mut list_col: Column<'a, Message> = column![].spacing(2);
+
+    if b.playlists().is_empty() && !b.sync_in_flight() && b.last_error().is_none() {
+        list_col = list_col.push(
+            container(
+                text("No playlists yet. Click ⟳ Sync now to fetch the latest set.")
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62)),
+            )
+            .padding(Padding::from([20, 24])),
+        );
+    }
+
+    for meta in b.playlists() {
+        let expanded = b.is_expanded(&meta.file);
+        let chev = if expanded { "▾" } else { "▸" };
+        let toggle = tool_button(
+            Box::leak(format!("{chev} {}", meta.name).into_boxed_str()),
+            Message::PublishedPlaylistsToggleExpand(meta.file.clone()),
+        );
+
+        let load_msg = Message::PublishedPlaylistsLoad(meta.file.clone());
+        let load_btn: Element<'a, Message> = if hvsc_root_known {
+            tool_button("▶ Load", load_msg)
+        } else {
+            // Disabled button: render as a dim label so users see it's intentional.
+            container(
+                text("▶ Load (set HVSC root)")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.45, 0.47, 0.55)),
+            )
+            .padding(Padding::from([4, 8]))
+            .into()
+        };
+
+        let top_row = row![toggle, Space::new().width(Length::Fill), load_btn]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+        let sub_parts = {
+            let mut parts: Vec<String> = Vec::new();
+            if !meta.description.is_empty() {
+                parts.push(meta.description.clone());
+            }
+            parts.push(format!("({} tracks)", meta.tracks));
+            parts.join(" · ")
+        };
+
+        let mut entry_col = column![
+            top_row,
+            text(sub_parts)
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        ]
+        .spacing(2);
+
+        if expanded {
+            let preview_block: Element<'a, Message> = match b.preview(&meta.file) {
+                Some(PreviewState::Loading) => text("Loading preview…")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .into(),
+                Some(PreviewState::Failed(msg)) => text(format!("Preview failed: {msg}"))
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(1.0, 0.45, 0.45))
+                    .into(),
+                Some(PreviewState::Ready(tracks)) => {
+                    let mut col: Column<'a, Message> = column![].spacing(1);
+                    for t in tracks {
+                        let dur = t
+                            .duration_secs
+                            .map(|s| format!("  [{}:{:02}]", s / 60, s % 60))
+                            .unwrap_or_default();
+                        let author = t
+                            .author
+                            .as_ref()
+                            .map(|a| format!("{a} — "))
+                            .unwrap_or_default();
+                        col = col.push(
+                            text(format!("• {author}{}{dur}", t.title))
+                                .size(font::sized(11.0))
+                                .color(Color::from_rgb(0.80, 0.82, 0.85)),
+                        );
+                    }
+                    scrollable(col).height(Length::Fixed(240.0)).into()
+                }
+                None => text("Loading preview…")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .into(),
+            };
+            entry_col = entry_col.push(
+                container(preview_block)
+                    .padding(Padding {
+                        top: 4.0,
+                        right: 0.0,
+                        bottom: 4.0,
+                        left: 18.0,
+                    })
+                    .width(Length::Fill),
+            );
+        }
+
+        list_col = list_col.push(entry_col);
+        list_col = list_col.push(rule::horizontal(1));
+    }
+
+    let mut body = column![header_row]
+        .spacing(8)
+        .padding(Padding::from([8, 8]));
+    if let Some(b) = active_banner {
+        body = body.push(b);
+    }
+    if let Some(w) = hvsc_warning {
+        body = body.push(w);
+    }
+    body = body.push(scrollable(list_col).height(Length::Fill));
+
+    let footer = container(
+        row![
+            Space::new().width(Length::Fill),
+            tool_button("✕ Close", Message::ToggleHvscBrowser),
+        ]
+        .padding(Padding::from([6, 12]))
+        .align_y(Alignment::Center),
+    );
+
+    container(column![body, rule::horizontal(1), footer])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn format_relative_time(unix_secs: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(unix_secs);
+    let delta = (now - unix_secs).max(0);
+    if delta < 60 {
+        "just now".to_string()
+    } else if delta < 3600 {
+        format!("{} min ago", delta / 60)
+    } else if delta < 86400 {
+        format!("{} h ago", delta / 3600)
+    } else {
+        format!("{} days ago", delta / 86400)
+    }
 }
 
 /// Two-column HVSC browser panel. Left: author list (alphabetical, sticky
