@@ -27,6 +27,8 @@ mod daemon_installer;
 #[cfg(feature = "usb")]
 mod sid_direct;
 
+mod assembly64;
+mod assembly64_browser;
 mod hvsc_browser;
 mod hvsc_sync;
 mod remote;
@@ -165,11 +167,17 @@ struct App {
     show_recently_played: bool,
     /// Whether the SID register info panel is visible instead of the playlist.
     show_sid_panel: bool,
-    /// Whether the HVSC browser (two-column Authors|Tunes) is visible
-    /// instead of the playlist. Mutually exclusive with the panels above.
+    /// Whether the Browse panel (HVSC + Assembly64) is visible instead
+    /// of the playlist. Mutually exclusive with the panels above.
     show_hvsc_browser: bool,
     /// Lazy walker over the synced HVSC tree (authors + per-author tunes).
     hvsc_browser: hvsc_browser::HvscBrowser,
+    /// Browser source toggle (Local HVSC vs Assembly64). Persisted.
+    browser_source: hvsc_browser::BrowserSource,
+    /// Assembly64 search state machine.
+    assembly64_browser: assembly64_browser::Assembly64Browser,
+    /// Shared HTTP client for the Assembly64 API. Cheap to clone (Arc inside).
+    assembly64_client: assembly64::Assembly64Client,
 
     /// Absolute Y scroll offset of the playlist in pixels (updated by on_scroll).
     /// Used by the virtual list to compute which rows are in the viewport.
@@ -273,6 +281,8 @@ impl App {
         // Snapshot hvsc_root for the browser model — `config` moves into
         // the struct literal below, so we can't reach it from there.
         let initial_hvsc_root = config.hvsc_root.as_deref().map(std::path::PathBuf::from);
+        let initial_browser_src = config.browser_source.clone();
+        let initial_assembly64_query = config.assembly64_last_query.clone();
         // Pre-seed the HVSC sync status from the persisted timestamp, while
         // we still own `config` by reference (we'll move it into the struct
         // literal below).
@@ -432,6 +442,15 @@ impl App {
             show_sid_panel: false,
             show_hvsc_browser: false,
             hvsc_browser: hvsc_browser::HvscBrowser::new(initial_hvsc_root),
+            browser_source: hvsc_browser::BrowserSource::from_config_str(&initial_browser_src),
+            assembly64_browser: {
+                let mut b = assembly64_browser::Assembly64Browser::new();
+                if let Some(q) = initial_assembly64_query.clone() {
+                    b.set_query(q);
+                }
+                b
+            },
+            assembly64_client: assembly64::Assembly64Client::new(),
             playlist_scroll_offset_y: 0.0,
             // Use the saved window height as a reasonable first-frame estimate;
             // the real value arrives with the first PlaylistScrolled event.
@@ -1915,6 +1934,185 @@ impl App {
                 }
             }
 
+            // ── Browse panel: source toggle ────────────────────────────────
+            Message::BrowserSourceChanged(src) => {
+                self.browser_source = src;
+                self.config.browser_source = src.as_config_str().to_string();
+                self.config.save();
+            }
+
+            // ── Assembly64 browser ─────────────────────────────────────────
+            Message::Assembly64QueryChanged(q) => {
+                self.assembly64_browser.set_query(q);
+            }
+
+            Message::Assembly64SearchSubmit => {
+                let raw = self.assembly64_browser.query().trim().to_string();
+                if raw.is_empty() {
+                    return Task::none();
+                }
+                // Persist what the user typed (not the normalised form).
+                self.config.assembly64_last_query = Some(raw.clone());
+                self.config.save();
+                let query = normalise_assembly64_query(&raw);
+                // Stash the normalised form so "Load more" sends the same query.
+                self.assembly64_browser.set_query(query.clone());
+                self.assembly64_browser.begin_search();
+                // Restore the user-facing text so the input doesn't suddenly
+                // mutate under their cursor.
+                self.assembly64_browser.set_query(raw.clone());
+                let client = self.assembly64_client.clone();
+                let page_size = self.assembly64_browser.page_size();
+                return Task::perform(
+                    async move {
+                        client
+                            .search(&query, 0, page_size)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::Assembly64SearchDone,
+                );
+            }
+
+            Message::Assembly64SearchDone(result) => match result {
+                Ok(page) => {
+                    let prefetches = self.spawn_assembly64_prefetches(&page);
+                    self.assembly64_browser.apply_results(page, true);
+                    return Task::batch(prefetches);
+                }
+                Err(e) => self.assembly64_browser.set_search_error(e),
+            },
+
+            Message::Assembly64SearchMore => {
+                let query = self.assembly64_browser.results_query().to_string();
+                if query.is_empty() {
+                    return Task::none();
+                }
+                let offset = self.assembly64_browser.offset();
+                let page_size = self.assembly64_browser.page_size();
+                self.assembly64_browser.begin_load_more();
+                let client = self.assembly64_client.clone();
+                return Task::perform(
+                    async move {
+                        client
+                            .search(&query, offset, page_size)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::Assembly64SearchMoreDone,
+                );
+            }
+
+            Message::Assembly64SearchMoreDone(result) => match result {
+                Ok(page) => {
+                    let prefetches = self.spawn_assembly64_prefetches(&page);
+                    self.assembly64_browser.apply_results(page, false);
+                    return Task::batch(prefetches);
+                }
+                Err(e) => self.assembly64_browser.set_search_error(e),
+            },
+
+            Message::Assembly64PrefetchDone(item_id, result) => match result {
+                Ok(files) => self.assembly64_browser.record_prefetch(item_id, files),
+                Err(_) => self.assembly64_browser.record_prefetch_failure(),
+            },
+
+            Message::Assembly64ToggleExpand(item_id, category_id) => {
+                if self.assembly64_browser.expansion(&item_id).is_some() {
+                    // Already expanded → collapse.
+                    self.assembly64_browser.collapse(&item_id);
+                    return Task::none();
+                }
+                // Cache hit from the post-search prefetch: skip the network round-trip.
+                if let Some(cached) = self.assembly64_browser.prefetched_files(&item_id) {
+                    let files = cached.to_vec();
+                    self.assembly64_browser.set_expanded_loaded(item_id, files);
+                    return Task::none();
+                }
+                self.assembly64_browser
+                    .set_expanded_loading(item_id.clone());
+                let client = self.assembly64_client.clone();
+                let id_for_async = item_id.clone();
+                return Task::perform(
+                    async move {
+                        let res = client
+                            .list_files(&id_for_async, category_id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        (id_for_async, res)
+                    },
+                    |(id, res)| Message::Assembly64ExpandDone(id, res),
+                );
+            }
+
+            Message::Assembly64ExpandDone(item_id, result) => match result {
+                Ok(files) => self.assembly64_browser.set_expanded_loaded(item_id, files),
+                Err(e) => self.assembly64_browser.set_expanded_failed(item_id, e),
+            },
+
+            Message::Assembly64PlayFile(item_id, category_id, file_id, file_path) => {
+                return self.start_assembly64_download(
+                    item_id,
+                    category_id,
+                    file_id,
+                    file_path,
+                    true,
+                );
+            }
+
+            Message::Assembly64AddFile(item_id, category_id, file_id, file_path) => {
+                return self.start_assembly64_download(
+                    item_id,
+                    category_id,
+                    file_id,
+                    file_path,
+                    false,
+                );
+            }
+
+            Message::Assembly64DownloadDone(result, play, song) => match result {
+                Ok(cached_path) => match playlist::PlaylistEntry::from_path(&cached_path) {
+                    Ok(entry) => {
+                        let path = entry.path.clone();
+                        let resolved_song = entry.selected_song.max(song).max(1);
+                        self.playlist.add_entries(vec![entry]);
+                        if let Some(db) = self.songlength_db.as_ref() {
+                            db.apply_to_playlist(&mut self.playlist);
+                        }
+                        self.rebuild_filter();
+                        if play {
+                            if let Some(abs_i) =
+                                self.playlist.entries.iter().position(|e| e.path == path)
+                            {
+                                self.selected = Some(abs_i);
+                            }
+                            let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                                path,
+                                song: resolved_song,
+                                force_stereo: self.config.force_stereo_2sid
+                                    || std::env::args().any(|a| a == "--stereo"),
+                                sid4_addr: 0xd420,
+                                audio_port: if self.config.u64_audio_enabled {
+                                    Some(self.config.u64_audio_port)
+                                } else {
+                                    None
+                                },
+                                restart_usb_on_load: self.config.restart_usb_on_load,
+                            });
+                            self.show_hvsc_browser = false;
+                        }
+                    }
+                    Err(e) => {
+                        self.assembly64_browser
+                            .set_search_error(format!("Cannot parse SID: {e}"));
+                    }
+                },
+                Err(e) => {
+                    self.assembly64_browser
+                        .set_search_error(format!("Download failed: {e}"));
+                }
+            },
+
             // ── Virtual scroll ────────────────────────────────────────────
             Message::PlaylistScrolled(viewport) => {
                 // Store absolute Y offset and viewport height so playlist_view()
@@ -2262,7 +2460,11 @@ impl App {
             ]
             .into()
         } else if self.show_hvsc_browser {
-            let browser = ui::hvsc_browser_view(&self.hvsc_browser);
+            let browser = ui::browser_view(
+                self.browser_source,
+                &self.hvsc_browser,
+                &self.assembly64_browser,
+            );
             column![
                 info_bar,
                 progress,
@@ -3256,6 +3458,114 @@ impl App {
         // window starts at row 0 rather than mid-list with wrong rows shown.
         self.playlist_scroll_offset_y = 0.0;
     }
+
+    /// Fire one `list_files` per search hit so we can hide releases
+    /// that contain no playable `.sid` files. Cache lives in
+    /// `assembly64_browser.file_cache`, so a later manual expand on a
+    /// verified entry is instant. Failures leave the row visible.
+    fn spawn_assembly64_prefetches(
+        &mut self,
+        page: &[crate::assembly64::AsmEntry],
+    ) -> Vec<Task<Message>> {
+        if page.is_empty() {
+            return Vec::new();
+        }
+        self.assembly64_browser
+            .note_prefetch_started(page.len() as u32);
+        page.iter()
+            .map(|entry| {
+                let client = self.assembly64_client.clone();
+                let id = entry.id.clone();
+                let cat = entry.category;
+                Task::perform(
+                    async move {
+                        let res = client.list_files(&id, cat).await.map_err(|e| e.to_string());
+                        (id, res)
+                    },
+                    |(id, res)| Message::Assembly64PrefetchDone(id, res),
+                )
+            })
+            .collect()
+    }
+
+    fn start_assembly64_download(
+        &mut self,
+        item_id: String,
+        category_id: u32,
+        file_id: u32,
+        file_path: String,
+        play: bool,
+    ) -> Task<Message> {
+        let client = self.assembly64_client.clone();
+        let cache_root = match config::config_dir() {
+            Some(d) => d.join("assembly64_cache"),
+            None => std::env::temp_dir().join("phosphor_assembly64_cache"),
+        };
+        let id_for_dir = item_id.clone();
+        let filename = sanitise_assembly64_filename(&file_path);
+
+        Task::perform(
+            async move {
+                let bytes = client
+                    .download(&id_for_dir, category_id, file_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let target_dir = cache_root.join(&id_for_dir);
+                std::fs::create_dir_all(&target_dir)
+                    .map_err(|e| format!("create cache dir: {e}"))?;
+                let target = target_dir.join(&filename);
+                std::fs::write(&target, &bytes).map_err(|e| format!("write cache file: {e}"))?;
+                Ok::<PathBuf, String>(target)
+            },
+            move |result| Message::Assembly64DownloadDone(result, play, 0),
+        )
+    }
+}
+
+/// Wrap a bare search term as `name:"…" category:music` so Assembly64
+/// returns releases that actually contain playable SID files.
+///
+/// Why two clauses: the server rejects free text (HTTP 463), and
+/// standalone `.sid` files live almost exclusively under the Music
+/// category — Games/Demos bundle their music inside D64 disk images
+/// which we can't unpack. Without the filter, searches turn up
+/// releases with zero playable files (e.g. "Commando II" the game).
+///
+/// If the user types any `:` we trust them and pass through verbatim —
+/// power-users can opt out with bare `name:"commando"`, widen with
+/// `category:demos commando`, etc. The `name:"…"` form (quoted phrase,
+/// not `*term*` glob) is the current substring-search idiom — globs
+/// were dropped in a 2026-05 API change.
+fn normalise_assembly64_query(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "category:music sort:updated order:desc".to_string();
+    }
+    if trimmed.contains(':') {
+        return trimmed.to_string();
+    }
+    let phrase = trimmed.replace('"', "");
+    format!("name:\"{phrase}\" category:music")
+}
+
+fn sanitise_assembly64_filename(path: &str) -> String {
+    // The wire path is e.g. "MUSICIANS/H/Hubbard_Rob/Commando.sid". We want
+    // just the basename, with any path-unsafe chars replaced. If the file has
+    // no .sid-family extension already, force `.sid`.
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let mut out = String::with_capacity(base.len());
+    for ch in base.chars() {
+        if ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+' | '(' | ')' | ' ') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let lower = out.to_ascii_lowercase();
+    if !(lower.ends_with(".sid") || lower.ends_with(".psid") || lower.ends_with(".rsid")) {
+        out.push_str(".sid");
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

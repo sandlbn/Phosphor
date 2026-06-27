@@ -20,6 +20,45 @@ use walkdir::WalkDir;
 use crate::playlist::{PlaylistEntry, SonglengthDb};
 use crate::stil::StilDb;
 
+/// Browser source — picks which sub-view the Browse panel renders.
+/// "Local HVSC" reads from the synced HVSC tree on disk; "Assembly64"
+/// queries the remote A64 HTTP API. Persisted to config so the toggle
+/// position survives restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserSource {
+    LocalHvsc,
+    Assembly64,
+}
+
+impl Default for BrowserSource {
+    fn default() -> Self {
+        BrowserSource::LocalHvsc
+    }
+}
+
+impl BrowserSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowserSource::LocalHvsc => "Local HVSC",
+            BrowserSource::Assembly64 => "Assembly64",
+        }
+    }
+
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            BrowserSource::LocalHvsc => "local",
+            BrowserSource::Assembly64 => "a64",
+        }
+    }
+
+    pub fn from_config_str(s: &str) -> Self {
+        match s {
+            "a64" => BrowserSource::Assembly64,
+            _ => BrowserSource::LocalHvsc,
+        }
+    }
+}
+
 /// HVSC top-level category. DOCUMENTS/ is intentionally not browsable —
 /// it's text files (Songlengths.md5, STIL.txt) not tunes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
