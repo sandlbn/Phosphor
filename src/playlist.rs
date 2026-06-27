@@ -820,6 +820,90 @@ fn parse_m3u(content: &str, base_dir: &Path) -> Vec<M3uMeta> {
     results
 }
 
+/// One row in the Published Playlists preview list. Lightweight — does
+/// NOT read any SID files from disk, so a 100-track playlist parses
+/// in microseconds. Used only to render the inline ▾ preview in the
+/// browser; loading a playlist still goes through `PlaylistEntry`.
+#[derive(Debug, Clone)]
+pub struct PreviewTrack {
+    /// `#EXTINF:duration,Author - Title` → `Title`, or the basename
+    /// of the path when no EXTINF is present.
+    pub title: String,
+    /// `#EXTINF:duration,Author - Title` → `Author`. None when EXTINF
+    /// has no " - " split.
+    pub author: Option<String>,
+    /// EXTINF duration in seconds, only when > 0.
+    pub duration_secs: Option<u32>,
+    /// `#PHOSPHOR:song=N` sub-tune override.
+    pub selected_song: Option<u16>,
+}
+
+/// Parse an M3U for the preview list. Reuses the same lexer as the
+/// full loader but emits the lighter `PreviewTrack`.
+pub fn parse_m3u_preview(content: &str) -> Vec<PreviewTrack> {
+    let mut out = Vec::new();
+    let mut pending_duration: Option<u32> = None;
+    let mut pending_song: Option<u16> = None;
+    let mut pending_title: Option<String> = None;
+    let mut pending_author: Option<String> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            if let Some((dur_str, display)) = rest.split_once(',') {
+                if let Ok(dur) = dur_str.trim().parse::<i64>() {
+                    if dur > 0 {
+                        pending_duration = Some(dur as u32);
+                    }
+                }
+                let display = display.trim();
+                if let Some((author, title)) = display.split_once(" - ") {
+                    pending_author = Some(author.to_string());
+                    pending_title = Some(title.to_string());
+                } else {
+                    pending_title = Some(display.to_string());
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("#PHOSPHOR:") {
+            for part in rest.split(',') {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("song=") {
+                    pending_song = val.parse().ok();
+                }
+            }
+            continue;
+        }
+
+        if line.starts_with('#') {
+            continue;
+        }
+
+        // Path line — finalise an entry, fall back to the basename when
+        // no EXTINF title was given.
+        let title = pending_title.take().unwrap_or_else(|| {
+            Path::new(line)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| line.to_string())
+        });
+        out.push(PreviewTrack {
+            title,
+            author: pending_author.take(),
+            duration_secs: pending_duration.take(),
+            selected_song: pending_song.take(),
+        });
+    }
+
+    out
+}
+
 /// Parse a PLS playlist file.
 /// Format:
 /// ```text
@@ -917,10 +1001,29 @@ pub fn parse_playlist_file(
     path: PathBuf,
     progress: LoadingProgress,
 ) -> Result<Vec<PlaylistEntry>, String> {
+    let base = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    parse_playlist_file_with_base(path, base, progress)
+}
+
+/// Like `parse_playlist_file`, but resolves relative paths inside the
+/// M3U/PLS against `base_dir` instead of the playlist file's parent.
+///
+/// Published playlists ship with HVSC-relative paths
+/// (e.g. `MUSICIANS/A/ATOO/Compleeto.sid`) so the same M3U works on
+/// every user's machine. We point `base_dir` at the user's configured
+/// `hvsc_root` and the entries resolve correctly.
+pub fn parse_playlist_file_with_base(
+    path: PathBuf,
+    base_dir: PathBuf,
+    progress: LoadingProgress,
+) -> Result<Vec<PlaylistEntry>, String> {
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
 
-    let playlist_dir = path.parent().unwrap_or(Path::new("."));
+    let playlist_dir = base_dir.as_path();
 
     let ext = path
         .extension()

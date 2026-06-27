@@ -31,6 +31,8 @@ mod assembly64;
 mod assembly64_browser;
 mod hvsc_browser;
 mod hvsc_sync;
+mod published_playlists;
+mod published_playlists_browser;
 mod remote;
 mod sid_emulated;
 mod sid_sidlite;
@@ -65,6 +67,21 @@ struct ContextMenu {
     /// Absolute pixel position where the menu should appear.
     x: f32,
     y: f32,
+}
+
+/// Tracks whether the in-memory playlist represents the user's own
+/// default (saved to session_playlist.m3u on exit) or a read-only
+/// published playlist (which must NEVER overwrite the user's default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMode {
+    Default,
+    PublishedReadOnly { file: String },
+}
+
+impl Default for SessionMode {
+    fn default() -> Self {
+        SessionMode::Default
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,6 +195,14 @@ struct App {
     assembly64_browser: assembly64_browser::Assembly64Browser,
     /// Shared HTTP client for the Assembly64 API. Cheap to clone (Arc inside).
     assembly64_client: assembly64::Assembly64Client,
+    /// Published Playlists (manifest + previews + active-file indicator).
+    published_playlists_browser: published_playlists_browser::PublishedPlaylistsBrowser,
+    /// Shared HTTP client for the Published Playlists CDN.
+    published_playlists_client: published_playlists::PublishedPlaylistsClient,
+    /// `Default` → session_playlist.m3u is written on exit as usual.
+    /// `PublishedReadOnly` → the user's saved default is preserved
+    /// untouched; the in-memory playlist is discarded on quit.
+    session_mode: SessionMode,
 
     /// Absolute Y scroll offset of the playlist in pixels (updated by on_scroll).
     /// Used by the virtual list to compute which rows are in the viewport.
@@ -283,6 +308,7 @@ impl App {
         let initial_hvsc_root = config.hvsc_root.as_deref().map(std::path::PathBuf::from);
         let initial_browser_src = config.browser_source.clone();
         let initial_assembly64_query = config.assembly64_last_query.clone();
+        let initial_published_last_synced = config.published_playlists_last_synced;
         // Pre-seed the HVSC sync status from the persisted timestamp, while
         // we still own `config` by reference (we'll move it into the struct
         // literal below).
@@ -451,6 +477,13 @@ impl App {
                 b
             },
             assembly64_client: assembly64::Assembly64Client::new(),
+            published_playlists_browser: {
+                let mut b = published_playlists_browser::PublishedPlaylistsBrowser::new();
+                b.restore_last_synced(initial_published_last_synced);
+                b
+            },
+            published_playlists_client: published_playlists::PublishedPlaylistsClient::new(),
+            session_mode: SessionMode::default(),
             playlist_scroll_offset_y: 0.0,
             // Use the saved window height as a reasonable first-frame estimate;
             // the real value arrives with the first PlaylistScrolled event.
@@ -558,7 +591,20 @@ impl App {
             Task::perform(async { Vec::new() }, Message::SessionLoaded)
         };
 
-        let mut tasks = vec![version_task, hvsc_task, session_task];
+        // Refresh the Published Playlists manifest quietly in the background
+        // so opening the panel shows up-to-date content immediately. Failures
+        // are silent — the user can still hit ⟳ Sync now inside the panel.
+        let published_playlists_task = Task::perform(
+            async { Message::PublishedPlaylistsSyncStart },
+            std::convert::identity,
+        );
+
+        let mut tasks = vec![
+            version_task,
+            hvsc_task,
+            session_task,
+            published_playlists_task,
+        ];
         let mut auto_status_parts: Vec<&str> = vec![];
 
         if songlength_missing {
@@ -2113,6 +2159,215 @@ impl App {
                 }
             },
 
+            // ── Published playlists ───────────────────────────────────────
+            Message::PublishedPlaylistsSyncStart => {
+                if self.published_playlists_browser.sync_in_flight() {
+                    return Task::none();
+                }
+                self.published_playlists_browser.begin_sync();
+                let client = self.published_playlists_client.clone();
+                return Task::perform(
+                    async move { client.fetch_index().await },
+                    Message::PublishedPlaylistsManifestDone,
+                );
+            }
+
+            Message::PublishedPlaylistsManifestDone(result) => match result {
+                Ok(manifest) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+
+                    let cache_dir = published_playlists_cache_dir();
+                    // Compare against the previously-cached index for delta-sync.
+                    let prev_index_path = cache_dir.join("index.json");
+                    let prev_shas: std::collections::HashMap<String, String> =
+                        std::fs::read_to_string(&prev_index_path)
+                            .ok()
+                            .and_then(|s| {
+                                serde_json::from_str::<published_playlists::Manifest>(&s).ok()
+                            })
+                            .map(|m| {
+                                m.playlists
+                                    .into_iter()
+                                    .map(|p| (p.file, p.sha256))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                    // Persist new manifest to disk for next launch's diff.
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    if let Ok(json) = serde_json::to_string_pretty(&serde_json::json!({
+                        "version": manifest.version,
+                        "playlists": manifest.playlists.iter().map(|p| serde_json::json!({
+                            "file": p.file,
+                            "name": p.name,
+                            "description": p.description,
+                            "tracks": p.tracks,
+                            "sha256": p.sha256,
+                        })).collect::<Vec<_>>(),
+                    })) {
+                        let _ = std::fs::write(&prev_index_path, json);
+                    }
+
+                    // Decide which files need downloading.
+                    let mut downloads: Vec<Task<Message>> = Vec::new();
+                    for entry in &manifest.playlists {
+                        let cached_path = cache_dir.join(&entry.file);
+                        let needs_download = !cached_path.exists()
+                            || prev_shas
+                                .get(&entry.file)
+                                .map(|s| s != &entry.sha256)
+                                .unwrap_or(true);
+                        if needs_download {
+                            let client = self.published_playlists_client.clone();
+                            let file = entry.file.clone();
+                            let dir = cache_dir.clone();
+                            let file_for_done = file.clone();
+                            downloads.push(Task::perform(
+                                async move {
+                                    let res = client.download_playlist(&file, dir).await;
+                                    (file_for_done, res)
+                                },
+                                |(f, r)| Message::PublishedPlaylistsFileDone(f, r),
+                            ));
+                        }
+                    }
+
+                    self.published_playlists_browser
+                        .note_download_started(downloads.len() as u32);
+                    self.published_playlists_browser
+                        .apply_manifest(manifest, now);
+                    self.config.published_playlists_last_synced = Some(now);
+                    self.config.save();
+
+                    if !downloads.is_empty() {
+                        return Task::batch(downloads);
+                    }
+                }
+                Err(e) => self.published_playlists_browser.set_error(e),
+            },
+
+            Message::PublishedPlaylistsFileDone(file, result) => {
+                self.published_playlists_browser.note_download_finished();
+                if let Err(e) = &result {
+                    eprintln!("[phosphor] Published playlist download failed for {file}: {e}");
+                }
+                // If the user has this row expanded and the preview was waiting,
+                // kick off the parse now that the file is on disk.
+                if matches!(
+                    self.published_playlists_browser.preview(&file),
+                    Some(crate::published_playlists_browser::PreviewState::Loading)
+                ) && result.is_ok()
+                {
+                    return self.spawn_published_preview_parse(file);
+                }
+            }
+
+            Message::PublishedPlaylistsToggleExpand(file) => {
+                if self.published_playlists_browser.is_expanded(&file) {
+                    self.published_playlists_browser.collapse(&file);
+                    return Task::none();
+                }
+                self.published_playlists_browser
+                    .set_preview_loading(file.clone());
+                let cache_dir = published_playlists_cache_dir();
+                let cached_path = cache_dir.join(&file);
+                if cached_path.exists() {
+                    return self.spawn_published_preview_parse(file);
+                }
+                // File not yet downloaded — PublishedPlaylistsFileDone will
+                // re-trigger this parse when the download completes.
+            }
+
+            Message::PublishedPlaylistsPreviewDone(file, result) => match result {
+                Ok(tracks) => self
+                    .published_playlists_browser
+                    .set_preview_ready(file, tracks),
+                Err(e) => self.published_playlists_browser.set_preview_failed(file, e),
+            },
+
+            Message::PublishedPlaylistsLoad(file) => {
+                let Some(hvsc_root) = self.config.hvsc_root.as_ref().map(PathBuf::from) else {
+                    self.published_playlists_browser
+                        .set_error("Configure HVSC root in Settings first.".into());
+                    return Task::none();
+                };
+                let cache_dir = published_playlists_cache_dir();
+                let cached_path = cache_dir.join(&file);
+                let pg = self.loading_progress.clone();
+                let file_for_async = file.clone();
+                let file_for_load = file.clone();
+
+                if cached_path.exists() {
+                    return Task::perform(
+                        async move {
+                            playlist::parse_playlist_file_with_base(cached_path, hvsc_root, pg)
+                                .map(|entries| (file_for_async, entries))
+                        },
+                        Message::PublishedPlaylistsLoadDone,
+                    );
+                }
+
+                // Not cached yet — download then parse, chained.
+                let client = self.published_playlists_client.clone();
+                let cache_dir_clone = cache_dir.clone();
+                return Task::perform(
+                    async move {
+                        let dl_path = client
+                            .download_playlist(&file_for_async, cache_dir_clone)
+                            .await?;
+                        playlist::parse_playlist_file_with_base(dl_path, hvsc_root, pg)
+                            .map(|entries| (file_for_load, entries))
+                    },
+                    Message::PublishedPlaylistsLoadDone,
+                );
+            }
+
+            Message::PublishedPlaylistsLoadDone(result) => match result {
+                Ok((file, entries)) => {
+                    let n = entries.len();
+                    eprintln!("[phosphor] Loaded published playlist '{file}' ({n} entries)");
+                    self.playlist.entries.clear();
+                    self.playlist.add_entries(entries);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(&mut self.playlist);
+                    }
+                    self.rebuild_filter();
+                    self.session_mode = SessionMode::PublishedReadOnly { file: file.clone() };
+                    self.published_playlists_browser.set_active(file);
+                    self.selected = None;
+                    self.show_hvsc_browser = false;
+                }
+                Err(e) => {
+                    self.published_playlists_browser
+                        .set_error(format!("Load failed: {e}"));
+                }
+            },
+
+            Message::PublishedPlaylistsRestoreDefault => {
+                let pg = self.loading_progress.clone();
+                return Task::perform(
+                    async move { playlist::parse_startup(Vec::new(), pg) },
+                    Message::PublishedPlaylistsRestoreDone,
+                );
+            }
+
+            Message::PublishedPlaylistsRestoreDone(entries) => {
+                let n = entries.len();
+                eprintln!("[phosphor] Restored default playlist ({n} entries)");
+                self.playlist.entries.clear();
+                self.playlist.add_entries(entries);
+                if let Some(db) = self.songlength_db.as_ref() {
+                    db.apply_to_playlist(&mut self.playlist);
+                }
+                self.rebuild_filter();
+                self.session_mode = SessionMode::Default;
+                self.published_playlists_browser.clear_active();
+                self.selected = None;
+            }
+
             // ── Virtual scroll ────────────────────────────────────────────
             Message::PlaylistScrolled(viewport) => {
                 // Store absolute Y offset and viewport height so playlist_view()
@@ -2464,6 +2719,9 @@ impl App {
                 self.browser_source,
                 &self.hvsc_browser,
                 &self.assembly64_browser,
+                &self.published_playlists_browser,
+                self.config.hvsc_root.is_some(),
+                &self.session_mode,
             );
             column![
                 info_bar,
@@ -3459,6 +3717,23 @@ impl App {
         self.playlist_scroll_offset_y = 0.0;
     }
 
+    /// Parse a cached published M3U into a `Vec<PreviewTrack>` off-thread
+    /// so a 100-track preview doesn't stall the UI.
+    fn spawn_published_preview_parse(&self, file: String) -> Task<Message> {
+        let cache_dir = published_playlists_cache_dir();
+        let cached_path = cache_dir.join(&file);
+        let file_for_async = file.clone();
+        Task::perform(
+            async move {
+                let res = std::fs::read_to_string(&cached_path)
+                    .map(|s| playlist::parse_m3u_preview(&s))
+                    .map_err(|e| format!("Read {}: {e}", cached_path.display()));
+                (file_for_async, res)
+            },
+            |(f, r)| Message::PublishedPlaylistsPreviewDone(f, r),
+        )
+    }
+
     /// Fire one `list_files` per search hit so we can hide releases
     /// that contain no playable `.sid` files. Cache lives in
     /// `assembly64_browser.file_cache`, so a later manual expand on a
@@ -3546,6 +3821,14 @@ fn normalise_assembly64_query(raw: &str) -> String {
     }
     let phrase = trimmed.replace('"', "");
     format!("name:\"{phrase}\" category:music")
+}
+
+/// Cache directory for downloaded published playlists +
+/// the last-seen manifest. Lives under the standard app-data path.
+fn published_playlists_cache_dir() -> PathBuf {
+    config::config_dir()
+        .map(|d| d.join("published_playlists"))
+        .unwrap_or_else(|| std::env::temp_dir().join("phosphor_published_playlists"))
 }
 
 fn sanitise_assembly64_filename(path: &str) -> String {
@@ -3677,8 +3960,21 @@ impl Drop for App {
         // Only save session if the background load completed.
         // Otherwise the playlist is empty and we'd delete the
         // existing session file.
-        if self.session_loaded {
-            self.playlist.save_session();
+        //
+        // Skip the save entirely when a published playlist is loaded:
+        // the user's own default lives untouched in session_playlist.m3u
+        // and we never want to clobber it with the read-only contents.
+        match &self.session_mode {
+            SessionMode::Default if self.session_loaded => {
+                self.playlist.save_session();
+            }
+            SessionMode::Default => {}
+            SessionMode::PublishedReadOnly { file } => {
+                eprintln!(
+                    "[phosphor] Published playlist '{file}' active — \
+                     skipping session save to preserve your default"
+                );
+            }
         }
         self.heard_db.save();
         let _ = self.cmd_tx.send(PlayerCmd::Stop);

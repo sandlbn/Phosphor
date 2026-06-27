@@ -1,0 +1,250 @@
+{
+  "version": 1,
+  "playlists": [
+    {
+      "file": "10_Years_HVSC.m3u",
+      "name": "10 Years HVSC",
+      "description": "",
+      "tracks": 40,
+      "sha256": "de023f312eec7ddd029946c1f8ee9a9547fb66a6efcff2c807eaceac198b919d"
+    },
+    {
+      "file": "Encore64.m3u",
+      "name": "Encore64",
+      "description": "",
+      "tracks": 13,
+      "sha256": "fb7d3ad5865fc0fdd1a3fecbbd51a77e51951c486becafa1b721b5b872f9d92f"
+    },
+    {
+      "file": "Epic_C64_SID_Collection.m3u",
+      "name": "Epic C64 SID Collection",
+      "description": "",
+      "tracks": 210,
+      "sha256": "e1d22e3e51822bad055aae5b8fe3c4452774abff2263de4aab4add9035072536"
+    },
+    {
+      "file": "HVSC_Favorite_Top_100.m3u",
+      "name": "HVSC Favorite Top 100",
+      "description": "",
+      "tracks": 100,
+      "sha256": "88e941f0e8224708a07880faecf6940d2c2bd59f1255506557a6e06a31ca2a98"
+    },
+    {
+      "file": "High_Voltage_Collection_Demo_Disk_402.m3u",
+      "name": "High Voltage Collection Demo Disk 402",
+      "description": "",
+      "tracks": 9,
+      "sha256": "5a48bfc0521a5d3a0204966bae47a3492ee043937e116224955b8328e5105e02"
+    },
+    {
+      "file": "The_C64_Grand_Tour_Challenge_2021.m3u",
+      "name": "The C64 Grand Tour Challenge 2021",
+      "description": "",
+      "tracks": 24,
+      "sha256": "993ef7f4bc078bd389fb6827aa18ec08abc859160a78b9b87cf51ad1a9399cf6"
+    },
+    {
+      "file": "Zoo_2019___wacek_mix.m3u",
+      "name": "Zoo 2019 wacek mix",
+      "description": "",
+      "tracks": 20,
+      "sha256": "05e6eee33ccbb670b26051ccecd88a1f3d59876f9a45d3cde04025a0b574f3cc"
+    },
+    {
+      "file": "Zyron___Coloured_Fields__The__1995_.m3u",
+      "name": "Zyron Coloured Fields The 1995",
+      "description": "",
+      "tracks": 8,
+      "sha256": "aab8bd061b78df78c8ffafa8589fe1c8b6d6802caae4e1753d0f42e0da5e5259"
+    },
+    {
+      "file": "Zyron___Concluded_Cuts__2000_.m3u",
+      "name": "Zyron Concluded Cuts 2000",
+      "description": "",
+      "tracks": 32,
+      "sha256": "a6e05c0ac526f7c248ed0e75558986d244e128226b4f67d246835ece2cf16fa4"
+    },
+    {
+      "file": "Zyron___Echoes_of_Rapture__1996_.m3u",
+      "name": "Zyron Echoes of Rapture 1996",
+      "description": "",
+      "tracks": 20,
+      "sha256": "7aaacb17353440c9a1a65692a219a2db3b8ea931a71b5fecd7a219e232f56f65"
+    },
+    {
+      "file": "Zyron___Forgotten_Beats__1993_.m3u",
+      "name": "Zyron Forgotten Beats 1993",
+      "description": "",
+      "tracks": 10,
+      "sha256": "87b60a08228b0fe51f839a019e6f8d7e55f896f004b79dae1bea85b38ee8ca9e"
+    },
+    {
+      "file": "Zyron___Laserdance_Collection__1991_.m3u",
+      "name": "Zyron Laserdance Collection 1991",
+      "description": "",
+      "tracks": 5,
+      "sha256": "6fa8d7a74c166d06884f1248b2bb9bbea7621c0201826b1e829a9ac630ebd55b"
+    },
+    {
+      "file": "Zyron___Music_Collection__01__1990_.m3u",
+      "name": "Zyron Music Collection 01 1990",
+      "description": "",
+      "tracks": 10,
+      "sha256": "311af1f6d4210270a4859812d3aa0a969492bfd48c18bcb6d0f3deeeeea1e633"
+    },
+    {
+      "file": "Zyron___Music_Collection__02__1991_.m3u",
+      "name": "Zyron Music Collection 02 1991",
+      "description": "",
+      "tracks": 10,
+      "sha256": "2bc4500c4147d3bb81f5e9aa2e68340b729693150b034f20293bd6aac32c3ee8"
+    },
+    {
+      "file": "Zyron___Music_Collection__03__1991_.m3u",
+      "name": "Zyron Music Collection 03 1991",
+      "description": "",
+      "tracks": 10,
+      "sha256": "04f0bb81e4ba0235e12694580d8570f21ecba7819fd32a7d2bde36abaa7bc359"
+    },
+    {
+      "file": "Zyron___Music_Collection__04__1991_.m3u",
+      "name": "Zyron Music Collection 04 1991",
+      "description": "",
+      "tracks": 10,
+      "sha256": "e19e3176fd12bc9d0765db106424d4aaa3015aa5ac5c36d2362ad808790e5552"
+    },
+    {
+      "file": "Zyron___Music_Collection__05__1991_.m3u",
+      "name": "Zyron Music Collection 05 1991",
+      "description": "",
+      "tracks": 10,
+      "sha256": "4747b0033a00029706c65b40ac570aadea36ac9b78ce6f5d1adc49c7d5dfa961"
+    },
+    {
+      "file": "Zyron___Music_Collection__06__1991_.m3u",
+      "name": "Zyron Music Collection 06 1991",
+      "description": "",
+      "tracks": 10,
+      "sha256": "828eef83b8ea09123c8898283ce0a22d8deb9815e9e01c15a73a046d1be3a041"
+    },
+    {
+      "file": "Zyron___Music_Collection__07__1991_.m3u",
+      "name": "Zyron Music Collection 07 1991",
+      "description": "",
+      "tracks": 10,
+      "sha256": "812b78283d968dcb894eba8ca2c80a02204497119d50fd14328e1822090d4883"
+    },
+    {
+      "file": "Zyron___Music_Collection__08__1992_.m3u",
+      "name": "Zyron Music Collection 08 1992",
+      "description": "",
+      "tracks": 10,
+      "sha256": "0c9e9a5ce7dea455c99248c358225a4aa05de11487b1cf11de4ab70b901fc11b"
+    },
+    {
+      "file": "Zyron___Music_Collection__09__1992_.m3u",
+      "name": "Zyron Music Collection 09 1992",
+      "description": "",
+      "tracks": 10,
+      "sha256": "1b0077e8a7c86d81a454db7896ca457162db8c102e27e44947249a5f3df64081"
+    },
+    {
+      "file": "Zyron___Music_Collection__10__1992_.m3u",
+      "name": "Zyron Music Collection 10 1992",
+      "description": "",
+      "tracks": 10,
+      "sha256": "a04424c0c3163ad0be92bde443b227c1e03ebd338df0527757bcc154ddfc0260"
+    },
+    {
+      "file": "Zyron___Music_Collection__11__1992_.m3u",
+      "name": "Zyron Music Collection 11 1992",
+      "description": "",
+      "tracks": 10,
+      "sha256": "55c6af2e575e42321106d10ace7633fb06d75325b21f540e653c95b551507212"
+    },
+    {
+      "file": "Zyron___Music_Collection__12__1992_.m3u",
+      "name": "Zyron Music Collection 12 1992",
+      "description": "",
+      "tracks": 10,
+      "sha256": "090b514b5da7c0931ab71d9ba5616f65cc24cf54d181ca6e7946667a6e40d56d"
+    },
+    {
+      "file": "Zyron___Music_Collection__13__1992_.m3u",
+      "name": "Zyron Music Collection 13 1992",
+      "description": "",
+      "tracks": 10,
+      "sha256": "71421fa64c6a9b4aa6dadec69a2445b4bd92b51dcecf51f4c5f0ae03c303c299"
+    },
+    {
+      "file": "Zyron___Music_Collection__14__1993_.m3u",
+      "name": "Zyron Music Collection 14 1993",
+      "description": "",
+      "tracks": 9,
+      "sha256": "e39a8197b727a4e33542ca20cd0d9934b81f53429bf9a898312c80b34fc9a521"
+    },
+    {
+      "file": "Zyron___Music_Collection__15__1993_.m3u",
+      "name": "Zyron Music Collection 15 1993",
+      "description": "",
+      "tracks": 10,
+      "sha256": "e48f9638748b5a3c59b0155a6a3e299faf64c59a024d5f7638bcff19e1e87f11"
+    },
+    {
+      "file": "Zyron___Music_Collection__16__1993_.m3u",
+      "name": "Zyron Music Collection 16 1993",
+      "description": "",
+      "tracks": 10,
+      "sha256": "79a52710e15ee02e9c12018ec04c27858b02d80ecf485b2f445c8387d9a12c0b"
+    },
+    {
+      "file": "Zyron___Music_Collection__17__1993_.m3u",
+      "name": "Zyron Music Collection 17 1993",
+      "description": "",
+      "tracks": 10,
+      "sha256": "6aa1af4d8a4c7bf1b32d4a75c08e0e5ea73121f9e1fda4f521c072f704f384f5"
+    },
+    {
+      "file": "Zyron___Opera_Omnia_1__1993_.m3u",
+      "name": "Zyron Opera Omnia 1 1993",
+      "description": "",
+      "tracks": 10,
+      "sha256": "4165f5b305a9187b8f08efe98d6dc904f6e447e0c29d5795397ced46ef7b6537"
+    },
+    {
+      "file": "Zyron___Opera_Omnia_2__1994_.m3u",
+      "name": "Zyron Opera Omnia 2 1994",
+      "description": "",
+      "tracks": 10,
+      "sha256": "84095a0b97b28f331f8bfed96b40071f3b21acabce6e8b170646892014cdaa5d"
+    },
+    {
+      "file": "Zyron___Opera_Omnia_3__1994_.m3u",
+      "name": "Zyron Opera Omnia 3 1994",
+      "description": "",
+      "tracks": 10,
+      "sha256": "5026cfd127ec18bbdbfa403aac3e6e31503c6ca0a5d5c41661bce7e550895149"
+    },
+    {
+      "file": "Zyron___Opera_Omnia_4__1995_.m3u",
+      "name": "Zyron Opera Omnia 4 1995",
+      "description": "",
+      "tracks": 10,
+      "sha256": "3dbf9ec88aaedc588a83555f51fbe49d0e5864c2a4810477e37298565f9d8892"
+    },
+    {
+      "file": "Zyron___Oxsid_Book__The__1997_.m3u",
+      "name": "Zyron Oxsid Book The 1997",
+      "description": "",
+      "tracks": 10,
+      "sha256": "75fe48305e3e3f0b36270d0555a7758214a8bc571cc5923b0e645df3fdad87eb"
+    },
+    {
+      "file": "Zyron___Symptom_from_Afghanistan__A__1995_.m3u",
+      "name": "Zyron Symptom from Afghanistan A 1995",
+      "description": "",
+      "tracks": 8,
+      "sha256": "22313259d1a0b59b2317d69a131ee6a1439dc85ff30d0d38307669e986ce915b"
+    }
+  ]
+}

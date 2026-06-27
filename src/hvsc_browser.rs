@@ -28,6 +28,7 @@ use crate::stil::StilDb;
 pub enum BrowserSource {
     LocalHvsc,
     Assembly64,
+    PublishedPlaylists,
 }
 
 impl Default for BrowserSource {
@@ -41,6 +42,7 @@ impl BrowserSource {
         match self {
             BrowserSource::LocalHvsc => "Local HVSC",
             BrowserSource::Assembly64 => "Assembly64",
+            BrowserSource::PublishedPlaylists => "Playlists",
         }
     }
 
@@ -48,12 +50,14 @@ impl BrowserSource {
         match self {
             BrowserSource::LocalHvsc => "local",
             BrowserSource::Assembly64 => "a64",
+            BrowserSource::PublishedPlaylists => "published",
         }
     }
 
     pub fn from_config_str(s: &str) -> Self {
         match s {
             "a64" => BrowserSource::Assembly64,
+            "published" => BrowserSource::PublishedPlaylists,
             _ => BrowserSource::LocalHvsc,
         }
     }
