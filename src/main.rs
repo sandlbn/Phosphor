@@ -27,6 +27,7 @@ mod daemon_installer;
 #[cfg(feature = "usb")]
 mod sid_direct;
 
+mod hvsc_browser;
 mod hvsc_sync;
 mod remote;
 mod sid_emulated;
@@ -164,6 +165,11 @@ struct App {
     show_recently_played: bool,
     /// Whether the SID register info panel is visible instead of the playlist.
     show_sid_panel: bool,
+    /// Whether the HVSC browser (two-column Authors|Tunes) is visible
+    /// instead of the playlist. Mutually exclusive with the panels above.
+    show_hvsc_browser: bool,
+    /// Lazy walker over the synced HVSC tree (authors + per-author tunes).
+    hvsc_browser: hvsc_browser::HvscBrowser,
 
     /// Absolute Y scroll offset of the playlist in pixels (updated by on_scroll).
     /// Used by the virtual list to compute which rows are in the viewport.
@@ -264,6 +270,9 @@ struct App {
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let config = Config::load();
+        // Snapshot hvsc_root for the browser model — `config` moves into
+        // the struct literal below, so we can't reach it from there.
+        let initial_hvsc_root = config.hvsc_root.as_deref().map(std::path::PathBuf::from);
         // Pre-seed the HVSC sync status from the persisted timestamp, while
         // we still own `config` by reference (we'll move it into the struct
         // literal below).
@@ -421,6 +430,8 @@ impl App {
             hvsc_update_available: false,
             show_recently_played: false,
             show_sid_panel: false,
+            show_hvsc_browser: false,
+            hvsc_browser: hvsc_browser::HvscBrowser::new(initial_hvsc_root),
             playlist_scroll_offset_y: 0.0,
             // Use the saved window height as a reasonable first-frame estimate;
             // the real value arrives with the first PlaylistScrolled event.
@@ -1169,6 +1180,7 @@ impl App {
                 if self.show_recently_played {
                     self.show_settings = false;
                     self.show_sid_panel = false;
+                    self.show_hvsc_browser = false;
                 }
             }
 
@@ -1213,6 +1225,7 @@ impl App {
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
                     self.show_device_config = false;
+                    self.show_hvsc_browser = false;
                 }
             }
 
@@ -1223,6 +1236,7 @@ impl App {
                     self.show_settings = false;
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
+                    self.show_hvsc_browser = false;
                     // Auto-load on open.
                     self.device_cfg_status = "Reading device…".into();
                     let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
@@ -1739,8 +1753,166 @@ impl App {
                 if self.show_sid_panel {
                     self.show_settings = false;
                     self.show_recently_played = false;
+                    self.show_hvsc_browser = false;
                 }
                 self.context_menu = None;
+            }
+
+            Message::ToggleHvscBrowser => {
+                self.show_hvsc_browser = !self.show_hvsc_browser;
+                if self.show_hvsc_browser {
+                    self.show_settings = false;
+                    self.show_recently_played = false;
+                    self.show_sid_panel = false;
+                    self.show_device_config = false;
+                    // Re-sync root in case it changed since last open.
+                    self.hvsc_browser.set_root(
+                        self.config
+                            .hvsc_root
+                            .as_deref()
+                            .map(std::path::PathBuf::from),
+                    );
+                    if let Err(e) = self.hvsc_browser.load_authors_if_needed() {
+                        eprintln!("[hvsc-browser] {e}");
+                    }
+                }
+                self.context_menu = None;
+            }
+
+            Message::HvscBrowserCategoryChanged(cat) => {
+                self.hvsc_browser.set_category(cat);
+                if let Err(e) = self.hvsc_browser.load_authors_if_needed() {
+                    eprintln!("[hvsc-browser] {e}");
+                }
+            }
+
+            Message::HvscBrowserSearchChanged(q) => {
+                let was_empty = self.hvsc_browser.search().is_empty();
+                self.hvsc_browser.set_search(q);
+                // The first time the user types into the search box, lazily
+                // build the flat-tune index for the current category so we
+                // can match by song filename across all authors / sections.
+                // Subsequent searches reuse the same index. ~50-200 ms for
+                // a typical category on SSD.
+                if was_empty && !self.hvsc_browser.search().is_empty() {
+                    let _ = self.hvsc_browser.build_flat_index_if_needed();
+                }
+            }
+
+            Message::HvscBrowserAuthorSelected(idx) => {
+                self.hvsc_browser.select_author(
+                    idx,
+                    self.stil_db.as_ref(),
+                    self.songlength_db.as_ref(),
+                );
+            }
+
+            Message::HvscBrowserAddAllFromAuthor => {
+                let entries: Vec<_> = self
+                    .hvsc_browser
+                    .tunes()
+                    .iter()
+                    .map(|t| t.entry.clone())
+                    .collect();
+                if !entries.is_empty() {
+                    self.playlist.add_entries(entries);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(&mut self.playlist);
+                    }
+                    self.rebuild_filter();
+                }
+            }
+
+            Message::HvscBrowserAddTune(idx) => {
+                if let Some(t) = self.hvsc_browser.tunes().get(idx) {
+                    self.playlist.add_entries(vec![t.entry.clone()]);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(&mut self.playlist);
+                    }
+                    self.rebuild_filter();
+                }
+            }
+
+            Message::HvscBrowserPlayTune(idx) => {
+                if let Some(t) = self.hvsc_browser.tunes().get(idx) {
+                    let entry = t.entry.clone();
+                    let path = entry.path.clone();
+                    let song = entry.selected_song.max(1);
+                    self.playlist.add_entries(vec![entry]);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(&mut self.playlist);
+                    }
+                    self.rebuild_filter();
+                    // Find the new entry in the (now-filtered) playlist + select it
+                    // so the UI's "now playing" highlight follows. Then dispatch Play.
+                    if let Some((vi, &abs_i)) =
+                        self.filtered_indices.iter().enumerate().find(|(_, &i)| {
+                            self.playlist.entries.get(i).map(|e| &e.path) == Some(&path)
+                        })
+                    {
+                        let _ = vi;
+                        self.selected = Some(abs_i);
+                    }
+                    let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                        path,
+                        song,
+                        force_stereo: self.config.force_stereo_2sid
+                            || std::env::args().any(|a| a == "--stereo"),
+                        sid4_addr: 0xd420,
+                        audio_port: if self.config.u64_audio_enabled {
+                            Some(self.config.u64_audio_port)
+                        } else {
+                            None
+                        },
+                        restart_usb_on_load: self.config.restart_usb_on_load,
+                    });
+                    self.show_hvsc_browser = false;
+                }
+            }
+
+            Message::HvscBrowserAddFlat(idx) => {
+                if let Some(entry) = self
+                    .hvsc_browser
+                    .realise_flat(idx, self.songlength_db.as_ref())
+                {
+                    self.playlist.add_entries(vec![entry]);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(&mut self.playlist);
+                    }
+                    self.rebuild_filter();
+                }
+            }
+
+            Message::HvscBrowserPlayFlat(idx) => {
+                if let Some(entry) = self
+                    .hvsc_browser
+                    .realise_flat(idx, self.songlength_db.as_ref())
+                {
+                    let path = entry.path.clone();
+                    let song = entry.selected_song.max(1);
+                    self.playlist.add_entries(vec![entry]);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(&mut self.playlist);
+                    }
+                    self.rebuild_filter();
+                    if let Some(abs_i) = self.playlist.entries.iter().position(|e| e.path == path) {
+                        self.selected = Some(abs_i);
+                    }
+                    let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                        path,
+                        song,
+                        force_stereo: self.config.force_stereo_2sid
+                            || std::env::args().any(|a| a == "--stereo"),
+                        sid4_addr: 0xd420,
+                        audio_port: if self.config.u64_audio_enabled {
+                            Some(self.config.u64_audio_port)
+                        } else {
+                            None
+                        },
+                        restart_usb_on_load: self.config.restart_usb_on_load,
+                    });
+                    self.show_hvsc_browser = false;
+                }
             }
 
             // ── Virtual scroll ────────────────────────────────────────────
@@ -2087,6 +2259,17 @@ impl App {
                 controls,
                 rule::horizontal(1),
                 sid_view
+            ]
+            .into()
+        } else if self.show_hvsc_browser {
+            let browser = ui::hvsc_browser_view(&self.hvsc_browser);
+            column![
+                info_bar,
+                progress,
+                rule::horizontal(1),
+                controls,
+                rule::horizontal(1),
+                browser
             ]
             .into()
         } else {

@@ -248,6 +248,19 @@ pub enum Message {
     /// and recently played).
     ToggleSidPanel,
 
+    // HVSC browser (two-column Authors | Tunes)
+    ToggleHvscBrowser,
+    HvscBrowserCategoryChanged(crate::hvsc_browser::HvscCategory),
+    HvscBrowserSearchChanged(String),
+    HvscBrowserAuthorSelected(usize),
+    HvscBrowserAddAllFromAuthor,
+    HvscBrowserAddTune(usize),
+    HvscBrowserPlayTune(usize),
+    /// Play a tune from the flat search index (global, no author selected).
+    HvscBrowserPlayFlat(usize),
+    /// Add a tune from the flat search index to the playlist.
+    HvscBrowserAddFlat(usize),
+
     // Version check
     VersionCheckDone(Result<Option<crate::version_check::NewVersionInfo>, String>),
     OpenUpdateUrl,
@@ -760,11 +773,12 @@ pub fn controls_bar<'a>(
         .spacing(4)
     };
 
-    // Panel-toggles sub-group (history / SID panel / device config / settings).
+    // Panel-toggles sub-group (history / SID panel / device config / settings / HVSC browser).
     let panel_toggles = if compact {
         row![
             recent_btn,
             sid_btn,
+            small_button("📚", Message::ToggleHvscBrowser),
             small_button("🔧", Message::ToggleDeviceConfig),
             small_button("⚙", Message::ToggleSettings),
         ]
@@ -773,6 +787,7 @@ pub fn controls_bar<'a>(
         row![
             recent_btn,
             sid_btn,
+            small_button("📚 HVSC", Message::ToggleHvscBrowser),
             small_button("🔧 Device", Message::ToggleDeviceConfig),
             small_button("⚙ Settings", Message::ToggleSettings),
         ]
@@ -1599,6 +1614,384 @@ fn playlist_row_content<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build the settings panel (shown instead of the playlist when ⚙ is toggled).
+/// Two-column HVSC browser panel. Left: author list (alphabetical, sticky
+/// letter headers). Right: tunes belonging to the selected author. Footer
+/// has Add-all + category segmented control + Close.
+pub fn hvsc_browser_view<'a>(
+    browser: &'a crate::hvsc_browser::HvscBrowser,
+) -> Element<'a, Message> {
+    use crate::hvsc_browser::HvscCategory;
+
+    // ── Empty state: no hvsc_root set ──────────────────────────────────────
+    if browser.is_empty_state() {
+        let body = column![
+            text("HVSC browser")
+                .size(font::sized(22.0))
+                .color(Color::from_rgb(0.85, 0.87, 0.9)),
+            text("No HVSC root configured.")
+                .size(font::sized(14.0))
+                .color(Color::from_rgb(0.75, 0.77, 0.82)),
+            text(
+                "Settings → HVSC tunes → Sync HVSC now will download the tree. \
+                 You can also point Settings → HVSC root at an existing copy."
+            )
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62)),
+            tool_button("⚙ Open Settings", Message::ToggleSettings),
+            tool_button("✕ Close", Message::ToggleHvscBrowser),
+        ]
+        .spacing(10)
+        .padding(Padding::from([24, 24]));
+        return container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+                ..Default::default()
+            })
+            .into();
+    }
+
+    // ── Left column: search + author list ──────────────────────────────────
+    let search_input = text_input("Search authors / tunes", browser.search())
+        .on_input(Message::HvscBrowserSearchChanged)
+        .size(font::sized(12.0))
+        .padding(Padding::from([6, 10]))
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _st| text_input::Style {
+            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.27, 0.30),
+            },
+            icon: Color::from_rgb(0.5, 0.5, 0.6),
+            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+            value: Color::from_rgb(0.85, 0.87, 0.9),
+            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+        });
+
+    let mut author_col: Column<'a, Message> = column![].spacing(1);
+    let mut last_letter: Option<char> = None;
+    let filtered_authors = browser.filtered_authors();
+    let total_authors = browser.authors().len();
+    for &idx in &filtered_authors {
+        let a = &browser.authors()[idx];
+        // Sticky-ish letter header (just an inline divider row).
+        if Some(a.letter) != last_letter {
+            last_letter = Some(a.letter);
+            author_col = author_col.push(
+                container(
+                    text(a.letter.to_string())
+                        .size(font::sized(11.0))
+                        .color(Color::from_rgb(0.45, 0.47, 0.55)),
+                )
+                .padding(Padding::from([4, 10])),
+            );
+        }
+        let is_selected = browser.selected_author_idx() == Some(idx);
+        let row_bg = if is_selected {
+            Color::from_rgb(0.20, 0.25, 0.35)
+        } else {
+            Color::from_rgba(0.0, 0.0, 0.0, 0.0)
+        };
+        let label = button(
+            text(&a.display_name)
+                .size(font::sized(13.0))
+                .color(Color::from_rgb(0.85, 0.87, 0.9)),
+        )
+        .on_press(Message::HvscBrowserAuthorSelected(idx))
+        .padding(Padding::from([4, 12]))
+        .width(Length::Fill)
+        .style(move |_t: &Theme, st| button::Style {
+            background: Some(iced::Background::Color(match st {
+                button::Status::Hovered => Color::from_rgb(0.16, 0.18, 0.22),
+                _ => row_bg,
+            })),
+            text_color: Color::from_rgb(0.85, 0.87, 0.9),
+            border: iced::Border::default(),
+            ..Default::default()
+        });
+        author_col = author_col.push(label);
+    }
+
+    // Label depends on category — DEMOS/GAMES list "sections" (0-9, A-F,
+    // Commodore, …), MUSICIANS lists "authors".
+    let unit_label = match browser.category() {
+        crate::hvsc_browser::HvscCategory::Musicians => "authors",
+        _ => "sections",
+    };
+    let author_count_label = if filtered_authors.len() == total_authors {
+        format!("{} {}", total_authors, unit_label)
+    } else {
+        format!(
+            "{} / {} {}",
+            filtered_authors.len(),
+            total_authors,
+            unit_label
+        )
+    };
+
+    let left_col = column![
+        search_input,
+        text(author_count_label)
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.55)),
+        scrollable(author_col).height(Length::Fill),
+    ]
+    .spacing(6)
+    .padding(Padding::from([8, 8]))
+    .width(Length::Fixed(320.0));
+
+    // When the search box has text, prefer the flat global tune search
+    // over the per-author view. This is the "search song doesn't work"
+    // path the user hit: typing a song name without first selecting an
+    // author should still surface matches.
+    let has_search = !browser.search().trim().is_empty();
+    let flat_results: Vec<usize> = if has_search {
+        browser.filtered_flat()
+    } else {
+        Vec::new()
+    };
+    let show_flat_results = has_search && !flat_results.is_empty();
+
+    // ── Right column: tune list ─────────────────────────────────────────────
+    let right_header: Element<'a, Message> = if show_flat_results {
+        let total = browser.flat_index().len();
+        let label = if browser.flat_index_loaded() {
+            format!(
+                "{} matches across all (showing up to 500 of {})",
+                flat_results.len(),
+                total
+            )
+        } else {
+            "Indexing tunes…".to_string()
+        };
+        row![
+            text("🔍 Search results")
+                .size(font::sized(15.0))
+                .color(Color::from_rgb(0.85, 0.87, 0.9)),
+            Space::new().width(Length::Fixed(8.0)),
+            text(label)
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        match browser.selected_author() {
+            Some(a) => {
+                let n = browser.tunes().len();
+                row![
+                    text(&a.display_name)
+                        .size(font::sized(15.0))
+                        .color(Color::from_rgb(0.85, 0.87, 0.9)),
+                    Space::new().width(Length::Fixed(8.0)),
+                    text(format!("— {n} tunes"))
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.55, 0.57, 0.62)),
+                ]
+                .align_y(Alignment::Center)
+                .into()
+            }
+            None => text(if has_search {
+                "No matches — try a different query."
+            } else {
+                "Select an author on the left, or type in the search box to find tunes globally."
+            })
+            .size(font::sized(13.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .into(),
+        }
+    };
+
+    // Tune rows (no virtualisation for MVP — typical author has <50 tunes).
+    let mut tune_col: Column<'a, Message> = column![].spacing(1);
+    if show_flat_results {
+        // Global search results: each row shows filename + author/section
+        // attribution, since hits can come from anywhere in the category.
+        let col_author_w = Length::FillPortion(3);
+        let col_actions_pad = Length::Fixed(72.0);
+        tune_col = tune_col.push(
+            row![
+                text("Filename")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(Length::FillPortion(5)),
+                text("Author / section")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_author_w),
+                Space::new().width(col_actions_pad),
+            ]
+            .padding(Padding::from([2, 10]))
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        for &fi in &flat_results {
+            let f = &browser.flat_index()[fi];
+            let row_widget = row![
+                text(&f.stem)
+                    .size(font::sized(13.0))
+                    .color(Color::from_rgb(0.85, 0.87, 0.9))
+                    .width(Length::FillPortion(5))
+                    .wrapping(text::Wrapping::None),
+                text(&f.author_raw)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.65, 0.67, 0.72))
+                    .width(col_author_w)
+                    .wrapping(text::Wrapping::None),
+                tool_button("▶", Message::HvscBrowserPlayFlat(fi)),
+                Space::new().width(Length::Fixed(4.0)),
+                tool_button("➕", Message::HvscBrowserAddFlat(fi)),
+            ]
+            .padding(Padding::from([2, 10]))
+            .spacing(8)
+            .align_y(Alignment::Center);
+            tune_col = tune_col.push(row_widget);
+        }
+    } else if browser.selected_author().is_some() {
+        // Column widths. Title + Released share the flexible space with
+        // FillPortion so short titles don't leave a giant gap before the
+        // metadata, and long publisher strings in `released` don't wrap
+        // to multiple lines. The right-side metric columns stay fixed so
+        // they align across rows.
+        let col_subs_w = Length::Fixed(40.0);
+        let col_len_w = Length::Fixed(60.0);
+        let col_stil_w = Length::Fixed(40.0);
+        // Column header
+        tune_col = tune_col.push(
+            row![
+                text("Title")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(Length::FillPortion(5)),
+                text("Released")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(Length::FillPortion(3)),
+                text("#")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_subs_w),
+                text("Len")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_len_w),
+                text("STIL")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_stil_w),
+                Space::new().width(Length::Fixed(72.0)),
+            ]
+            .padding(Padding::from([2, 10]))
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        let filtered_tunes = browser.filtered_tunes();
+        for &idx in &filtered_tunes {
+            let t = &browser.tunes()[idx];
+            let e = &t.entry;
+            let duration_label = match e.duration_secs {
+                Some(s) => format!("{}:{:02}", s / 60, s % 60),
+                None => "—".to_string(),
+            };
+            let stil_marker = if t.has_stil { "✓" } else { "" };
+            let row_widget = row![
+                text(&e.title)
+                    .size(font::sized(13.0))
+                    .color(Color::from_rgb(0.85, 0.87, 0.9))
+                    .width(Length::FillPortion(5))
+                    .wrapping(text::Wrapping::None),
+                text(&e.released)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.65, 0.67, 0.72))
+                    .width(Length::FillPortion(3))
+                    .wrapping(text::Wrapping::None),
+                text(e.songs.to_string())
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.65, 0.67, 0.72))
+                    .width(col_subs_w),
+                text(duration_label)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.65, 0.67, 0.72))
+                    .width(col_len_w),
+                text(stil_marker)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.4, 0.85, 0.5))
+                    .width(col_stil_w),
+                tool_button("▶", Message::HvscBrowserPlayTune(idx)),
+                Space::new().width(Length::Fixed(4.0)),
+                tool_button("➕", Message::HvscBrowserAddTune(idx)),
+            ]
+            .padding(Padding::from([2, 10]))
+            .spacing(8)
+            .align_y(Alignment::Center);
+            tune_col = tune_col.push(row_widget);
+        }
+    }
+
+    let right_col = column![right_header, scrollable(tune_col).height(Length::Fill),]
+        .spacing(8)
+        .padding(Padding::from([8, 8]))
+        .width(Length::Fill);
+
+    // ── Footer: add-all + category segmented + close ───────────────────────
+    let category_btn = |cat: HvscCategory| -> Element<'a, Message> {
+        let active = browser.category() == cat;
+        let label = if active {
+            format!("✓ {}", cat.label())
+        } else {
+            cat.label().to_string()
+        };
+        tool_button(
+            Box::leak(label.into_boxed_str()),
+            Message::HvscBrowserCategoryChanged(cat),
+        )
+    };
+
+    let add_all_label = match browser.selected_author() {
+        Some(_) => format!("⬇ Add all ({})", browser.tunes().len()),
+        None => "⬇ Add all".to_string(),
+    };
+    let add_all_btn: Element<'a, Message> = if browser.selected_author().is_some() {
+        tool_button(
+            Box::leak(add_all_label.into_boxed_str()),
+            Message::HvscBrowserAddAllFromAuthor,
+        )
+    } else {
+        // Inert placeholder: same layout, dimmed look (no on_press).
+        text("⬇ Add all")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.35, 0.36, 0.40))
+            .into()
+    };
+
+    let footer = row![
+        add_all_btn,
+        Space::new().width(Length::Fill),
+        category_btn(HvscCategory::Musicians),
+        category_btn(HvscCategory::Demos),
+        category_btn(HvscCategory::Games),
+        Space::new().width(Length::Fixed(8.0)),
+        tool_button("✕ Close", Message::ToggleHvscBrowser),
+    ]
+    .spacing(6)
+    .padding(Padding::from([6, 12]))
+    .align_y(Alignment::Center);
+
+    let body = row![left_col, rule::vertical(1), right_col];
+
+    container(column![body, rule::horizontal(1), footer])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+            ..Default::default()
+        })
+        .into()
+}
+
 pub fn settings_panel<'a>(
     config: &Config,
     default_length_text: &'a str,
