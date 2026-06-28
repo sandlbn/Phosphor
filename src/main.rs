@@ -1364,6 +1364,28 @@ impl App {
                 ));
             }
 
+            Message::DeviceConfigAction(cmd) => {
+                use player::DeviceConfigCmd as C;
+                self.device_cfg_status = match &cmd {
+                    C::Confirm => "Confirming config…".into(),
+                    C::DetectSids => "Detecting SIDs…".into(),
+                    C::DetectClones => "Detecting clones (≈2 s)…".into(),
+                    C::TestSid(0) => "Test tone: all SIDs".into(),
+                    C::TestSid(n) => format!("Test tone: SID{n}"),
+                    C::StopTests => "Stopping test tones".into(),
+                    C::ResetUsbsid => "Resetting USBSID — reconnecting…".into(),
+                    C::RestartBus => "Restarting SID bus".into(),
+                    C::RestartBusClk => "Restarting bus + clock".into(),
+                    C::SyncPios => "Sync PIOs".into(),
+                    C::SocketDetect => "Re-detecting sockets…".into(),
+                    C::MidiLoadState => "Loading MIDI state".into(),
+                    C::MidiSaveState => "Saving MIDI state".into(),
+                    C::MidiResetState => "Resetting MIDI state".into(),
+                    other => format!("Sending {other:?}…"),
+                };
+                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(cmd));
+            }
+
             Message::DeviceConfigResult(result) => match result {
                 Ok(snap) => {
                     self.device_cfg = Some(snap);

@@ -4,7 +4,7 @@
 //! column with sections matching the web Configtool's layout (firmware,
 //! sockets, clock, presets, actions).
 
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, Space};
+use iced::widget::{button, column, container, pick_list, row, scrollable, slider, text, Space};
 use iced::{Alignment, Color, Element, Length, Padding, Theme};
 
 use usbsid_pico_config::{ChipType, ClockRate, Preset, SidType};
@@ -12,7 +12,7 @@ use usbsid_pico_config::{ChipType, ClockRate, Preset, SidType};
 use super::font;
 use super::DeviceConfigSnapshot;
 use super::Message;
-use crate::player::DeviceConfigEdit;
+use crate::player::{DeviceConfigCmd, DeviceConfigEdit};
 
 /// Build the Device tab UI.
 pub fn device_panel<'a>(
@@ -65,18 +65,29 @@ pub fn device_panel<'a>(
 }
 
 fn build_loaded<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
-    column![
+    let mut col = column![
         section_about(snap),
         section_clock(snap),
         section_socket("Socket One", &snap.config.socket1, 1),
         section_socket("Socket Two", &snap.config.socket2, 2),
         section_audio(snap),
+        section_leds(snap),
         section_protocols(snap),
-        section_presets(),
-        section_actions(),
     ]
-    .spacing(16)
-    .into()
+    .spacing(16);
+
+    // FPGASID stub: shown when any socket actually has a FPGASID configured.
+    if snap.config.socket1.chip_type == ChipType::FpgaSid
+        || snap.config.socket2.chip_type == ChipType::FpgaSid
+    {
+        col = col.push(section_fpgasid_stub());
+    }
+
+    col.push(section_advanced(snap))
+        .push(section_presets())
+        .push(section_tools())
+        .push(section_actions())
+        .into()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -336,7 +347,7 @@ fn section_protocols<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message>
     // CDC/WebUSB/ASID/MIDI are firmware-managed (the Clojure tool's
     // config->commands writer doesn't emit them either), so they stay
     // read-only. FMOpl is the only writable protocol toggle.
-    column![
+    let mut col = column![
         section_title("Protocols"),
         kv_row("CDC", bool_label(p.cdc)),
         kv_row("WebUSB", bool_label(p.webusb)),
@@ -345,10 +356,300 @@ fn section_protocols<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message>
         toggle_row("FMOpl", p.fmopl_enabled, |v| {
             DeviceConfigEdit::FmoplEnabled(v)
         }),
-        kv_row("FMOpl SID", p.fmopl_sidno.to_string()),
+    ]
+    .spacing(4);
+
+    if p.fmopl_enabled {
+        col = col.push(fmopl_sid_picker(p.fmopl_sidno));
+    }
+
+    if p.midi {
+        col = col.push(midi_state_row());
+    }
+    col.into()
+}
+
+/// Segmented control for FMopl SID Number — 0=auto, 1..=4=explicit SID.
+fn fmopl_sid_picker<'a>(current: u8) -> Element<'a, Message> {
+    let mut r = row![text("FMopl SID")
+        .size(font::sized(12.0))
+        .color(Color::from_rgb(0.55, 0.57, 0.62))
+        .width(Length::Fixed(180.0))]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    for (val, label) in [
+        (0u8, "Auto"),
+        (1, "SID1"),
+        (2, "SID2"),
+        (3, "SID3"),
+        (4, "SID4"),
+    ] {
+        let active = current == val;
+        let btn = button(text(label).size(font::sized(12.0)))
+            .on_press(Message::DeviceConfigEdit(DeviceConfigEdit::FmoplSidno(val)))
+            .padding(Padding::from([3, 10]))
+            .style(move |_t: &Theme, st| {
+                if active {
+                    button::Style {
+                        background: Some(iced::Background::Color(Color::from_rgb(
+                            0.30, 0.40, 0.55,
+                        ))),
+                        text_color: Color::from_rgb(0.95, 0.97, 1.0),
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            width: 1.0,
+                            color: Color::from_rgb(0.45, 0.55, 0.70),
+                        },
+                        ..Default::default()
+                    }
+                } else {
+                    phosphor_button_style(_t, st)
+                }
+            });
+        r = r.push(btn);
+    }
+    r.into()
+}
+
+/// MIDI state save/load/reset buttons (only meaningful when MIDI enabled).
+fn midi_state_row<'a>() -> Element<'a, Message> {
+    row![
+        text("MIDI state")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .width(Length::Fixed(180.0)),
+        small_button(
+            "Load",
+            Message::DeviceConfigAction(DeviceConfigCmd::MidiLoadState)
+        ),
+        small_button(
+            "Save",
+            Message::DeviceConfigAction(DeviceConfigCmd::MidiSaveState)
+        ),
+        small_button(
+            "Reset",
+            Message::DeviceConfigAction(DeviceConfigCmd::MidiResetState)
+        ),
+        text("(persists in flash)")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.55)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn section_leds<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+    let led = &snap.config.led;
+    let rgb = &snap.config.rgb_led;
+    column![
+        section_title("LED"),
+        toggle_row("Status LED", led.enabled, |v| {
+            DeviceConfigEdit::LedEnabled(v)
+        }),
+        toggle_row("Status LED idle breathe", led.idle_breathe, |v| {
+            DeviceConfigEdit::LedIdleBreathe(v)
+        }),
+        toggle_row("RGB LED", rgb.enabled, |v| {
+            DeviceConfigEdit::RgbLedEnabled(v)
+        }),
+        toggle_row("RGB LED idle breathe", rgb.idle_breathe, |v| {
+            DeviceConfigEdit::RgbLedIdleBreathe(v)
+        }),
+        rgb_brightness_row(rgb.brightness),
+        rgb_sid_picker(rgb.sid_to_use),
     ]
     .spacing(4)
     .into()
+}
+
+fn rgb_brightness_row<'a>(current: u8) -> Element<'a, Message> {
+    // iced slider emits f32 values; round to u8 before dispatching.
+    let sl = slider(0.0..=255.0, current as f32, |v| {
+        Message::DeviceConfigEdit(DeviceConfigEdit::RgbLedBrightness(v as u8))
+    })
+    .step(1.0_f32)
+    .width(Length::Fixed(220.0));
+    row![
+        text("RGB brightness")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .width(Length::Fixed(180.0)),
+        sl,
+        text(format!("{current}"))
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.85, 0.87, 0.9)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn rgb_sid_picker<'a>(current: i8) -> Element<'a, Message> {
+    let mut r = row![text("RGB driven by")
+        .size(font::sized(12.0))
+        .color(Color::from_rgb(0.55, 0.57, 0.62))
+        .width(Length::Fixed(180.0))]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    for (val, label) in [
+        (-1_i8, "Off"),
+        (1, "SID1"),
+        (2, "SID2"),
+        (3, "SID3"),
+        (4, "SID4"),
+    ] {
+        let active = current == val;
+        let btn = button(text(label).size(font::sized(12.0)))
+            .on_press(Message::DeviceConfigEdit(DeviceConfigEdit::RgbLedSidToUse(
+                val,
+            )))
+            .padding(Padding::from([3, 10]))
+            .style(move |_t: &Theme, st| {
+                if active {
+                    button::Style {
+                        background: Some(iced::Background::Color(Color::from_rgb(
+                            0.30, 0.40, 0.55,
+                        ))),
+                        text_color: Color::from_rgb(0.95, 0.97, 1.0),
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            width: 1.0,
+                            color: Color::from_rgb(0.45, 0.55, 0.70),
+                        },
+                        ..Default::default()
+                    }
+                } else {
+                    phosphor_button_style(_t, st)
+                }
+            });
+        r = r.push(btn);
+    }
+    r.into()
+}
+
+fn section_advanced<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+    let cfg = &snap.config;
+    let mut col = column![
+        section_title("Advanced (PCB v1.5+)"),
+        toggle_row("Need confirmation", cfg.need_confirmation, |v| {
+            DeviceConfigEdit::NeedConfirmation(v)
+        }),
+        toggle_row(
+            "Disable socket change-detect",
+            cfg.disable_changedetect,
+            |v| DeviceConfigEdit::DisableChangeDetect(v),
+        ),
+    ]
+    .spacing(4);
+    if cfg.need_confirmation {
+        col = col.push(
+            row![
+                Space::new().width(Length::Fixed(180.0)),
+                small_button(
+                    "✓ Confirm config",
+                    Message::DeviceConfigAction(DeviceConfigCmd::Confirm)
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    col.into()
+}
+
+fn section_fpgasid_stub<'a>() -> Element<'a, Message> {
+    column![
+        section_title("FPGASID"),
+        text(
+            "FPGASID-specific config (revision, address-decoder, etc.) is not yet \
+              supported in Phosphor. Use the upstream USBSID-Pico-Configtool for now."
+        )
+        .size(font::sized(12.0))
+        .color(Color::from_rgb(0.85, 0.75, 0.45)),
+    ]
+    .spacing(4)
+    .into()
+}
+
+fn section_tools<'a>() -> Element<'a, Message> {
+    let detect_row = row![
+        small_button(
+            "🔎 Detect SIDs",
+            Message::DeviceConfigAction(DeviceConfigCmd::DetectSids)
+        ),
+        small_button(
+            "🧬 Detect Clones",
+            Message::DeviceConfigAction(DeviceConfigCmd::DetectClones)
+        ),
+        small_button(
+            "🔌 Socket detect",
+            Message::DeviceConfigAction(DeviceConfigCmd::SocketDetect)
+        ),
+    ]
+    .spacing(8);
+
+    let test_row = row![
+        text("Test tones")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .width(Length::Fixed(180.0)),
+        small_button(
+            "All",
+            Message::DeviceConfigAction(DeviceConfigCmd::TestSid(0))
+        ),
+        small_button(
+            "SID1",
+            Message::DeviceConfigAction(DeviceConfigCmd::TestSid(1))
+        ),
+        small_button(
+            "SID2",
+            Message::DeviceConfigAction(DeviceConfigCmd::TestSid(2))
+        ),
+        small_button(
+            "SID3",
+            Message::DeviceConfigAction(DeviceConfigCmd::TestSid(3))
+        ),
+        small_button(
+            "SID4",
+            Message::DeviceConfigAction(DeviceConfigCmd::TestSid(4))
+        ),
+        small_button(
+            "■ Stop",
+            Message::DeviceConfigAction(DeviceConfigCmd::StopTests)
+        ),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let hw_row = row![
+        text("Hardware")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62))
+            .width(Length::Fixed(180.0)),
+        small_button(
+            "⚠ Reset USBSID",
+            Message::DeviceConfigAction(DeviceConfigCmd::ResetUsbsid)
+        ),
+        small_button(
+            "Restart bus",
+            Message::DeviceConfigAction(DeviceConfigCmd::RestartBus)
+        ),
+        small_button(
+            "Restart bus + CLK",
+            Message::DeviceConfigAction(DeviceConfigCmd::RestartBusClk)
+        ),
+        small_button(
+            "Sync PIOs",
+            Message::DeviceConfigAction(DeviceConfigCmd::SyncPios)
+        ),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    column![section_title("Tools"), detect_row, test_row, hw_row]
+        .spacing(6)
+        .into()
 }
 
 fn section_presets<'a>() -> Element<'a, Message> {

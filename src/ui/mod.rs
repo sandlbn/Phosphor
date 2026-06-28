@@ -189,6 +189,10 @@ pub enum Message {
     DeviceConfigSave,
     DeviceConfigReset,
     DeviceConfigAutoDetect,
+    /// Generic dispatch for the newer diagnostic / hardware / MIDI-state
+    /// commands. Carries the full `DeviceConfigCmd` so we don't need
+    /// thirteen near-identical Message variants.
+    DeviceConfigAction(crate::player::DeviceConfigCmd),
     DeviceConfigResult(Result<DeviceConfigSnapshot, String>),
 
     // Settings

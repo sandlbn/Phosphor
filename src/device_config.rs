@@ -5,8 +5,23 @@
 
 use crate::player::{DeviceConfigCmd, DeviceConfigEdit};
 use crate::ui::DeviceConfigSnapshot;
+use usbsid_pico_config::protocol::{cfg as cfg_op, encode_packet};
 use usbsid_pico_config::transport::Transport;
 use usbsid_pico_config::Device;
+
+/// Send a single fire-and-forget config opcode (no response expected).
+/// Used for the diagnostic / hardware action commands the crate doesn't
+/// expose as named wrappers (TEST_SID, RESET_USBSID, MIDI state, etc.).
+fn send_cfg_opcode<T: Transport>(
+    dev: &mut Device<T>,
+    cmd: u8,
+    args: [u8; 4],
+) -> Result<(), String> {
+    let packet = encode_packet(cmd, args);
+    dev.transport_mut()
+        .send(&packet)
+        .map_err(|e| format!("send opcode {cmd:#04X}: {e}"))
+}
 
 /// Execute `op` against the device wrapped by `transport`. Returns
 /// `Some(snapshot)` only for `Refresh` (and as an after-effect of
@@ -73,6 +88,85 @@ pub fn run<T: Transport>(
             std::thread::sleep(std::time::Duration::from_millis(3500));
             refresh(&mut dev).map(Some)
         }
+
+        DeviceConfigCmd::Confirm => {
+            dev.confirm_config()
+                .map_err(|e| format!("confirm_config: {e}"))?;
+            refresh(&mut dev).map(Some)
+        }
+
+        DeviceConfigCmd::DetectSids => {
+            dev.detect_sids().map_err(|e| format!("detect_sids: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            refresh(&mut dev).map(Some)
+        }
+
+        DeviceConfigCmd::DetectClones => {
+            dev.detect_clones()
+                .map_err(|e| format!("detect_clones: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            refresh(&mut dev).map(Some)
+        }
+
+        DeviceConfigCmd::TestSid(which) => {
+            let cmd = match *which {
+                0 => cfg_op::TEST_ALLSIDS,
+                1 => cfg_op::TEST_SID1,
+                2 => cfg_op::TEST_SID2,
+                3 => cfg_op::TEST_SID3,
+                4 => cfg_op::TEST_SID4,
+                other => return Err(format!("TestSid: invalid SID index {other}")),
+            };
+            send_cfg_opcode(&mut dev, cmd, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::StopTests => {
+            send_cfg_opcode(&mut dev, cfg_op::STOP_TESTS, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::ResetUsbsid => {
+            send_cfg_opcode(&mut dev, cfg_op::RESET_USBSID, [0, 0, 0, 0])?;
+            // Device re-enumerates — drop the handle; the GUI will reconnect.
+            Ok(None)
+        }
+
+        DeviceConfigCmd::RestartBus => {
+            send_cfg_opcode(&mut dev, cfg_op::RESTART_BUS, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::RestartBusClk => {
+            send_cfg_opcode(&mut dev, cfg_op::RESTART_BUS_CLK, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::SyncPios => {
+            send_cfg_opcode(&mut dev, cfg_op::SYNC_PIOS, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::SocketDetect => {
+            send_cfg_opcode(&mut dev, cfg_op::SOCKET_DETECT, [0, 0, 0, 0])?;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            refresh(&mut dev).map(Some)
+        }
+
+        DeviceConfigCmd::MidiLoadState => {
+            send_cfg_opcode(&mut dev, cfg_op::LOAD_MIDI_STATE, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::MidiSaveState => {
+            send_cfg_opcode(&mut dev, cfg_op::SAVE_MIDI_STATE, [0, 0, 0, 0])?;
+            Ok(None)
+        }
+
+        DeviceConfigCmd::MidiResetState => {
+            send_cfg_opcode(&mut dev, cfg_op::RESET_MIDI_STATE, [0, 0, 0, 0])?;
+            Ok(None)
+        }
     }
 }
 
@@ -106,8 +200,17 @@ fn apply_edit(cfg: &mut usbsid_pico_config::DeviceConfig, edit: DeviceConfigEdit
         Flipped(v) => cfg.flipped = v,
         Mixed(v) => cfg.mixed = v,
         FmoplEnabled(v) => cfg.protocols.fmopl_enabled = v,
+        FmoplSidno(v) => cfg.protocols.fmopl_sidno = v,
         LockClockrate(v) => cfg.lock_clockrate = v,
         ExternalClock(v) => cfg.external_clock = v,
+        LedEnabled(v) => cfg.led.enabled = v,
+        LedIdleBreathe(v) => cfg.led.idle_breathe = v,
+        RgbLedEnabled(v) => cfg.rgb_led.enabled = v,
+        RgbLedIdleBreathe(v) => cfg.rgb_led.idle_breathe = v,
+        RgbLedBrightness(v) => cfg.rgb_led.brightness = v,
+        RgbLedSidToUse(v) => cfg.rgb_led.sid_to_use = v,
+        NeedConfirmation(v) => cfg.need_confirmation = v,
+        DisableChangeDetect(v) => cfg.disable_changedetect = v,
     }
 }
 

@@ -73,6 +73,32 @@ pub enum DeviceConfigCmd {
     Reset,
     /// Trigger the firmware's full chip + SID detection.
     AutoDetect,
+    /// PCB v1.5+: confirm pending config so sockets become active.
+    Confirm,
+    /// Probe SID positions (firmware-detected). Lightweight vs AutoDetect.
+    DetectSids,
+    /// Probe SID clone types (ARMSID / SKPico / FPGASID / etc).
+    DetectClones,
+    /// Play a test tone. 0 = all SIDs, 1..=4 = specific SID.
+    TestSid(u8),
+    /// Stop any running test tones.
+    StopTests,
+    /// Soft-reset the USBSID-Pico firmware (re-enumerates over USB).
+    ResetUsbsid,
+    /// Re-init the SID bus.
+    RestartBus,
+    /// Re-init the SID bus AND re-derive the clock.
+    RestartBusClk,
+    /// Re-sync the PIO state machines.
+    SyncPios,
+    /// Re-run the socket detect routine (PCB v1.5+ presence detection).
+    SocketDetect,
+    /// MIDI state: load the saved state from flash.
+    MidiLoadState,
+    /// MIDI state: persist the current state to flash.
+    MidiSaveState,
+    /// MIDI state: reset to factory MIDI state.
+    MidiResetState,
 }
 
 /// One discrete edit a Device-tab control can dispatch. Each variant maps
@@ -92,8 +118,21 @@ pub enum DeviceConfigEdit {
     Flipped(bool),
     Mixed(bool),
     FmoplEnabled(bool),
+    /// FMopl SID selector. 0 = auto, 1..=4 = explicit SID.
+    FmoplSidno(u8),
     LockClockrate(bool),
     ExternalClock(bool),
+    // ── LED + RGB LED ──────────────────────────────────────────────
+    LedEnabled(bool),
+    LedIdleBreathe(bool),
+    RgbLedEnabled(bool),
+    RgbLedIdleBreathe(bool),
+    RgbLedBrightness(u8),
+    /// RGB LED → SID-to-use. -1 = off, 1..=4 = SID index.
+    RgbLedSidToUse(i8),
+    // ── PCB v1.5+ flags ────────────────────────────────────────────
+    NeedConfirmation(bool),
+    DisableChangeDetect(bool),
 }
 
 /// Status updates sent from player thread → GUI.
@@ -1191,6 +1230,27 @@ fn handle_cmd(
                 let _ = device_cfg_tx.try_send(Err(e));
                 return;
             }
+            // ── Quiesce playback before talking config ────────────────────
+            // The driver's threaded writer drains the ring buffer and
+            // locks the same USB endpoint our config commands use. If
+            // SID writes interleave with our SET_CONFIG packets the
+            // firmware can re-engage a socket we just disabled, or
+            // stall responding to READ_CONFIG — the "disable doesn't
+            // work / freezes" symptom reported via email.
+            //
+            // We're already on the player thread, so processing this
+            // command means no new frames are being pushed to the ring
+            // for the duration of the config op. Flushing the ring +
+            // a brief idle lets the writer thread drain whatever's
+            // still queued before we take over the endpoint. The next
+            // playback frame after we return will refill the ring.
+            if matches!(state, PlayState::Playing) {
+                if let Some(br) = bridge.as_mut() {
+                    br.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+            }
+
             let result = match bridge.as_mut() {
                 Some(br) => br.run_device_config(&op),
                 None => Err("device not initialised".into()),
