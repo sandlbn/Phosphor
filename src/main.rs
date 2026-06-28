@@ -302,7 +302,7 @@ struct App {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
-        let config = Config::load();
+        let mut config = Config::load();
         // Snapshot hvsc_root for the browser model — `config` moves into
         // the struct literal below, so we can't reach it from there.
         let initial_hvsc_root = config.hvsc_root.as_deref().map(std::path::PathBuf::from);
@@ -353,27 +353,26 @@ impl App {
             .map(PathBuf::from)
             .collect();
 
-        let songlength_db = config
-            .last_songlength_file
-            .as_ref()
-            .map(PathBuf::from)
+        // ONLY use Phosphor's own Songlengths.md5 at <config_dir>/Songlengths.md5.
+        // No fallback to `last_songlength_file` (which kept pointing at the
+        // stale HVSC/DOCUMENTS/ copy after a sync) and no `auto_load` to
+        // legacy paths. The auto-download writes to exactly this location,
+        // so a fresh download is always picked up on next boot.
+        let songlength_db = config::songlength_db_path()
             .filter(|p| p.exists())
             .and_then(|p| {
-                eprintln!(
-                    "[phosphor] Loading remembered Songlengths at {}",
-                    p.display()
-                );
+                eprintln!("[phosphor] Loading Songlengths.md5 at {}", p.display());
                 SonglengthDb::load(&p).ok()
-            })
-            .or_else(|| {
-                config::songlength_db_path()
-                    .filter(|p| p.exists())
-                    .and_then(|p| {
-                        eprintln!("[phosphor] Found Songlengths.md5 at {}", p.display());
-                        SonglengthDb::load(&p).ok()
-                    })
-            })
-            .or_else(|| SonglengthDb::auto_load());
+            });
+
+        // Keep `last_songlength_file` in sync so Settings UI shows the same path.
+        if let Some(p) = config::songlength_db_path() {
+            let s = p.to_string_lossy().into_owned();
+            if config.last_songlength_file.as_deref() != Some(s.as_str()) {
+                config.last_songlength_file = Some(s);
+                config.save();
+            }
+        }
 
         // Load STIL database from remembered path, then from default config path.
         let stil_db = config
@@ -1048,7 +1047,10 @@ impl App {
                         match SonglengthDb::load(&path) {
                             Ok(db) => {
                                 let count = db.entries.len();
-                                db.apply_to_playlist(&mut self.playlist);
+                                db.apply_to_playlist(
+                                    &mut self.playlist,
+                                    self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                                );
                                 if self.config.default_song_length_secs > 0 {
                                     apply_default_length(
                                         &mut self.playlist,
@@ -1087,7 +1089,10 @@ impl App {
                 self.config.remember_songlength_path(&path);
                 match SonglengthDb::load(&path) {
                     Ok(db) => {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                         self.songlength_db = Some(db);
                     }
                     Err(e) => eprintln!("[phosphor] Failed to load Songlength DB: {e}"),
@@ -1489,7 +1494,10 @@ impl App {
             Message::SonglengthDownloaded(Ok(path)) => match SonglengthDb::load(&path) {
                 Ok(db) => {
                     let count = db.entries.len();
-                    db.apply_to_playlist(&mut self.playlist);
+                    db.apply_to_playlist(
+                        &mut self.playlist,
+                        self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                    );
                     if self.config.default_song_length_secs > 0 {
                         apply_default_length(
                             &mut self.playlist,
@@ -1882,7 +1890,10 @@ impl App {
                 if !entries.is_empty() {
                     self.playlist.add_entries(entries);
                     if let Some(db) = self.songlength_db.as_ref() {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                     }
                     self.rebuild_filter();
                 }
@@ -1892,7 +1903,10 @@ impl App {
                 if let Some(t) = self.hvsc_browser.tunes().get(idx) {
                     self.playlist.add_entries(vec![t.entry.clone()]);
                     if let Some(db) = self.songlength_db.as_ref() {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                     }
                     self.rebuild_filter();
                 }
@@ -1905,7 +1919,10 @@ impl App {
                     let song = entry.selected_song.max(1);
                     self.playlist.add_entries(vec![entry]);
                     if let Some(db) = self.songlength_db.as_ref() {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                     }
                     self.rebuild_filter();
                     // Find the new entry in the (now-filtered) playlist + select it
@@ -1942,7 +1959,10 @@ impl App {
                 {
                     self.playlist.add_entries(vec![entry]);
                     if let Some(db) = self.songlength_db.as_ref() {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                     }
                     self.rebuild_filter();
                 }
@@ -1957,7 +1977,10 @@ impl App {
                     let song = entry.selected_song.max(1);
                     self.playlist.add_entries(vec![entry]);
                     if let Some(db) = self.songlength_db.as_ref() {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                     }
                     self.rebuild_filter();
                     if let Some(abs_i) = self.playlist.entries.iter().position(|e| e.path == path) {
@@ -2123,7 +2146,10 @@ impl App {
                         let resolved_song = entry.selected_song.max(song).max(1);
                         self.playlist.add_entries(vec![entry]);
                         if let Some(db) = self.songlength_db.as_ref() {
-                            db.apply_to_playlist(&mut self.playlist);
+                            db.apply_to_playlist(
+                                &mut self.playlist,
+                                self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                            );
                         }
                         self.rebuild_filter();
                         if play {
@@ -2300,17 +2326,20 @@ impl App {
                 let file_for_async = file.clone();
                 let file_for_load = file.clone();
 
+                // Skeleton loader: no SID reads at parse time, so the
+                // playlist swap is instant. Background `EnrichDone` task
+                // fills in real titles + durations a moment later.
                 if cached_path.exists() {
                     return Task::perform(
                         async move {
-                            playlist::parse_playlist_file_with_base(cached_path, hvsc_root, pg)
+                            playlist::parse_playlist_skeleton_with_base(cached_path, hvsc_root, pg)
                                 .map(|entries| (file_for_async, entries))
                         },
                         Message::PublishedPlaylistsLoadDone,
                     );
                 }
 
-                // Not cached yet — download then parse, chained.
+                // Not cached yet — download then skeleton-parse, chained.
                 let client = self.published_playlists_client.clone();
                 let cache_dir_clone = cache_dir.clone();
                 return Task::perform(
@@ -2318,7 +2347,7 @@ impl App {
                         let dl_path = client
                             .download_playlist(&file_for_async, cache_dir_clone)
                             .await?;
-                        playlist::parse_playlist_file_with_base(dl_path, hvsc_root, pg)
+                        playlist::parse_playlist_skeleton_with_base(dl_path, hvsc_root, pg)
                             .map(|entries| (file_for_load, entries))
                     },
                     Message::PublishedPlaylistsLoadDone,
@@ -2326,25 +2355,73 @@ impl App {
             }
 
             Message::PublishedPlaylistsLoadDone(result) => match result {
-                Ok((file, entries)) => {
-                    let n = entries.len();
-                    eprintln!("[phosphor] Loaded published playlist '{file}' ({n} entries)");
+                Ok((file, skeletons)) => {
+                    let n = skeletons.len();
+                    eprintln!(
+                        "[phosphor] Loaded published playlist '{file}' ({n} skeletons) — enriching in background"
+                    );
                     self.playlist.entries.clear();
-                    self.playlist.add_entries(entries);
+                    self.playlist.add_entries(skeletons.clone());
                     if let Some(db) = self.songlength_db.as_ref() {
-                        db.apply_to_playlist(&mut self.playlist);
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
                     }
                     self.rebuild_filter();
                     self.session_mode = SessionMode::PublishedReadOnly { file: file.clone() };
-                    self.published_playlists_browser.set_active(file);
+                    self.published_playlists_browser.set_active(file.clone());
                     self.selected = None;
                     self.show_hvsc_browser = false;
+
+                    // Background enrichment — runs on a blocking task so
+                    // the ~100 disk reads don't block the async runtime.
+                    let file_for_enrich = file.clone();
+                    return Task::perform(
+                        async move {
+                            let enriched = tokio::task::spawn_blocking(move || {
+                                playlist::enrich_skeleton_entries(skeletons)
+                            })
+                            .await
+                            .unwrap_or_default();
+                            (file_for_enrich, enriched)
+                        },
+                        |(f, e)| Message::PublishedPlaylistsEnrichDone(f, e),
+                    );
                 }
                 Err(e) => {
                     self.published_playlists_browser
                         .set_error(format!("Load failed: {e}"));
                 }
             },
+
+            Message::PublishedPlaylistsEnrichDone(source_file, enriched) => {
+                // Drop the result if the user has since switched playlists or
+                // restored their default — applying it would clobber state.
+                let still_active = matches!(
+                    &self.session_mode,
+                    SessionMode::PublishedReadOnly { file } if file == &source_file
+                );
+                if !still_active {
+                    eprintln!(
+                        "[phosphor] Enrichment for '{source_file}' discarded — session changed"
+                    );
+                    return Task::none();
+                }
+                eprintln!(
+                    "[phosphor] Enriched published playlist '{source_file}' ({} entries)",
+                    enriched.len()
+                );
+                self.playlist.entries.clear();
+                self.playlist.add_entries(enriched);
+                if let Some(db) = self.songlength_db.as_ref() {
+                    db.apply_to_playlist(
+                        &mut self.playlist,
+                        self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                    );
+                }
+                self.rebuild_filter();
+            }
 
             Message::PublishedPlaylistsRestoreDefault => {
                 let pg = self.loading_progress.clone();
@@ -2360,7 +2437,10 @@ impl App {
                 self.playlist.entries.clear();
                 self.playlist.add_entries(entries);
                 if let Some(db) = self.songlength_db.as_ref() {
-                    db.apply_to_playlist(&mut self.playlist);
+                    db.apply_to_playlist(
+                        &mut self.playlist,
+                        self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                    );
                 }
                 self.rebuild_filter();
                 self.session_mode = SessionMode::Default;
@@ -2721,6 +2801,9 @@ impl App {
                 &self.assembly64_browser,
                 &self.published_playlists_browser,
                 self.config.hvsc_root.is_some(),
+                self.hvsc_update_available,
+                self.hvsc_sync.is_some(),
+                &self.hvsc_sync_status,
                 &self.session_mode,
             );
             column![
@@ -3109,7 +3192,10 @@ impl App {
             self.config.remember_songlength_path(&sl_candidate);
             if let Ok(db) = SonglengthDb::load(&sl_candidate) {
                 let count = db.entries.len();
-                db.apply_to_playlist(&mut self.playlist);
+                db.apply_to_playlist(
+                    &mut self.playlist,
+                    self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                );
                 self.songlength_db = Some(db);
                 self.download_status =
                     format!("Loaded {} entries from {}", count, sl_candidate.display());
@@ -3691,7 +3777,10 @@ impl App {
 
     fn apply_songlengths(&mut self) {
         if let Some(ref db) = self.songlength_db {
-            db.apply_to_playlist(&mut self.playlist);
+            db.apply_to_playlist(
+                &mut self.playlist,
+                self.config.hvsc_root.as_deref().map(std::path::Path::new),
+            );
         }
         if self.config.default_song_length_secs > 0 {
             apply_default_length(&mut self.playlist, self.config.default_song_length_secs);
