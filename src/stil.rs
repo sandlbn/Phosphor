@@ -559,9 +559,10 @@ pub async fn check_hvsc_update(hvsc_base: &str) -> Result<HvscUpdateInfo, String
         .and_then(|u| u.join("STIL.txt"))
         .map_err(|e| format!("URL join failed: {e}"))?;
 
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent("phosphor-hvsc-sync/0.4")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10));
+    let client = crate::config::apply_proxy(builder)
         .build()
         .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
     let resp = client

@@ -204,6 +204,12 @@ pub enum Message {
     SetMacosUsbMode(String),
     DefaultSongLengthChanged(String),
     BaseFontSizeChanged(String),
+    /// Live draft of the proxy URL text input.
+    ProxyUrlChanged(String),
+    /// Persist the draft proxy URL to `config.proxy_url` and reload HTTP clients.
+    ProxyApply,
+    /// Clear `config.proxy_url` so all clients drop their proxy on next request.
+    ProxyClear,
     VolumeChanged(f32),
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
@@ -2799,6 +2805,9 @@ pub fn settings_panel<'a>(
     http_remote_running: bool,
     http_port_text: &'a str,
     base_font_size_text: &'a str,
+    // Draft HTTP proxy URL — empty string = "no proxy". Applied to all
+    // outbound requests once the user clicks Apply.
+    proxy_url_text: &'a str,
     // `hvsc_sync_active` true while a HVSC rsync sync is running (swaps
     // Sync/Cancel button + reveals progress bar).
     hvsc_sync_active: bool,
@@ -3014,6 +3023,59 @@ pub fn settings_panel<'a>(
     } else {
         "Disabled (0) — unknown songs won't auto-advance".to_string()
     };
+
+    // ── HTTP proxy ─────────────────────────────────────────────
+    let proxy_active = !config.proxy_url.as_deref().unwrap_or("").trim().is_empty();
+    let proxy_status_text = if proxy_active {
+        format!("Active: {}", config.proxy_url.as_deref().unwrap_or(""))
+    } else {
+        "No proxy configured — direct connection.".to_string()
+    };
+    let proxy_status_color = if proxy_active {
+        Color::from_rgb(0.55, 0.85, 0.55)
+    } else {
+        Color::from_rgb(0.45, 0.47, 0.52)
+    };
+    let proxy_section = column![
+        text("HTTP proxy:")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        row![
+            text_input("http://proxy.corp:8080", proxy_url_text)
+                .on_input(Message::ProxyUrlChanged)
+                .on_submit(Message::ProxyApply)
+                .size(font::sized(14.0))
+                .padding(Padding::from([6, 10]))
+                .width(Length::Fixed(360.0))
+                .style(|_theme: &Theme, _st| text_input::Style {
+                    background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.25, 0.27, 0.30)
+                    },
+                    icon: Color::from_rgb(0.5, 0.5, 0.6),
+                    placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+                    value: Color::from_rgb(0.85, 0.87, 0.9),
+                    selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+                }),
+            tool_button("Apply", Message::ProxyApply),
+            tool_button("Clear", Message::ProxyClear),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        text(proxy_status_text)
+            .size(font::sized(11.0))
+            .color(proxy_status_color),
+        text(
+            "Accepts http://, https://, socks5://. Basic auth via \
+             http://user:pass@host:port. Applies to all outbound requests \
+             (HVSC sync, Songlengths/STIL, Assembly64, Published Playlists)."
+        )
+        .size(font::sized(11.0))
+        .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
 
     // ── Base font size ─────────────────────────────────────────
     let font_size_section = column![
@@ -3298,6 +3360,8 @@ pub fn settings_panel<'a>(
         length_section,
         rule::horizontal(1),
         font_size_section,
+        rule::horizontal(1),
+        proxy_section,
         rule::horizontal(1),
         dl_section,
         rule::horizontal(1),

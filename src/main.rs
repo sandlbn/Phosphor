@@ -175,6 +175,10 @@ struct App {
     /// keystrokes (e.g. just `"1"` while typing `"14"`) so the field stays
     /// editable; only successful parses commit to config.
     base_font_size_text: String,
+    /// Live-edited HTTP proxy URL — only persisted to config.proxy_url
+    /// when the user clicks Apply (avoids touching live HTTP clients
+    /// on every keystroke).
+    proxy_url_text: String,
     /// Status message shown below the Songlength download button.
     download_status: String,
     /// Combined status for auto-downloads shown in the search bar.
@@ -434,6 +438,7 @@ impl App {
             String::new()
         };
         let base_font_size_text = format!("{}", config.base_font_size);
+        let proxy_url_text = config.proxy_url.clone().unwrap_or_default();
 
         let favorites = FavoritesDb::load();
         let recently_played = RecentlyPlayed::load();
@@ -483,6 +488,7 @@ impl App {
             device_cfg_rx,
             default_length_text,
             base_font_size_text,
+            proxy_url_text,
             download_status: String::new(),
             auto_download_status: String::new(),
             pending_auto_downloads: 0,
@@ -1499,6 +1505,40 @@ impl App {
                         crate::ui::font::set_base(clamped);
                         self.config.save();
                     }
+                }
+            }
+
+            // ── HTTP proxy ─────────────────────────────────────────────
+            Message::ProxyUrlChanged(val) => {
+                // Live-update the draft only; don't touch config or HTTP
+                // clients until the user clicks Apply.
+                self.proxy_url_text = val;
+            }
+
+            Message::ProxyApply => {
+                let trimmed = self.proxy_url_text.trim().to_string();
+                let new_val = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                if new_val != self.config.proxy_url {
+                    self.config.proxy_url = new_val;
+                    self.config.save();
+                    eprintln!(
+                        "[phosphor] Proxy applied: {:?}. Next outbound request \
+                         will use the new setting.",
+                        self.config.proxy_url
+                    );
+                }
+            }
+
+            Message::ProxyClear => {
+                self.proxy_url_text.clear();
+                if self.config.proxy_url.is_some() {
+                    self.config.proxy_url = None;
+                    self.config.save();
+                    eprintln!("[phosphor] Proxy cleared.");
                 }
             }
 
@@ -2809,6 +2849,7 @@ impl App {
                 self.http_remote_running,
                 &self.http_port_text,
                 &self.base_font_size_text,
+                &self.proxy_url_text,
                 self.hvsc_sync.is_some(),
                 &self.hvsc_sync_status,
                 self.hvsc_sync_progress,

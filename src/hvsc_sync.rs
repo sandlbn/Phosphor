@@ -139,12 +139,16 @@ async fn run_sync(
     tx: &Sender<HvscSyncEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let engine = DownloadEngine::new(EngineConfig {
+    // Inherit any user-configured proxy so HVSC sync works behind a
+    // corporate firewall. None / empty → gosh-dl's default behaviour.
+    let mut engine_config = EngineConfig {
         download_dir: dest.clone(),
         ..EngineConfig::default()
-    })
-    .await
-    .map_err(|e| format!("Cannot start download engine: {e}"))?;
+    };
+    engine_config.http.proxy_url = crate::config::current_proxy_url();
+    let engine = DownloadEngine::new(engine_config)
+        .await
+        .map_err(|e| format!("Cannot start download engine: {e}"))?;
     let mut events = engine.subscribe();
 
     let options = DownloadOptions {
@@ -626,9 +630,10 @@ fn skip_if_present(dest: &Path, local_rel: &Path, size_hint: Option<u64>) -> boo
 
 /// Fetch an HTML page via reqwest. Used once per sync for the root index.
 async fn fetch_html(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent("phosphor-hvsc-sync/0.4")
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30));
+    let client = crate::config::apply_proxy(builder)
         .build()
         .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
     let resp = client
@@ -725,9 +730,10 @@ pub async fn fetch_hvsc_document(
         .and_then(|u| u.join(relative))
         .map_err(|e| format!("URL join failed: {e}"))?;
 
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent("phosphor-hvsc-sync/0.4")
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(180));
+    let client = crate::config::apply_proxy(builder)
         .build()
         .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
     let resp = client
