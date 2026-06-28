@@ -295,6 +295,11 @@ pub enum Message {
     /// User clicked ▶ Load on a published playlist row.
     PublishedPlaylistsLoad(String),
     PublishedPlaylistsLoadDone(Result<(String, Vec<crate::playlist::PlaylistEntry>), String>),
+    /// Background SID-header read + md5 + songlength enrichment for a
+    /// just-loaded published playlist. Carries (source_file, enriched).
+    /// We compare source_file against current session_mode before
+    /// applying — if the user switched playlists mid-flight, drop it.
+    PublishedPlaylistsEnrichDone(String, Vec<crate::playlist::PlaylistEntry>),
     /// User clicked "↺ Restore my playlist" while a published playlist is active.
     PublishedPlaylistsRestoreDefault,
     PublishedPlaylistsRestoreDone(Vec<crate::playlist::PlaylistEntry>),
@@ -668,6 +673,33 @@ pub fn controls_bar<'a>(
             .into()
     };
 
+    // Accent variant for the Library entry-point: deep teal background +
+    // brighter border so the "browse content" affordance stands out from
+    // the surrounding utility toggles (recent/sid/device/settings).
+    let accent_button = |label: &'a str, msg: Message| -> Element<'a, Message> {
+        button(text(label).size(font::sized(btn_size)))
+            .on_press(msg)
+            .padding(Padding::from([btn_pad, if compact { 8 } else { 12 }]))
+            .style(|_theme: &Theme, st| {
+                let bg = match st {
+                    button::Status::Hovered => Color::from_rgb(0.22, 0.32, 0.42),
+                    button::Status::Pressed => Color::from_rgb(0.12, 0.18, 0.24),
+                    _ => Color::from_rgb(0.16, 0.22, 0.32),
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: Color::from_rgb(0.92, 0.96, 1.0),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.40, 0.55, 0.70),
+                    },
+                    ..Default::default()
+                }
+            })
+            .into()
+    };
+
     let sep = || -> Element<'a, Message> {
         // Vertical-rule separator. Sized to match the buttons so groups
         // visually align. Slightly muted colour so it reads as a divider
@@ -811,12 +843,19 @@ pub fn controls_bar<'a>(
         .spacing(4)
     };
 
-    // Panel-toggles sub-group (history / SID panel / device config / settings / library browser).
+    // Library entry-point in its own group so the accented styling reads
+    // as a content-discovery affordance separate from the system toggles.
+    let library_group: Element<'a, Message> = if compact {
+        accent_button("📚", Message::ToggleHvscBrowser)
+    } else {
+        accent_button("📚 Library", Message::ToggleHvscBrowser)
+    };
+
+    // Panel-toggles sub-group (history / SID panel / device config / settings).
     let panel_toggles = if compact {
         row![
             recent_btn,
             sid_btn,
-            small_button("📚", Message::ToggleHvscBrowser),
             small_button("🔧", Message::ToggleDeviceConfig),
             small_button("⚙", Message::ToggleSettings),
         ]
@@ -825,7 +864,6 @@ pub fn controls_bar<'a>(
         row![
             recent_btn,
             sid_btn,
-            small_button("📚 Library", Message::ToggleHvscBrowser),
             small_button("🔧 Device", Message::ToggleDeviceConfig),
             small_button("⚙ Settings", Message::ToggleSettings),
         ]
@@ -865,6 +903,8 @@ pub fn controls_bar<'a>(
 
     let mut bottom_row = row![
         file_ops,
+        sep(),
+        library_group,
         sep(),
         panel_toggles,
         Space::new().width(Length::Fill)
@@ -1660,6 +1700,9 @@ pub fn browser_view<'a>(
     a64: &'a crate::assembly64_browser::Assembly64Browser,
     pub_pls: &'a crate::published_playlists_browser::PublishedPlaylistsBrowser,
     hvsc_root_known: bool,
+    hvsc_update_available: bool,
+    hvsc_sync_in_progress: bool,
+    hvsc_sync_status: &'a str,
     session_mode: &'a crate::SessionMode,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::BrowserSource;
@@ -1697,7 +1740,12 @@ pub fn browser_view<'a>(
     });
 
     let body: Element<'a, Message> = match source {
-        BrowserSource::LocalHvsc => hvsc_browser_view(hvsc),
+        BrowserSource::LocalHvsc => hvsc_browser_view(
+            hvsc,
+            hvsc_update_available,
+            hvsc_sync_in_progress,
+            hvsc_sync_status,
+        ),
         BrowserSource::Assembly64 => assembly64_browser_view(a64),
         BrowserSource::PublishedPlaylists => {
             published_playlists_view(pub_pls, hvsc_root_known, session_mode)
@@ -2116,7 +2164,8 @@ pub fn published_playlists_view<'a>(
                 .size(font::sized(11.0))
                 .color(Color::from_rgb(0.55, 0.57, 0.62)),
         ]
-        .spacing(2);
+        .spacing(2)
+        .width(Length::Fill);
 
         if expanded {
             let preview_block: Element<'a, Message> = match b.preview(&meta.file) {
@@ -2129,7 +2178,7 @@ pub fn published_playlists_view<'a>(
                     .color(Color::from_rgb(1.0, 0.45, 0.45))
                     .into(),
                 Some(PreviewState::Ready(tracks)) => {
-                    let mut col: Column<'a, Message> = column![].spacing(1);
+                    let mut col: Column<'a, Message> = column![].spacing(0);
                     for t in tracks {
                         let dur = t
                             .duration_secs
@@ -2138,15 +2187,23 @@ pub fn published_playlists_view<'a>(
                         let author = t
                             .author
                             .as_ref()
-                            .map(|a| format!("{a} — "))
+                            .map(|a| format!("{} — ", a.replace('_', " ")))
                             .unwrap_or_default();
+                        let title = t.title.replace('_', " ");
                         col = col.push(
-                            text(format!("• {author}{}{dur}", t.title))
+                            text(format!("• {author}{title}{dur}"))
                                 .size(font::sized(11.0))
-                                .color(Color::from_rgb(0.80, 0.82, 0.85)),
+                                .line_height(iced::widget::text::LineHeight::Absolute(
+                                    iced::Pixels(14.0),
+                                ))
+                                .color(Color::from_rgb(0.80, 0.82, 0.85))
+                                .width(Length::Fill),
                         );
                     }
-                    scrollable(col).height(Length::Fixed(240.0)).into()
+                    scrollable(col.width(Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fixed(240.0))
+                        .into()
                 }
                 None => text("Loading preview…")
                     .size(font::sized(11.0))
@@ -2165,7 +2222,14 @@ pub fn published_playlists_view<'a>(
             );
         }
 
-        list_col = list_col.push(entry_col);
+        // Right padding leaves clearance for the scrollable's vertical
+        // scrollbar — otherwise the ▶ Load button gets clipped behind it.
+        list_col = list_col.push(container(entry_col).width(Length::Fill).padding(Padding {
+            top: 0.0,
+            right: 16.0,
+            bottom: 0.0,
+            left: 0.0,
+        }));
         list_col = list_col.push(rule::horizontal(1));
     }
 
@@ -2222,8 +2286,29 @@ fn format_relative_time(unix_secs: i64) -> String {
 /// has Add-all + category segmented control + Close.
 pub fn hvsc_browser_view<'a>(
     browser: &'a crate::hvsc_browser::HvscBrowser,
+    update_available: bool,
+    sync_in_progress: bool,
+    sync_status: &'a str,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::HvscCategory;
+
+    // Sync row: button (or progress) + status text. Reused in the empty
+    // state and as a top banner when an update is available.
+    let sync_button: Element<'a, Message> = if sync_in_progress {
+        container(
+            text(if sync_status.is_empty() {
+                "Syncing…".to_string()
+            } else {
+                format!("Syncing… {sync_status}")
+            })
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.85, 0.87, 0.9)),
+        )
+        .padding(Padding::from([4, 8]))
+        .into()
+    } else {
+        tool_button("⬇ Sync HVSC now", Message::HvscRsyncStart)
+    };
 
     // ── Empty state: no hvsc_root set ──────────────────────────────────────
     if browser.is_empty_state() {
@@ -2231,17 +2316,21 @@ pub fn hvsc_browser_view<'a>(
             text("HVSC browser")
                 .size(font::sized(22.0))
                 .color(Color::from_rgb(0.85, 0.87, 0.9)),
-            text("No HVSC root configured.")
+            text("No HVSC tree found.")
                 .size(font::sized(14.0))
                 .color(Color::from_rgb(0.75, 0.77, 0.82)),
             text(
-                "Settings → HVSC tunes → Sync HVSC now will download the tree. \
-                 You can also point Settings → HVSC root at an existing copy."
+                "Sync the High Voltage SID Collection to start browsing. \
+                 Or point Settings → HVSC root at an existing copy."
             )
             .size(font::sized(12.0))
             .color(Color::from_rgb(0.55, 0.57, 0.62)),
-            tool_button("⚙ Open Settings", Message::ToggleSettings),
-            tool_button("✕ Close", Message::ToggleHvscBrowser),
+            row![
+                sync_button,
+                tool_button("⚙ Open Settings", Message::ToggleSettings),
+                tool_button("✕ Close", Message::ToggleHvscBrowser),
+            ]
+            .spacing(8),
         ]
         .spacing(10)
         .padding(Padding::from([24, 24]));
@@ -2254,6 +2343,45 @@ pub fn hvsc_browser_view<'a>(
             })
             .into();
     }
+
+    // ── Update-available banner (only when sync is NOT already running) ────
+    let update_banner: Option<Element<'a, Message>> = if update_available || sync_in_progress {
+        let label: Element<'a, Message> = if sync_in_progress {
+            text(if sync_status.is_empty() {
+                "Syncing HVSC…".to_string()
+            } else {
+                format!("Syncing HVSC… {sync_status}")
+            })
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.85, 0.87, 0.9))
+            .into()
+        } else {
+            text("🆕 New HVSC release available")
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.85, 0.87, 0.9))
+                .into()
+        };
+        Some(
+            container(
+                row![label, Space::new().width(Length::Fill), sync_button]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([6, 10]))
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.13, 0.16, 0.20))),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.35, 0.45),
+                },
+                ..Default::default()
+            })
+            .into(),
+        )
+    } else {
+        None
+    };
 
     // ── Left column: search + author list ──────────────────────────────────
     let search_input = text_input("Search authors / tunes", browser.search())
@@ -2585,7 +2713,13 @@ pub fn hvsc_browser_view<'a>(
 
     let body = row![left_col, rule::vertical(1), right_col];
 
-    container(column![body, rule::horizontal(1), footer])
+    let mut outer: Column<'a, Message> = column![];
+    if let Some(banner) = update_banner {
+        outer = outer.push(banner).push(rule::horizontal(1));
+    }
+    outer = outer.push(body).push(rule::horizontal(1)).push(footer);
+
+    container(outer)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_t: &Theme| container::Style {

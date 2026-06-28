@@ -556,15 +556,25 @@ impl Playlist {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Parsed Songlength.md5 database: MD5 → Vec<duration_seconds> (one per sub-tune).
+///
+/// `by_path` is a secondary index keyed by lowercase HVSC-relative path
+/// (e.g. `musicians/b/baldwin_neil/shadow_skimmer.sid`). Each entry in
+/// the upstream file is preceded by a `; /MUSICIANS/...` comment naming
+/// the SID that md5 belongs to — we capture that and use it as a fallback
+/// lookup when the user's local SID bytes differ from what the DB was
+/// built against (common when HVSC tree and Songlengths.md5 come from
+/// slightly different mirrors or release dates).
 #[derive(Debug, Clone)]
 pub struct SonglengthDb {
     pub entries: HashMap<String, Vec<u32>>,
+    pub by_path: HashMap<String, Vec<u32>>,
 }
 
 impl SonglengthDb {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            by_path: HashMap::new(),
         }
     }
 
@@ -613,16 +623,32 @@ impl SonglengthDb {
             .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
 
         let mut db = Self::new();
+        // Track the most recent `; /path` comment so we can index the
+        // following md5 entry by HVSC-relative path as well.
+        let mut pending_path: Option<String> = None;
 
         for line in content.lines() {
             let line = line.trim();
-            // Skip empty lines, comments, and section headers
-            // (matches the ultimate64-manager parser exactly)
-            if line.is_empty()
-                || line.starts_with(';')
-                || line.starts_with('#')
-                || line.starts_with('[')
-            {
+            if line.is_empty() {
+                continue;
+            }
+
+            // `;` lines are path headers — `; /MUSICIANS/B/Foo/Bar.sid`.
+            // Capture and normalise to lowercase, no leading slash.
+            if let Some(rest) = line.strip_prefix(';') {
+                let p = rest.trim().trim_start_matches('/').to_ascii_lowercase();
+                if p.ends_with(".sid") || p.ends_with(".mus") {
+                    pending_path = Some(p);
+                } else {
+                    pending_path = None;
+                }
+                continue;
+            }
+
+            // Other comments / section headers — just clear any pending path
+            // so a stray `[Database]` between comment and md5 doesn't alias.
+            if line.starts_with('#') || line.starts_with('[') {
+                pending_path = None;
                 continue;
             }
 
@@ -631,8 +657,8 @@ impl SonglengthDb {
                 let md5_str = &line[..eq_pos];
                 let times_str = &line[eq_pos + 1..];
 
-                // MD5 must be exactly 32 hex chars
                 if md5_str.len() != 32 {
+                    pending_path = None;
                     continue;
                 }
 
@@ -644,7 +670,12 @@ impl SonglengthDb {
                     .collect();
 
                 if !durations.is_empty() {
+                    if let Some(p) = pending_path.take() {
+                        db.by_path.insert(p, durations.clone());
+                    }
                     db.entries.insert(md5, durations);
+                } else {
+                    pending_path = None;
                 }
             }
         }
@@ -665,11 +696,46 @@ impl SonglengthDb {
         self.entries.get(&md5.to_lowercase())
     }
 
+    /// Look up by HVSC-relative path (e.g. `MUSICIANS/B/Foo.sid`).
+    /// Used as a fallback when md5 lookup misses — happens when the
+    /// local SID bytes differ slightly from what the DB was built
+    /// against (older HVSC sync vs newer Songlengths.md5).
+    pub fn lookup_by_path(&self, rel_path: &str, subtune: usize) -> Option<u32> {
+        let key = rel_path
+            .trim_start_matches('/')
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        self.by_path.get(&key).and_then(|v| v.get(subtune).copied())
+    }
+
+    /// md5 lookup first, then fall back to path-based lookup if md5 misses
+    /// and the entry's absolute path lives under `hvsc_root`.
+    pub fn lookup_with_path_fallback(
+        &self,
+        md5: Option<&str>,
+        abs_path: &Path,
+        hvsc_root: Option<&Path>,
+        subtune: usize,
+    ) -> Option<u32> {
+        if let Some(m) = md5 {
+            if let Some(d) = self.lookup(m, subtune) {
+                return Some(d);
+            }
+        }
+        let root = hvsc_root?;
+        let rel = abs_path.strip_prefix(root).ok()?;
+        let rel_str = rel.to_string_lossy();
+        self.lookup_by_path(&rel_str, subtune)
+    }
+
     /// Apply durations to all playlist entries that have MD5s.
     /// Entries that already have a duration (e.g. restored from an M3U file)
-    /// are left untouched.
-    pub fn apply_to_playlist(&self, playlist: &mut Playlist) {
+    /// are left untouched. `hvsc_root` enables the HVSC-relative-path
+    /// fallback for the common case where the local SID bytes differ from
+    /// what the DB was built against; pass `None` to disable.
+    pub fn apply_to_playlist(&self, playlist: &mut Playlist, hvsc_root: Option<&Path>) {
         let mut applied = 0;
+        let mut applied_by_path = 0;
         let mut skipped = 0;
         for entry in &mut playlist.entries {
             // Don't overwrite durations already loaded from the playlist file
@@ -677,17 +743,34 @@ impl SonglengthDb {
                 skipped += 1;
                 continue;
             }
-            if let Some(ref md5) = entry.md5 {
-                let subtune = entry.selected_song.saturating_sub(1) as usize;
-                if let Some(dur) = self.lookup(md5, subtune) {
+            let subtune = entry.selected_song.saturating_sub(1) as usize;
+            let md5_str = entry.md5.as_deref();
+            let mut md5_hit = false;
+            if let Some(m) = md5_str {
+                if let Some(dur) = self.lookup(m, subtune) {
                     entry.duration_secs = Some(dur);
                     applied += 1;
+                    md5_hit = true;
+                }
+            }
+            if !md5_hit {
+                if let Some(dur) =
+                    self.lookup_with_path_fallback(md5_str, &entry.path, hvsc_root, subtune)
+                {
+                    entry.duration_secs = Some(dur);
+                    applied_by_path += 1;
                 }
             }
         }
-        if applied > 0 || skipped > 0 {
+        if applied_by_path > 0 {
             eprintln!(
-                "[phosphor] Songlengths: applied={applied}, already_known={skipped}, total={}",
+                "[phosphor] Songlengths: {applied_by_path} entries matched by HVSC-relative path (local SID bytes differ from DB)"
+            );
+        }
+        let total_applied = applied + applied_by_path;
+        if total_applied > 0 || skipped > 0 {
+            eprintln!(
+                "[phosphor] Songlengths: applied={total_applied}, already_known={skipped}, total={}",
                 playlist.entries.len()
             );
         }
@@ -1125,6 +1208,90 @@ pub fn parse_playlist_file_with_base(
     }
     // Don't clear — main thread handler clears after post-processing.
     Ok(entries)
+}
+
+/// Parse an M3U into **skeleton** entries — no SID files are read, no
+/// md5 is computed, no songlength lookup. Each entry gets path +
+/// filename-based title + sensible defaults so the playlist UI renders
+/// instantly even for very long lists.
+///
+/// Pair with `enrich_skeleton_entries` (background task) to fill in
+/// real titles, song counts, durations, etc., as soon as the disk
+/// reads complete.
+///
+/// Used by the Published Playlists "▶ Load" flow — the user doesn't
+/// have to wait while ~100 SID headers are read sequentially.
+pub fn parse_playlist_skeleton_with_base(
+    path: PathBuf,
+    base_dir: PathBuf,
+    _progress: LoadingProgress,
+) -> Result<Vec<PlaylistEntry>, String> {
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+
+    let items = parse_m3u(&content, base_dir.as_path());
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.path.is_dir() {
+            // Skeletons don't recurse into directories — published M3Us
+            // are flat lists of HVSC-relative file paths.
+            continue;
+        }
+        let title = item.title.clone().unwrap_or_else(|| {
+            item.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.path.to_string_lossy().into_owned())
+        });
+        out.push(PlaylistEntry {
+            path: item.path,
+            title,
+            author: item.author.unwrap_or_default(),
+            released: item.released.unwrap_or_default(),
+            songs: item.songs.unwrap_or(1),
+            selected_song: item.selected_song.unwrap_or(1),
+            is_pal: item.is_pal.unwrap_or(true),
+            num_sids: item.num_sids.unwrap_or(1),
+            is_rsid: item.is_rsid.unwrap_or(false),
+            md5: item.md5,
+            duration_secs: item.duration_secs,
+            has_wds: false,
+        });
+    }
+    Ok(out)
+}
+
+/// Background enrichment: for each entry that's missing md5 (the
+/// skeleton ones), open the SID on disk, parse the header, compute the
+/// HVSC md5, and merge the real metadata back. EXTINF duration + the
+/// `#PHOSPHOR:song=N` sub-tune override from the M3U survive the merge.
+///
+/// Missing files / parse failures leave the skeleton entry alone — the
+/// user still sees the row and can investigate; the player will raise
+/// the real error if they try to play it.
+pub fn enrich_skeleton_entries(entries: Vec<PlaylistEntry>) -> Vec<PlaylistEntry> {
+    entries
+        .into_iter()
+        .map(|skel| {
+            if skel.md5.is_some() {
+                // Already cached (e.g. has #PHOSPHOR:md5= from a session save).
+                return skel;
+            }
+            match PlaylistEntry::from_path(&skel.path) {
+                Ok(real) => PlaylistEntry {
+                    // Preserve overrides that came from the M3U.
+                    selected_song: if skel.selected_song > 1 && skel.selected_song <= real.songs {
+                        skel.selected_song
+                    } else {
+                        real.selected_song
+                    },
+                    duration_secs: skel.duration_secs.or(real.duration_secs),
+                    ..real
+                },
+                Err(_) => skel,
+            }
+        })
+        .collect()
 }
 
 /// Load the session playlist (and/or CLI args) in a background thread.

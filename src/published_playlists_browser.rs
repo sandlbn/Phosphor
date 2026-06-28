@@ -46,10 +46,6 @@ impl PublishedPlaylistsBrowser {
     }
 
     // ── Getters ────────────────────────────────────────────────────
-    pub fn manifest(&self) -> Option<&Manifest> {
-        self.manifest.as_ref()
-    }
-
     pub fn playlists(&self) -> &[PublishedPlaylistMeta] {
         self.manifest
             .as_ref()
@@ -71,10 +67,6 @@ impl PublishedPlaylistsBrowser {
 
     pub fn last_synced_unix(&self) -> Option<i64> {
         self.last_synced_unix
-    }
-
-    pub fn active_file(&self) -> Option<&str> {
-        self.active_file.as_deref()
     }
 
     pub fn preview(&self, file: &str) -> Option<&PreviewState> {
