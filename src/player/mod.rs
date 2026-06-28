@@ -4,6 +4,7 @@
 pub mod hacks;
 pub mod libsidplayfp;
 pub mod memory;
+mod priority;
 pub mod rsid_bus;
 pub mod sid_file;
 
@@ -371,6 +372,12 @@ fn player_loop(
     mut u64_password: String,
     mut macos_usb_mode: String,
 ) {
+    // Pin this thread above the default GUI scheduling tier so OS-level
+    // throttling (background demotion, eco-cores on battery, powersave
+    // clocks) doesn't slip our PAL/NTSC frame deadlines. Best-effort
+    // per-OS; failures are logged but non-fatal.
+    priority::elevate_player_thread();
+
     let mut bridge: Option<Box<dyn SidDevice>> = None;
     let mut state = PlayState::Stopped;
     let mut play_ctx: Option<PlayContext> = None;
