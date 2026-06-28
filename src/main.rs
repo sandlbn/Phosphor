@@ -38,6 +38,43 @@ mod sid_emulated;
 mod sid_sidlite;
 mod sid_u64;
 
+/// Windows-only high-resolution timer guard.
+///
+/// Windows' default scheduler tick is ~15.6 ms, so `thread::sleep()` rounds
+/// up to the next 15.6 ms boundary unless someone has called
+/// `timeBeginPeriod(1)` — which since Windows 10 21H2 is per-process. Our
+/// player thread paces PAL frames at ~19.95 ms, so without 1 ms timer
+/// resolution it sleeps to ~31 ms and misses every frame whenever Phosphor
+/// runs in the background. RAII guard: bumps resolution at construction,
+/// restores at drop.
+#[cfg(windows)]
+mod windows_timer {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(uPeriod: u32) -> u32;
+        fn timeEndPeriod(uPeriod: u32) -> u32;
+    }
+
+    pub struct HiResTimerGuard;
+
+    impl HiResTimerGuard {
+        pub fn raise() -> Self {
+            unsafe {
+                timeBeginPeriod(1);
+            }
+            Self
+        }
+    }
+
+    impl Drop for HiResTimerGuard {
+        fn drop(&mut self) {
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
+    }
+}
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -4335,6 +4372,13 @@ fn main() -> iced::Result {
     }));
 
     env_logger::init();
+
+    // Windows: pin the system timer to 1 ms resolution for the lifetime of
+    // `main()`. Without this the player thread misses PAL frames whenever
+    // Phosphor runs in the background (sleep granularity reverts to ~15.6 ms).
+    // No-op on Linux/macOS — sleep granularity is already ~1 ms by default.
+    #[cfg(windows)]
+    let _hi_res_timer = windows_timer::HiResTimerGuard::raise();
 
     let config_for_window = Config::load();
     // Seed the global font scale before the first frame so the very first
