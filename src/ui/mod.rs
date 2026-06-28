@@ -642,6 +642,8 @@ pub fn controls_bar<'a>(
     window_width: f32,
     show_recently_played: bool,
     show_sid_panel: bool,
+    tick: u32,
+    hvsc_needs_attention: bool,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let btn_size = if compact { 11.0_f32 } else { 12.0 };
@@ -849,10 +851,26 @@ pub fn controls_bar<'a>(
 
     // Library entry-point in its own group so the accented styling reads
     // as a content-discovery affordance separate from the system toggles.
-    let library_group: Element<'a, Message> = if compact {
-        accent_button("📚", Message::ToggleHvscBrowser)
-    } else {
-        accent_button("📚 Library", Message::ToggleHvscBrowser)
+    // When HVSC isn't synced, a rotating red ring is layered around the
+    // button to draw the user's eye — see `LibraryRing`.
+    let library_group: Element<'a, Message> = {
+        let btn = if compact {
+            accent_button("📚", Message::ToggleHvscBrowser)
+        } else {
+            accent_button("📚 Library", Message::ToggleHvscBrowser)
+        };
+        if hvsc_needs_attention {
+            let ring = Canvas::new(LibraryRing { tick, active: true })
+                .width(Length::Fill)
+                .height(Length::Fill);
+            // stack! layers children with the FIRST at the back; we want the
+            // ring drawn around the button, so button first, ring on top.
+            // `LibraryRing`'s default `update()` ignores events so clicks
+            // still reach the button below.
+            iced::widget::stack![btn, ring].into()
+        } else {
+            btn
+        }
     };
 
     // Panel-toggles sub-group (history / SID panel / device config / settings).
@@ -2348,44 +2366,84 @@ pub fn hvsc_browser_view<'a>(
             .into();
     }
 
-    // ── Update-available banner (only when sync is NOT already running) ────
-    let update_banner: Option<Element<'a, Message>> = if update_available || sync_in_progress {
-        let label: Element<'a, Message> = if sync_in_progress {
-            text(if sync_status.is_empty() {
+    // ── Sync banner — ALWAYS visible so the resync button is reachable ────
+    // Three states drive the wording + visual emphasis:
+    //   in-progress   → grey container, status text, no button
+    //   update avail. → highlighted blue, "new release" text + Sync button
+    //   up to date    → muted grey, version text + "Re-sync" button
+    let (banner_label, banner_bg, banner_border): (Element<'a, Message>, Color, Color) =
+        if sync_in_progress {
+            let txt = if sync_status.is_empty() {
                 "Syncing HVSC…".to_string()
             } else {
                 format!("Syncing HVSC… {sync_status}")
-            })
-            .size(font::sized(12.0))
-            .color(Color::from_rgb(0.85, 0.87, 0.9))
-            .into()
-        } else {
-            text("🆕 New HVSC release available")
-                .size(font::sized(12.0))
-                .color(Color::from_rgb(0.85, 0.87, 0.9))
-                .into()
-        };
-        Some(
-            container(
-                row![label, Space::new().width(Length::Fill), sync_button]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
+            };
+            (
+                text(txt)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.85, 0.87, 0.9))
+                    .into(),
+                Color::from_rgb(0.13, 0.16, 0.20),
+                Color::from_rgb(0.25, 0.35, 0.45),
             )
-            .padding(Padding::from([6, 10]))
-            .style(|_t: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.13, 0.16, 0.20))),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: Color::from_rgb(0.25, 0.35, 0.45),
-                },
-                ..Default::default()
-            })
-            .into(),
-        )
+        } else if update_available {
+            (
+                text(if sync_status.is_empty() {
+                    "🆕 New HVSC release available".to_string()
+                } else {
+                    format!("🆕 {sync_status}")
+                })
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.95, 0.85, 0.55))
+                .into(),
+                Color::from_rgb(0.18, 0.16, 0.10),
+                Color::from_rgb(0.45, 0.38, 0.20),
+            )
+        } else {
+            (
+                text(if sync_status.is_empty() {
+                    "HVSC is up to date".to_string()
+                } else {
+                    sync_status.to_string()
+                })
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.65, 0.67, 0.72))
+                .into(),
+                Color::from_rgb(0.11, 0.12, 0.14),
+                Color::from_rgb(0.20, 0.22, 0.25),
+            )
+        };
+
+    let banner_button: Element<'a, Message> = if sync_in_progress {
+        Space::new().width(Length::Fixed(0.0)).into()
+    } else if update_available {
+        tool_button("⬇ Sync HVSC now", Message::HvscRsyncStart)
     } else {
-        None
+        tool_button("⟳ Re-sync HVSC", Message::HvscRsyncStart)
     };
+
+    let update_banner: Option<Element<'a, Message>> = Some(
+        container(
+            row![
+                banner_label,
+                Space::new().width(Length::Fill),
+                banner_button
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding(Padding::from([6, 10]))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(banner_bg)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: banner_border,
+            },
+            ..Default::default()
+        })
+        .into(),
+    );
 
     // ── Left column: search + author list ──────────────────────────────────
     let search_input = text_input("Search authors / tunes", browser.search())
@@ -3825,6 +3883,85 @@ pub fn mini_player_view<'a>(
 
 /// Demoscene-style loading screen with rainbow pixel text and a spinning cube.
 /// The `tick` field changes every frame (33ms) which forces iced to redraw.
+/// Rotating red "alarm" ring drawn behind the Library toolbar button
+/// when HVSC isn't synced. Two opposite arc segments orbit + throb so
+/// the affordance reads as "something needs your attention here" without
+/// being a featureless spinner.
+///
+/// Inert when `active == false` — `draw` returns no geometry, no GPU work.
+/// Layered via `iced::widget::stack!` BEHIND the actual button, so all
+/// clicks pass through to the button below.
+struct LibraryRing {
+    tick: u32,
+    active: bool,
+}
+
+impl<Message> canvas::Program<Message> for LibraryRing {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        if !self.active {
+            return vec![frame.into_geometry()];
+        }
+
+        let cx = bounds.width * 0.5;
+        let cy = bounds.height * 0.5;
+        // Hug the button: radius lands just outside the rounded-rect edge.
+        // 2 px inset keeps the stroke fully inside the canvas bounds even
+        // when the stroke width pulses up to its maximum.
+        let radius = (bounds.width.min(bounds.height) * 0.5) - 2.0;
+        if radius <= 0.0 {
+            return vec![frame.into_geometry()];
+        }
+
+        let t = self.tick as f32;
+        // ~1.7 s per full rotation (33ms tick × 60 / 0.06 ≈ 1.65s).
+        let base_angle = t * 0.06;
+        // Throb period ≈ 2 s (60 ticks). abs() of sin gives a 0→1→0 pulse.
+        let pulse = (((self.tick % 60) as f32) / 60.0 * std::f32::consts::TAU)
+            .sin()
+            .abs();
+
+        // Two opposite 100° arcs, each drawn as ~24 line segments.
+        let arc_span = std::f32::consts::PI * 100.0 / 180.0;
+        let segments = 24usize;
+        let alpha = 0.55 + 0.45 * pulse;
+        let width = 1.8 + 1.2 * pulse;
+        let color = Color::from_rgba(0.95, 0.30, 0.30, alpha);
+        let stroke = iced::widget::canvas::Stroke::default()
+            .with_color(color)
+            .with_width(width)
+            .with_line_cap(iced::widget::canvas::LineCap::Round);
+
+        for arc_idx in 0..2 {
+            let start = base_angle + arc_idx as f32 * std::f32::consts::PI;
+            let path = iced::widget::canvas::Path::new(|b| {
+                for i in 0..=segments {
+                    let theta = start + (i as f32 / segments as f32) * arc_span;
+                    let x = cx + radius * theta.cos();
+                    let y = cy + radius * theta.sin();
+                    if i == 0 {
+                        b.move_to(Point::new(x, y));
+                    } else {
+                        b.line_to(Point::new(x, y));
+                    }
+                }
+            });
+            frame.stroke(&path, stroke.clone());
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
 struct LoadingScroller {
     text: String,
     tick: u32,
