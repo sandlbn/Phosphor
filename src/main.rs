@@ -2727,6 +2727,16 @@ impl App {
             self.config.master_volume,
             engine_suffix.as_deref(),
         );
+        // Alarm the Library button (rotating red ring) when HVSC is unconfigured
+        // or its root path no longer exists on disk. Silenced while a sync is
+        // in flight — the panel itself shows progress in that case.
+        let hvsc_needs_attention = self
+            .config
+            .hvsc_root
+            .as_ref()
+            .map(|p| !std::path::Path::new(p).exists())
+            .unwrap_or(true)
+            && self.hvsc_sync.is_none();
         let controls = ui::controls_bar(
             &self.status,
             &self.playlist,
@@ -2734,6 +2744,8 @@ impl App {
             self.window_width,
             self.show_recently_played,
             self.show_sid_panel,
+            self.tick,
+            hvsc_needs_attention,
         );
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
         let progress = ui::progress_bar(&self.status, current_duration);
