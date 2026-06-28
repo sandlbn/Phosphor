@@ -113,9 +113,10 @@ impl Default for Assembly64Client {
 
 impl Assembly64Client {
     pub fn new() -> Self {
-        let http = Client::builder()
+        let builder = Client::builder()
             .user_agent("phosphor-assembly64/0.4")
-            .timeout(SEARCH_TIMEOUT)
+            .timeout(SEARCH_TIMEOUT);
+        let http = crate::config::apply_proxy(builder)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { http }
@@ -203,9 +204,10 @@ impl Assembly64Client {
         );
         // Build a per-call client so we can use a longer timeout without
         // affecting the shared search timeout.
-        let dl = Client::builder()
+        let dl_builder = Client::builder()
             .user_agent("phosphor-assembly64/0.4")
-            .timeout(DOWNLOAD_TIMEOUT)
+            .timeout(DOWNLOAD_TIMEOUT);
+        let dl = crate::config::apply_proxy(dl_builder)
             .build()
             .map_err(|e| AssemblyError::Network(e.to_string()))?;
         let resp = dl

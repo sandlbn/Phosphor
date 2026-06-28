@@ -47,9 +47,10 @@ fn find_platform_asset(assets: &[GitHubAsset]) -> Option<&str> {
 
 /// Fetch the latest release from GitHub and compare with current version.
 pub async fn check_github_release(current_version: &str) -> Result<Option<NewVersionInfo>, String> {
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent("Phosphor-SID-Player")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10));
+    let client = crate::config::apply_proxy(builder)
         .build()
         .map_err(|e| format!("Client error: {e}"))?;
 

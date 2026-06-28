@@ -52,9 +52,10 @@ impl Default for PublishedPlaylistsClient {
 
 impl PublishedPlaylistsClient {
     pub fn new() -> Self {
-        let http = Client::builder()
+        let builder = Client::builder()
             .user_agent("phosphor-published-playlists/0.4")
-            .timeout(FETCH_TIMEOUT)
+            .timeout(FETCH_TIMEOUT);
+        let http = crate::config::apply_proxy(builder)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { http }

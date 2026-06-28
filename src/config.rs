@@ -54,6 +54,12 @@ pub struct Config {
     /// UNIX timestamp (seconds) of the last successful Published Playlists
     /// sync. Drives the "Last synced: 4 min ago" indicator.
     pub published_playlists_last_synced: Option<i64>,
+    /// Optional HTTP proxy URL applied to every outbound request
+    /// (HVSC sync, Songlengths/STIL download, Assembly64, version check,
+    /// Published Playlists). Empty / None → use reqwest's default
+    /// behaviour (env vars, etc.). Accepts `http://`, `https://`, and
+    /// `socks5://` schemes; basic auth via `http://user:pass@host:port`.
+    pub proxy_url: Option<String>,
     /// Last HVSC version string fetched from the CDN (e.g. "HVSC #80").
     /// Used to detect when a new release is available.
     pub hvsc_known_version: Option<String>,
@@ -112,6 +118,7 @@ impl Default for Config {
             browser_source: "local".to_string(),
             assembly64_last_query: None,
             published_playlists_last_synced: None,
+            proxy_url: None,
             hvsc_known_version: None,
             u64_audio_enabled: false,
             u64_audio_port: 11001,
@@ -270,6 +277,11 @@ impl Config {
                 if val != "null" {
                     config.published_playlists_last_synced = val.parse::<i64>().ok();
                 }
+            } else if let Some(rest) = line.strip_prefix("\"proxy_url\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.proxy_url = strip_json_string(val);
+                }
             } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.u64_audio_enabled = val == "true";
@@ -381,6 +393,7 @@ impl Config {
                 "  \"browser_source\": \"{}\",\n",
                 "  \"assembly64_last_query\": {},\n",
                 "  \"published_playlists_last_synced\": {},\n",
+                "  \"proxy_url\": {},\n",
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
@@ -413,6 +426,7 @@ impl Config {
             self.browser_source,
             fmt_opt_str(&self.assembly64_last_query),
             fmt_opt_i64(self.published_playlists_last_synced),
+            fmt_opt_str(&self.proxy_url),
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,
@@ -600,5 +614,36 @@ pub fn config_dir() -> Option<PathBuf> {
     {
         let home = std::env::var("HOME").ok()?;
         Some(PathBuf::from(home).join(".config").join("phosphor"))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HTTP proxy support
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read the user-configured proxy URL from disk. We load on demand
+/// rather than passing config refs through every HTTP module — the
+/// proxy URL only changes via Settings (rare) and re-reading the
+/// config from disk is cheap.
+pub fn current_proxy_url() -> Option<String> {
+    Config::load()
+        .proxy_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Apply the configured proxy (if any) to a `reqwest::ClientBuilder`.
+/// All Phosphor HTTP modules construct their clients through this
+/// helper so corporate proxies "just work" once configured.
+pub fn apply_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(url) = current_proxy_url() else {
+        return builder;
+    };
+    match reqwest::Proxy::all(&url) {
+        Ok(p) => builder.proxy(p),
+        Err(e) => {
+            eprintln!("[phosphor] Invalid proxy URL {url:?}: {e} — ignoring");
+            builder
+        }
     }
 }
