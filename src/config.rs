@@ -7,9 +7,8 @@ use std::path::PathBuf;
 /// Default HTTPS URL for the HVSC C64Music/ tree. Single source of truth:
 /// the full recursive sync crawls under this URL, AND `Songlengths.md5` +
 /// `STIL.txt` are refreshed from `<this>/DOCUMENTS/{Songlengths.md5,STIL.txt}`.
-/// prg.dtu.dk is the TU Denmark academic mirror — it serves real Apache
-/// HTML directory listings, which our crawler needs.
-pub const DEFAULT_HVSC_RSYNC_URL: &str = "https://www.prg.dtu.dk/HVSC/C64Music/";
+
+pub const DEFAULT_HVSC_RSYNC_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music/";
 
 /// Default window dimensions — used on first launch.
 const DEFAULT_WINDOW_WIDTH: f32 = 900.0;
