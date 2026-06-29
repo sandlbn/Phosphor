@@ -3339,6 +3339,7 @@ pub fn settings_panel<'a>(
         ("Space", "Play / Pause (when search inactive)"),
         ("← →", "Previous / Next track"),
         ("↑ ↓", "Navigate playlist"),
+        ("L", "Toggle 📚 Library panel"),
         ("Delete", "Remove selected"),
         ("Ctrl+F", "Focus search"),
     ] {
@@ -3723,6 +3724,7 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
         ("K", "Toggle karaoke lyrics (MUS files)"),
         ("H", "Toggle favourite for current track"),
         ("M", "Toggle mini player"),
+        ("L", "Toggle 📚 Library panel"),
         ("Ctrl+F", "Focus search"),
         ("Delete", "Remove selected track"),
         ("Escape / ?", "Close this overlay"),

@@ -3166,6 +3166,10 @@ impl App {
                     Key::Character(ref c) if c.as_str() == "m" && status != Status::Captured => {
                         Some(Message::ToggleMiniPlayer)
                     }
+                    // L — toggle 📚 Library panel
+                    Key::Character(ref c) if c.as_str() == "l" && status != Status::Captured => {
+                        Some(Message::ToggleHvscBrowser)
+                    }
                     // ? — show/hide help overlay
                     Key::Character(ref c) if c.as_str() == "?" => Some(Message::ShowHelp),
                     // Arrow keys — context-sensitive, resolved in update()
