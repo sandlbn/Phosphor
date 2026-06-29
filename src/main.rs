@@ -2102,6 +2102,58 @@ impl App {
                 }
             }
 
+            // ── HVSC: 🎲 Surprise me ───────────────────────────────────────
+            Message::HvscBrowserSurpriseMe => {
+                // Ensure the flat index for the current category is loaded.
+                let total = self.hvsc_browser.build_flat_index_if_needed();
+                if total == 0 {
+                    eprintln!("[surprise] No tunes in HVSC flat index — is the tree synced?");
+                } else {
+                    use rand::Rng;
+                    let idx = rand::thread_rng().gen_range(0..total);
+                    if let Some(entry) = self
+                        .hvsc_browser
+                        .realise_flat(idx, self.songlength_db.as_ref())
+                    {
+                        let path = entry.path.clone();
+                        let song = entry.selected_song.max(1);
+                        eprintln!(
+                            "[surprise] picked {} of {}: {}",
+                            idx + 1,
+                            total,
+                            path.display()
+                        );
+                        self.playlist.add_entries(vec![entry]);
+                        if let Some(db) = self.songlength_db.as_ref() {
+                            db.apply_to_playlist(
+                                &mut self.playlist,
+                                self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                            );
+                        }
+                        self.rebuild_filter();
+                        if let Some(abs_i) =
+                            self.playlist.entries.iter().position(|e| e.path == path)
+                        {
+                            self.selected = Some(abs_i);
+                        }
+                        let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                            path,
+                            song,
+                            force_stereo: self.config.force_stereo_2sid
+                                || std::env::args().any(|a| a == "--stereo"),
+                            sid4_addr: 0xd420,
+                            audio_port: if self.config.u64_audio_enabled {
+                                Some(self.config.u64_audio_port)
+                            } else {
+                                None
+                            },
+                            restart_usb_on_load: self.config.restart_usb_on_load,
+                        });
+                        self.show_hvsc_browser = false;
+                    }
+                }
+            }
+
             // ── Browse panel: source toggle ────────────────────────────────
             Message::BrowserSourceChanged(src) => {
                 self.browser_source = src;
@@ -3113,6 +3165,10 @@ impl App {
                     // M — toggle mini player
                     Key::Character(ref c) if c.as_str() == "m" && status != Status::Captured => {
                         Some(Message::ToggleMiniPlayer)
+                    }
+                    // L — toggle 📚 Library panel
+                    Key::Character(ref c) if c.as_str() == "l" && status != Status::Captured => {
+                        Some(Message::ToggleHvscBrowser)
                     }
                     // ? — show/hide help overlay
                     Key::Character(ref c) if c.as_str() == "?" => Some(Message::ShowHelp),

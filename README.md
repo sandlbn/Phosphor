@@ -14,8 +14,11 @@ https://github.com/sandlbn/Phosphor/releases
 ## Features
 
 - **Four playback engines** — USB hardware, software emulation (reSID or SIDLite), or Commodore Ultimate 64 over the network
+- **📚 Library panel** — browse Local HVSC, search Assembly64 live, and load curated Playlists synced from the Phosphor repo
+- **🎲 Surprise me** — one-click random tune from your synced HVSC tree
 - **USBSID-Pico device config** — built-in Device panel (🔧 button) for chip routing, clock rate, presets, and save-to-flash, all without leaving Phosphor
 - **HTTP remote control** — built-in web server for controlling playback from any browser on the network (phone, tablet, another PC)
+- **HTTP proxy support** — single-field setting for `http://` / `https://` / `socks5://`, applied to all outbound requests
 - **Playlist management** — add files and folders, drag & drop, save/load M3U playlists; duplicate detection on import
 - **Session restore** — playlist automatically saved on exit and restored on next launch
 - **Sortable columns** — click any column header to sort by title, author, released, duration, type, or SID count
@@ -47,6 +50,7 @@ Good luck hearing all 60,000+ — at four minutes each that's only about 167 str
 | `F` | Toggle full-screen visualiser |
 | `V` | Cycle visualiser mode (Bars → Scope → Tracker → Karaoke) |
 | `K` | Toggle karaoke lyrics (MUS files with .wds) |
+| `L` | Toggle 📚 Library panel |
 | `H` | Toggle favourite for currently playing track |
 | `?` | Show keyboard shortcuts & about |
 | `Delete` | Remove selected track |

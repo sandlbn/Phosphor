@@ -270,6 +270,9 @@ pub enum Message {
     HvscBrowserPlayFlat(usize),
     /// Add a tune from the flat search index to the playlist.
     HvscBrowserAddFlat(usize),
+    /// 🎲 Surprise Me — pick a random tune from the current HVSC category
+    /// and play it. Builds the flat index lazily on first click.
+    HvscBrowserSurpriseMe,
 
     // Browse panel: source toggle (Local HVSC vs Assembly64)
     BrowserSourceChanged(crate::hvsc_browser::BrowserSource),
@@ -2531,8 +2534,15 @@ pub fn hvsc_browser_view<'a>(
         )
     };
 
-    let left_col = column![
+    let search_row = row![
         search_input,
+        tool_button("🎲 Surprise me", Message::HvscBrowserSurpriseMe),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let left_col = column![
+        search_row,
         text(author_count_label)
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.55)),
@@ -3329,6 +3339,7 @@ pub fn settings_panel<'a>(
         ("Space", "Play / Pause (when search inactive)"),
         ("← →", "Previous / Next track"),
         ("↑ ↓", "Navigate playlist"),
+        ("L", "Toggle 📚 Library panel"),
         ("Delete", "Remove selected"),
         ("Ctrl+F", "Focus search"),
     ] {
@@ -3713,6 +3724,7 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
         ("K", "Toggle karaoke lyrics (MUS files)"),
         ("H", "Toggle favourite for current track"),
         ("M", "Toggle mini player"),
+        ("L", "Toggle 📚 Library panel"),
         ("Ctrl+F", "Focus search"),
         ("Delete", "Remove selected track"),
         ("Escape / ?", "Close this overlay"),
