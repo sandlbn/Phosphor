@@ -52,6 +52,25 @@ impl PlaylistEntry {
 
         let md5 = sid_file::compute_hvsc_md5(&sid);
 
+        // Opt-in diagnostic to debug "Library-loaded SIDs show wrong
+        // num_sids" reports. Enable with `PHOSPHOR_DEBUG_NUMSIDS=1`.
+        // Logs the file's PSID-version + raw bytes 0x7A/0x7B (SID2/3
+        // address fields) + the parsed `num_sids` so we can compare
+        // the same file's reading across different load paths.
+        if std::env::var("PHOSPHOR_DEBUG_NUMSIDS").is_ok() {
+            let b7a = sid.raw.get(0x7A).copied().unwrap_or(0);
+            let b7b = sid.raw.get(0x7B).copied().unwrap_or(0);
+            eprintln!(
+                "[NUMSIDS] {}: v={} num_sids={} b[0x7A]=0x{:02X} b[0x7B]=0x{:02X} extra={:?}",
+                path.display(),
+                h.version,
+                h.num_sids(),
+                b7a,
+                b7b,
+                h.extra_sid_addrs,
+            );
+        }
+
         Ok(Self {
             path: path.to_path_buf(),
             title: if h.name.is_empty() {

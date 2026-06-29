@@ -4348,6 +4348,99 @@ fn format_usb_chip_summary(snap: &ui::DeviceConfigSnapshot) -> String {
     }
 }
 
+/// Diagnostic walker for `--check-numsids`. Calls the exact same
+/// `PlaylistEntry::from_path` every real load path uses, prints what
+/// num_sids it computes plus the underlying header bytes, and flags
+/// any file whose computed num_sids would render as multi-SID in the
+/// playlist column (i.e. > 1).
+///
+/// Stats summary at the end so the user can paste back something short
+/// like "1234 files, 1238 single-SID, 56 multi-SID" instead of dumping
+/// the whole tree.
+fn check_numsids(root: &std::path::Path) {
+    use walkdir::WalkDir;
+
+    let mut total: usize = 0;
+    let mut single: usize = 0;
+    let mut multi: usize = 0;
+    let mut errors: usize = 0;
+
+    let iter: Box<dyn Iterator<Item = walkdir::DirEntry>> = if root.is_file() {
+        // Single-file mode: just process the one file.
+        Box::new(
+            WalkDir::new(root)
+                .max_depth(0)
+                .into_iter()
+                .filter_map(|e| e.ok()),
+        )
+    } else {
+        Box::new(WalkDir::new(root).into_iter().filter_map(|e| e.ok()))
+    };
+
+    for dirent in iter {
+        let p = dirent.path();
+        if !p.is_file() {
+            continue;
+        }
+        let ext_ok = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "sid" | "mus"))
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+
+        total += 1;
+        // Read the raw bytes ourselves so we can dump 0x7A/0x7B alongside
+        // what from_path reports — that's the whole point of the test.
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[ERR] {}: cannot read: {e}", p.display());
+                errors += 1;
+                continue;
+            }
+        };
+        let b7a = bytes.get(0x7A).copied().unwrap_or(0);
+        let b7b = bytes.get(0x7B).copied().unwrap_or(0);
+
+        match playlist::PlaylistEntry::from_path(p) {
+            Ok(entry) => {
+                let tag = if entry.num_sids > 1 {
+                    "MULTI"
+                } else {
+                    "single"
+                };
+                if entry.num_sids > 1 {
+                    multi += 1;
+                } else {
+                    single += 1;
+                }
+                println!(
+                    "[{tag}] {}: num_sids={} b[0x7A]=0x{:02X} b[0x7B]=0x{:02X}",
+                    p.display(),
+                    entry.num_sids,
+                    b7a,
+                    b7b,
+                );
+            }
+            Err(e) => {
+                eprintln!("[ERR] {}: from_path failed: {e}", p.display());
+                errors += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "\n--- check-numsids summary ---\n\
+         total       : {total}\n\
+         single-SID  : {single}\n\
+         multi-SID   : {multi}\n\
+         errors      : {errors}"
+    );
+}
+
 fn parse_sid4_from_args() -> u16 {
     let args: Vec<String> = std::env::args().collect();
     args.windows(2)
@@ -4413,6 +4506,32 @@ fn main() -> iced::Result {
     }));
 
     env_logger::init();
+
+    // Diagnostic subcommand: walk a directory of .sid files, call the
+    // regular `PlaylistEntry::from_path` on each (the same function
+    // every load path in Phosphor uses), and print num_sids + relevant
+    // header bytes per file. Exits without launching the GUI.
+    //
+    //   phosphor --check-numsids <path>
+    //
+    // The output is identical to what Phosphor would record at load
+    // time, so any "library says 2SID, files-picker says 1" mismatch
+    // is reproducible here too — or proven NOT to be in `from_path`.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--check-numsids") {
+            match args.get(i + 1).cloned() {
+                Some(p) => {
+                    check_numsids(std::path::Path::new(&p));
+                    return Ok(());
+                }
+                None => {
+                    eprintln!("Usage: phosphor --check-numsids <file-or-directory>");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
 
     // Windows: pin the system timer to 1 ms resolution for the lifetime of
     // `main()`. Without this the player thread misses PAL frames whenever
