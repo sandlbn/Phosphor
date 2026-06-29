@@ -50,6 +50,7 @@ Good luck hearing all 60,000+ — at four minutes each that's only about 167 str
 | `F` | Toggle full-screen visualiser |
 | `V` | Cycle visualiser mode (Bars → Scope → Tracker → Karaoke) |
 | `K` | Toggle karaoke lyrics (MUS files with .wds) |
+| `L` | Toggle 📚 Library panel |
 | `H` | Toggle favourite for currently playing track |
 | `?` | Show keyboard shortcuts & about |
 | `Delete` | Remove selected track |
