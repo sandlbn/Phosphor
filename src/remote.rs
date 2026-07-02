@@ -4,11 +4,14 @@
 // Runs in a background thread — all communication with the iced App
 // goes through shared state (Arc<Mutex>) and a command channel.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossbeam_channel::Sender;
 use serde::Serialize;
+
+use crate::published_playlists::Manifest;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Commands sent from HTTP server → App (polled on Tick)
@@ -21,6 +24,23 @@ pub enum RemoteCmd {
     NextTrack,
     PrevTrack,
     SetSubtune(u16),
+    // Playback QOL — added to bring the remote API up to parity with
+    // the library / QOL features that landed in the desktop UI over the
+    // last release cycle. Every variant is dispatched 1:1 to an existing
+    // `Message::…` handler in `App::poll_remote_commands()`.
+    ToggleFavorite(usize),
+    ToggleFavoriteCurrent,
+    ToggleShuffle,
+    CycleRepeat,
+    SetSleepTimer(Option<u32>),
+    SetVolume(f32),
+    Surprise,
+    // Library — Published Playlists
+    LoadPublishedPlaylist(String),
+    RestoreDefaultPlaylist,
+    // Library — HVSC browse
+    HvscPlay(PathBuf),
+    HvscAdd(PathBuf),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +62,27 @@ pub struct RemoteStatus {
     pub sid_type: String,
     pub is_pal: bool,
     pub engine: String,
+    // ── QOL additions (populated in `App::update_remote_state`) ────
+    /// Whether the currently-playing track is hearted.
+    pub is_favorite: bool,
+    /// Host-side master volume in `[0.0, 1.0]`.
+    pub master_volume: f32,
+    /// Playlist-level playback flags.
+    pub shuffle: bool,
+    /// "off" | "one" | "all" — string so the web UI can render directly.
+    pub repeat: String,
+    /// Sleep timer: `Some(mins)` = armed for that many minutes total.
+    pub sleep_selected_mins: Option<u32>,
+    /// Seconds until the sleep timer fires. `None` = disarmed.
+    pub sleep_remaining_secs: Option<u32>,
+    /// HVSC sync currently running (drives the "syncing…" indicator).
+    pub hvsc_sync_active: bool,
+    /// `[files_done, files_total]` when a sync is running; `None` otherwise.
+    pub hvsc_sync_progress: Option<[u32; 2]>,
+    /// When the app is playing a Published Playlist in read-only mode,
+    /// this is the source filename (e.g. `HVSC_Favorite_Top_100.m3u`);
+    /// otherwise `None`.
+    pub active_published_playlist: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -52,6 +93,8 @@ pub struct RemotePlaylistEntry {
     pub duration: Option<u32>,
     pub num_sids: usize,
     pub is_rsid: bool,
+    /// True when this entry's md5 is in the favourites DB.
+    pub is_favorite: bool,
 }
 
 #[derive(Default)]
@@ -59,6 +102,13 @@ pub struct SharedRemoteState {
     pub status: RemoteStatus,
     pub playlist: Vec<RemotePlaylistEntry>,
     pub playlist_version: u64,
+    /// Snapshot of `config.hvsc_root` — needed by the HVSC-browse
+    /// endpoints so the HTTP thread can walk the on-disk tree without
+    /// touching App state.
+    pub hvsc_root: Option<PathBuf>,
+    /// Snapshot of the loaded Published Playlists manifest so the
+    /// GET /api/library/playlists endpoint can return it directly.
+    pub published_manifest: Option<Manifest>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,7 +131,7 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                 }
             };
 
-            for request in server.incoming_requests() {
+            for mut request in server.incoming_requests() {
                 let url = request.url().to_string();
                 let method = request.method().to_string();
 
@@ -208,6 +258,154 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                         }
                     }
 
+                    // ── API: playback QOL ────────────────────────────────
+                    ("POST", "/api/favorite/current") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::ToggleFavoriteCurrent);
+                        respond_ok(request);
+                    }
+                    ("POST", p) if p.starts_with("/api/favorite/") => {
+                        if let Some(idx_str) = p.strip_prefix("/api/favorite/") {
+                            match idx_str.parse::<usize>() {
+                                Ok(idx) => {
+                                    let _ = cmd_tx.try_send(RemoteCmd::ToggleFavorite(idx));
+                                    respond_ok(request);
+                                }
+                                Err(_) => respond_error(request, 400, "Invalid index"),
+                            }
+                        } else {
+                            respond_error(request, 400, "Missing index");
+                        }
+                    }
+                    ("POST", "/api/shuffle") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::ToggleShuffle);
+                        respond_ok(request);
+                    }
+                    ("POST", "/api/repeat") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::CycleRepeat);
+                        respond_ok(request);
+                    }
+                    ("POST", p) if p.starts_with("/api/sleep/") => {
+                        if let Some(m_str) = p.strip_prefix("/api/sleep/") {
+                            match m_str.parse::<u32>() {
+                                Ok(0) => {
+                                    let _ = cmd_tx.try_send(RemoteCmd::SetSleepTimer(None));
+                                    respond_ok(request);
+                                }
+                                Ok(m) => {
+                                    let _ = cmd_tx.try_send(RemoteCmd::SetSleepTimer(Some(m)));
+                                    respond_ok(request);
+                                }
+                                Err(_) => respond_error(request, 400, "Invalid minutes"),
+                            }
+                        } else {
+                            respond_error(request, 400, "Missing minutes");
+                        }
+                    }
+                    ("POST", p) if p.starts_with("/api/volume/") => {
+                        if let Some(v_str) = p.strip_prefix("/api/volume/") {
+                            match v_str.parse::<f32>() {
+                                Ok(v) => {
+                                    let _ = cmd_tx
+                                        .try_send(RemoteCmd::SetVolume(v.clamp(0.0, 1.0)));
+                                    respond_ok(request);
+                                }
+                                Err(_) => respond_error(request, 400, "Invalid volume"),
+                            }
+                        } else {
+                            respond_error(request, 400, "Missing volume");
+                        }
+                    }
+                    ("POST", "/api/surprise") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::Surprise);
+                        respond_ok(request);
+                    }
+
+                    // ── API: Published Playlists ─────────────────────────
+                    ("GET", "/api/library/playlists") => {
+                        let json = {
+                            let s = state.lock().unwrap();
+                            match &s.published_manifest {
+                                Some(m) => serde_json::to_string(&m.playlists)
+                                    .unwrap_or_else(|_| "[]".to_string()),
+                                None => "[]".to_string(),
+                            }
+                        };
+                        respond_json(request, &json);
+                    }
+                    ("POST", "/api/library/playlists/load") => {
+                        match read_body(&mut request) {
+                            Ok(body) => match extract_json_string(&body, "file") {
+                                Some(file) => {
+                                    let _ = cmd_tx
+                                        .try_send(RemoteCmd::LoadPublishedPlaylist(file));
+                                    respond_ok(request);
+                                }
+                                None => respond_error(request, 400, "Missing 'file'"),
+                            },
+                            Err(e) => respond_error(request, 400, &e),
+                        }
+                    }
+                    ("POST", "/api/library/playlists/restore") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::RestoreDefaultPlaylist);
+                        respond_ok(request);
+                    }
+
+                    // ── API: HVSC browse ─────────────────────────────────
+                    ("GET", p) if p.starts_with("/api/library/hvsc/authors") => {
+                        let query_str = p.split('?').nth(1).unwrap_or("");
+                        let category = parse_category(query_str)
+                            .unwrap_or(crate::hvsc_browser::HvscCategory::Musicians);
+                        let hvsc_root = { state.lock().unwrap().hvsc_root.clone() };
+                        match hvsc_root {
+                            Some(root) => {
+                                let json = list_hvsc_authors(&root, category);
+                                respond_json(request, &json);
+                            }
+                            None => respond_error(request, 503, "HVSC root not configured"),
+                        }
+                    }
+                    ("GET", p) if p.starts_with("/api/library/hvsc/tunes") => {
+                        let query_str = p.split('?').nth(1).unwrap_or("");
+                        let category = parse_category(query_str)
+                            .unwrap_or(crate::hvsc_browser::HvscCategory::Musicians);
+                        let author = parse_query_value(query_str, "author").unwrap_or_default();
+                        let hvsc_root = { state.lock().unwrap().hvsc_root.clone() };
+                        match hvsc_root {
+                            Some(root) if !author.is_empty() => {
+                                let json = list_hvsc_tunes(&root, category, &author);
+                                respond_json(request, &json);
+                            }
+                            Some(_) => respond_error(request, 400, "Missing 'author'"),
+                            None => respond_error(request, 503, "HVSC root not configured"),
+                        }
+                    }
+                    ("POST", "/api/library/hvsc/play") => {
+                        match read_body(&mut request) {
+                            Ok(body) => match extract_json_string(&body, "path") {
+                                Some(path) => {
+                                    let _ = cmd_tx
+                                        .try_send(RemoteCmd::HvscPlay(PathBuf::from(path)));
+                                    respond_ok(request);
+                                }
+                                None => respond_error(request, 400, "Missing 'path'"),
+                            },
+                            Err(e) => respond_error(request, 400, &e),
+                        }
+                    }
+                    ("POST", "/api/library/hvsc/add") => {
+                        match read_body(&mut request) {
+                            Ok(body) => match extract_json_string(&body, "path") {
+                                Some(path) => {
+                                    let _ = cmd_tx
+                                        .try_send(RemoteCmd::HvscAdd(PathBuf::from(path)));
+                                    respond_ok(request);
+                                }
+                                None => respond_error(request, 400, "Missing 'path'"),
+                            },
+                            Err(e) => respond_error(request, 400, &e),
+                        }
+                    }
+
                     _ => {
                         respond_error(request, 404, "Not found");
                     }
@@ -262,6 +460,169 @@ fn urldecode(s: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Helpers for the library / QOL endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read a POST body into a String. Cap at 4 KiB — we only accept small
+/// JSON payloads with one or two fields.
+fn read_body(request: &mut tiny_http::Request) -> Result<String, String> {
+    use std::io::Read;
+    const MAX_BODY: usize = 4096;
+    let mut buf = Vec::new();
+    request
+        .as_reader()
+        .take(MAX_BODY as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Body read error: {e}"))?;
+    String::from_utf8(buf).map_err(|_| "Invalid UTF-8 in body".to_string())
+}
+
+/// Poor-man's JSON string extractor. Accepts payloads shaped like
+/// `{"key":"value"}` (possibly with whitespace); returns `None` if the
+/// key is missing or the value isn't a plain string. Used for the two
+/// endpoints that take a single-field body (`file`, `path`).
+///
+/// Deliberately does NOT depend on `serde_json` here because we don't
+/// need real parsing — the caller controls both ends of the protocol.
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    // Look for  "key" : "..."
+    let needle = format!("\"{key}\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = body[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    // Find the closing unescaped quote.
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '/' => out.push('/'),
+                _ => return None,
+            },
+            _ => out.push(c),
+        }
+    }
+    None
+}
+
+/// Parse `key=value` from a `foo=bar&key=xxx&…` query string.
+fn parse_query_value(query: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    query
+        .split('&')
+        .find(|p| p.starts_with(&prefix))
+        .map(|p| urldecode(&p[prefix.len()..]))
+}
+
+/// Parse `?category=musicians|demos|games` into an `HvscCategory`.
+fn parse_category(query: &str) -> Option<crate::hvsc_browser::HvscCategory> {
+    let raw = parse_query_value(query, "category")?;
+    match raw.to_lowercase().as_str() {
+        "musicians" | "music" => Some(crate::hvsc_browser::HvscCategory::Musicians),
+        "demos" | "demo" => Some(crate::hvsc_browser::HvscCategory::Demos),
+        "games" | "game" => Some(crate::hvsc_browser::HvscCategory::Games),
+        _ => None,
+    }
+}
+
+#[derive(Serialize)]
+struct HvscAuthorRow<'a> {
+    name: &'a str,
+    display_name: &'a str,
+    letter: char,
+    path: String,
+}
+
+/// Build the author list for the requested category directly from the
+/// filesystem. Reuses `HvscBrowser::load_authors_if_needed` — the HTTP
+/// thread holds its own throwaway browser instance per request, which
+/// is fine because it's just a Vec<> and one shallow readdir walk.
+fn list_hvsc_authors(
+    hvsc_root: &std::path::Path,
+    category: crate::hvsc_browser::HvscCategory,
+) -> String {
+    let mut b = crate::hvsc_browser::HvscBrowser::new(Some(hvsc_root.to_path_buf()));
+    b.set_category(category);
+    if let Err(e) = b.load_authors_if_needed() {
+        return format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"));
+    }
+    let rows: Vec<HvscAuthorRow<'_>> = b
+        .authors()
+        .iter()
+        .map(|a| HvscAuthorRow {
+            name: a.raw_name.as_str(),
+            display_name: a.display_name.as_str(),
+            letter: a.letter,
+            path: a.path.to_string_lossy().into_owned(),
+        })
+        .collect();
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[derive(Serialize)]
+struct HvscTuneRow {
+    path: String,
+    title: String,
+    author: String,
+    released: String,
+    songs: u16,
+    selected_song: u16,
+    is_rsid: bool,
+    num_sids: usize,
+    duration_secs: Option<u32>,
+    md5: Option<String>,
+    has_stil: bool,
+}
+
+/// Walk the requested author folder and enumerate every SID/MUS tune.
+/// Called from the HTTP thread — takes tens of ms for typical authors.
+///
+/// Duration lookup is skipped in this first pass (needs an Arc-shared
+/// SonglengthDb which we haven't threaded through yet); the mobile UI
+/// picks it up from `/api/status` after playback starts.
+fn list_hvsc_tunes(
+    hvsc_root: &std::path::Path,
+    category: crate::hvsc_browser::HvscCategory,
+    author_name: &str,
+) -> String {
+    let mut b = crate::hvsc_browser::HvscBrowser::new(Some(hvsc_root.to_path_buf()));
+    b.set_category(category);
+    if b.load_authors_if_needed().is_err() {
+        return "[]".to_string();
+    }
+    let idx = match b.authors().iter().position(|a| a.raw_name == author_name) {
+        Some(i) => i,
+        None => return "[]".to_string(),
+    };
+    b.select_author(idx, None, None);
+    let rows: Vec<HvscTuneRow> = b
+        .tunes()
+        .iter()
+        .map(|t| HvscTuneRow {
+            path: t.entry.path.to_string_lossy().into_owned(),
+            title: t.entry.title.clone(),
+            author: t.entry.author.clone(),
+            released: t.entry.released.clone(),
+            songs: t.entry.songs,
+            selected_song: t.entry.selected_song,
+            is_rsid: t.entry.is_rsid,
+            num_sids: t.entry.num_sids,
+            duration_secs: t.entry.duration_secs,
+            md5: t.entry.md5.clone(),
+            has_stil: t.has_stil,
+        })
+        .collect();
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Embedded Web UI
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -305,14 +666,61 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   .state-dot.playing { background:#5cb870; box-shadow:0 0 6px #5cb870; }
   .state-dot.paused { background:#c8a030; }
   .state-dot.stopped { background:#505860; }
+  .heart { background:none; border:none; color:#607080; font-size:22px; cursor:pointer;
+    padding:0 8px; vertical-align:middle; }
+  .heart.on { color:#ff5f7a; }
+  .track .heart { font-size:16px; padding:2px 8px; }
+  .extras { display:flex; align-items:center; justify-content:center; gap:14px;
+    padding:8px 16px; font-size:12px; color:#8090a0; flex-wrap:wrap; }
+  .extras select, .extras input[type="range"] { background:#1a1e26; color:#c8ccd0;
+    border:1px solid #2a2e36; border-radius:4px; padding:4px 6px; font-size:12px; }
+  .extras input[type="range"] { padding:0; width:120px; }
+  .sleep-countdown { color:#c8a030; font-family:ui-monospace,monospace; font-size:12px; }
+  .banner { padding:8px 16px; background:#2a1e0a; border-bottom:1px solid #3a2a10;
+    color:#e8b060; font-size:13px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .banner button { background:none; border:1px solid #6a4a20; color:#e8b060;
+    padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px; }
+  .banner button:hover { background:#3a2a10; }
+  .lib-toggle { display:block; margin:8px auto 0; background:none;
+    border:1px solid #2a2e36; color:#8090a0; padding:6px 14px;
+    border-radius:6px; font-size:12px; cursor:pointer; }
+  .lib-toggle:hover { background:#1a1e26; color:#5cb870; }
+  .lib { border-top:1px solid #2a2e36; border-bottom:1px solid #2a2e36;
+    background:#141821; padding:8px 12px; margin-top:8px; }
+  .lib-tabs { display:flex; gap:8px; margin-bottom:8px; }
+  .lib-tab { flex:1; padding:6px; background:#1a1e26; border:1px solid #2a2e36;
+    color:#8090a0; border-radius:4px; cursor:pointer; font-size:12px;
+    text-align:center; }
+  .lib-tab.active { background:#1c2e22; border-color:#3a7; color:#5cb870; }
+  .lib-list { max-height:280px; overflow-y:auto; }
+  .lib-row { padding:8px; border-bottom:1px solid #1a1e26; cursor:pointer;
+    display:flex; justify-content:space-between; gap:8px; align-items:center; }
+  .lib-row:hover { background:#1a1e26; }
+  .lib-row .lib-name { flex:1; font-size:13px; color:#c8ccd0; }
+  .lib-row .lib-meta { font-size:11px; color:#607080; flex-shrink:0; }
+  .lib-back { padding:6px 0; color:#5cb870; cursor:pointer; font-size:12px; }
+  .lib-back:hover { text-decoration:underline; }
+  .lib-cat { display:flex; gap:6px; margin-bottom:6px; }
+  .lib-cat button { flex:1; padding:4px; background:#1a1e26; border:1px solid #2a2e36;
+    color:#8090a0; border-radius:4px; cursor:pointer; font-size:11px; }
+  .lib-cat button.on { background:#1c2e22; border-color:#3a7; color:#5cb870; }
+  .lib-empty { padding:20px; text-align:center; color:#607080; font-size:12px; }
 </style>
 </head>
 <body>
 
 <div class="header"><h1>PHOSPHOR</h1></div>
 
+<div class="banner" id="pub-banner" style="display:none;">
+  <span id="pub-banner-text"></span>
+  <button onclick="restoreDefault()">Restore my playlist</button>
+</div>
+
 <div class="now-playing" id="np">
-  <div class="np-title" id="np-title">—</div>
+  <div class="np-title">
+    <span id="np-title">—</span>
+    <button class="heart" id="np-heart" onclick="toggleFavCurrent()" title="Favourite">&#9825;</button>
+  </div>
   <div class="np-author" id="np-author"></div>
   <div class="np-info" id="np-info"></div>
 </div>
@@ -324,6 +732,50 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button onclick="cmd('stop')" title="Stop">&#9209;</button>
   <button onclick="cmd('pause')" title="Play/Pause" id="pp-btn">&#9208;</button>
   <button onclick="cmd('next')" title="Next">&#9197;</button>
+  <button onclick="cmd('surprise')" title="Surprise me — random HVSC tune">&#127922;</button>
+</div>
+
+<div class="extras">
+  <label>&#128554;
+    <select id="sleep" onchange="setSleep(this.value)">
+      <option value="0">Off</option>
+      <option value="15">15 min</option>
+      <option value="30">30 min</option>
+      <option value="60">60 min</option>
+    </select>
+    <span class="sleep-countdown" id="sleep-cd"></span>
+  </label>
+  <label>&#128266;
+    <input type="range" id="vol" min="0" max="100" step="1" value="100"
+      oninput="setVolume(this.value)">
+  </label>
+  <button onclick="cmd('shuffle')" id="shuf-btn" title="Shuffle"
+    style="background:none;border:1px solid #2a2e36;color:#8090a0;padding:4px 8px;border-radius:4px;cursor:pointer;">&#128256;</button>
+  <button onclick="cmd('repeat')" id="rep-btn" title="Repeat"
+    style="background:none;border:1px solid #2a2e36;color:#8090a0;padding:4px 8px;border-radius:4px;cursor:pointer;">&#8634; Off</button>
+</div>
+
+<button class="lib-toggle" onclick="toggleLibrary()" id="lib-toggle-btn">&#128218; Library</button>
+
+<div class="lib" id="lib" style="display:none;">
+  <div class="lib-tabs">
+    <div class="lib-tab active" id="lt-pl" onclick="showLibTab('pl')">&#128203; Playlists</div>
+    <div class="lib-tab" id="lt-hv" onclick="showLibTab('hv')">&#128194; HVSC</div>
+  </div>
+
+  <div id="lib-pl">
+    <div class="lib-list" id="lib-pl-list"></div>
+  </div>
+
+  <div id="lib-hv" style="display:none;">
+    <div class="lib-cat">
+      <button class="on" data-cat="musicians" onclick="setHvscCat('musicians')">Musicians</button>
+      <button data-cat="demos" onclick="setHvscCat('demos')">Demos</button>
+      <button data-cat="games" onclick="setHvscCat('games')">Games</button>
+    </div>
+    <div id="lib-hv-crumb" class="lib-back" onclick="hvBack()" style="display:none;">&#8592; Back to authors</div>
+    <div class="lib-list" id="lib-hv-list"></div>
+  </div>
 </div>
 
 <div class="search"><input id="q" placeholder="Search playlist..." oninput="onSearch()"></div>
@@ -332,10 +784,180 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
 
 <script>
 let entries=[], status={}, curIdx=null, total=0, loading=false, searchTimer=null;
+let volDebounce=null;
 
 async function cmd(c){
   await fetch('/api/'+c,{method:'POST'});
   setTimeout(poll,150);
+}
+
+async function toggleFavCurrent(){
+  await fetch('/api/favorite/current',{method:'POST'});
+  setTimeout(poll,150);
+  setTimeout(()=>loadPlaylist(false),200);
+}
+
+async function toggleFav(idx,ev){
+  ev.stopPropagation();
+  await fetch('/api/favorite/'+idx,{method:'POST'});
+  setTimeout(()=>loadPlaylist(false),150);
+}
+
+async function setSleep(mins){
+  await fetch('/api/sleep/'+mins,{method:'POST'});
+  setTimeout(poll,150);
+}
+
+function setVolume(pct){
+  clearTimeout(volDebounce);
+  const v=(pct/100).toFixed(2);
+  volDebounce=setTimeout(()=>{
+    fetch('/api/volume/'+v,{method:'POST'});
+  },100);
+}
+
+async function restoreDefault(){
+  await fetch('/api/library/playlists/restore',{method:'POST'});
+  setTimeout(poll,300);
+  setTimeout(()=>loadPlaylist(false),500);
+}
+
+// ── Library panel ─────────────────────────────────────────────
+let libOpen=false, hvscCat='musicians', hvscAuthor=null;
+
+function toggleLibrary(){
+  libOpen=!libOpen;
+  document.getElementById('lib').style.display=libOpen?'block':'none';
+  document.getElementById('lib-toggle-btn').textContent=libOpen?'✕ Close Library':'\u{1F4DA} Library';
+  if(libOpen){
+    loadLibPlaylists();
+  }
+}
+
+function showLibTab(which){
+  document.getElementById('lt-pl').classList.toggle('active',which==='pl');
+  document.getElementById('lt-hv').classList.toggle('active',which==='hv');
+  document.getElementById('lib-pl').style.display=which==='pl'?'block':'none';
+  document.getElementById('lib-hv').style.display=which==='hv'?'block':'none';
+  if(which==='hv'&&!hvscAuthor){loadHvscAuthors();}
+}
+
+async function loadLibPlaylists(){
+  const el=document.getElementById('lib-pl-list');
+  el.innerHTML='<div class="lib-empty">Loading playlists…</div>';
+  try{
+    const r=await fetch('/api/library/playlists');
+    const list=await r.json();
+    if(!list||list.length===0){
+      el.innerHTML='<div class="lib-empty">No playlists synced yet.<br>Open Phosphor → Library → Playlists → Sync.</div>';
+      return;
+    }
+    el.innerHTML=list.map(p=>{
+      const name=esc(p.name||p.file);
+      const desc=p.description?'<div style="font-size:11px;color:#607080;margin-top:2px;">'+esc(p.description)+'</div>':'';
+      const tracks=p.tracks?p.tracks+' tracks':'';
+      return '<div class="lib-row" onclick="loadPub(\''+esc(p.file)+'\')">'+
+        '<div><div class="lib-name">'+name+'</div>'+desc+'</div>'+
+        '<span class="lib-meta">'+tracks+'</span></div>';
+    }).join('');
+  }catch(e){
+    el.innerHTML='<div class="lib-empty">Failed to load: '+esc(e.message||'error')+'</div>';
+  }
+}
+
+async function loadPub(file){
+  const body=JSON.stringify({file:file});
+  await fetch('/api/library/playlists/load',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:body});
+  toggleLibrary();
+  setTimeout(poll,400);
+  setTimeout(()=>loadPlaylist(false),600);
+}
+
+function setHvscCat(cat){
+  hvscCat=cat;
+  hvscAuthor=null;
+  document.querySelectorAll('.lib-cat button').forEach(b=>{
+    b.classList.toggle('on',b.dataset.cat===cat);
+  });
+  loadHvscAuthors();
+}
+
+async function loadHvscAuthors(){
+  hvscAuthor=null;
+  document.getElementById('lib-hv-crumb').style.display='none';
+  const el=document.getElementById('lib-hv-list');
+  el.innerHTML='<div class="lib-empty">Loading authors…</div>';
+  try{
+    const r=await fetch('/api/library/hvsc/authors?category='+hvscCat);
+    const list=await r.json();
+    if(list.error){
+      el.innerHTML='<div class="lib-empty">'+esc(list.error)+'</div>';
+      return;
+    }
+    if(!list||list.length===0){
+      el.innerHTML='<div class="lib-empty">No authors found. Is HVSC synced?</div>';
+      return;
+    }
+    el.innerHTML=list.map(a=>{
+      return '<div class="lib-row" onclick="loadHvscTunes(\''+esc(a.name).replace(/\'/g,"&#39;")+'\')">'+
+        '<div class="lib-name">'+esc(a.display_name||a.name)+'</div>'+
+        '<span class="lib-meta">'+esc(String(a.letter||''))+'</span></div>';
+    }).join('');
+  }catch(e){
+    el.innerHTML='<div class="lib-empty">Failed to load</div>';
+  }
+}
+
+async function loadHvscTunes(author){
+  hvscAuthor=author;
+  document.getElementById('lib-hv-crumb').style.display='block';
+  document.getElementById('lib-hv-crumb').textContent='← '+author.replace(/_/g,' ');
+  const el=document.getElementById('lib-hv-list');
+  el.innerHTML='<div class="lib-empty">Loading tunes…</div>';
+  try{
+    const r=await fetch('/api/library/hvsc/tunes?category='+hvscCat+
+      '&author='+encodeURIComponent(author));
+    const list=await r.json();
+    if(!list||list.length===0){
+      el.innerHTML='<div class="lib-empty">No tunes.</div>';
+      return;
+    }
+    el.innerHTML=list.map(t=>{
+      const dur=t.duration_secs?fmtTime(t.duration_secs):'';
+      const meta=(t.songs>1?'['+t.selected_song+'/'+t.songs+'] ':'')+
+        (t.is_rsid?'RSID':'PSID')+(dur?' · '+dur:'');
+      const p=esc(t.path).replace(/\'/g,"&#39;");
+      return '<div class="lib-row" onclick="playHvsc(\''+p+'\')">'+
+        '<div><div class="lib-name">'+esc(t.title)+'</div>'+
+        '<div style="font-size:11px;color:#607080;">'+meta+'</div></div>'+
+        '<button onclick="addHvsc(\''+p+'\',event)" style="background:none;border:1px solid #2a2e36;color:#5cb870;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;">+</button>'+
+        '</div>';
+    }).join('');
+  }catch(e){
+    el.innerHTML='<div class="lib-empty">Failed to load</div>';
+  }
+}
+
+function hvBack(){
+  loadHvscAuthors();
+}
+
+async function playHvsc(path){
+  const body=JSON.stringify({path:path});
+  await fetch('/api/library/hvsc/play',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:body});
+  toggleLibrary();
+  setTimeout(poll,400);
+  setTimeout(()=>loadPlaylist(false),600);
+}
+
+async function addHvsc(path,ev){
+  ev.stopPropagation();
+  const body=JSON.stringify({path:path});
+  await fetch('/api/library/hvsc/add',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:body});
+  setTimeout(()=>loadPlaylist(false),200);
 }
 
 async function poll(){
@@ -358,6 +980,55 @@ async function poll(){
     document.getElementById('pp-btn').innerHTML=
       status.state==='playing'?'\u23F8':'\u25B6';
     if(status.current_index!==curIdx){curIdx=status.current_index;highlightCurrent();}
+    // Heart button (♥/♡) reflects current-track favourite state
+    const heart=document.getElementById('np-heart');
+    if(heart){
+      heart.innerHTML=status.is_favorite?'♥':'♡';
+      heart.classList.toggle('on',!!status.is_favorite);
+    }
+    // Shuffle + repeat toggle button state
+    const shufBtn=document.getElementById('shuf-btn');
+    if(shufBtn){
+      shufBtn.style.color=status.shuffle?'#5cb870':'#8090a0';
+      shufBtn.style.borderColor=status.shuffle?'#3a7':'#2a2e36';
+    }
+    const repBtn=document.getElementById('rep-btn');
+    if(repBtn){
+      const rep=status.repeat||'off';
+      repBtn.innerHTML='↻ '+rep.charAt(0).toUpperCase()+rep.slice(1);
+      repBtn.style.color=rep!=='off'?'#5cb870':'#8090a0';
+      repBtn.style.borderColor=rep!=='off'?'#3a7':'#2a2e36';
+    }
+    // Volume slider (only sync if not being edited)
+    const vol=document.getElementById('vol');
+    if(vol&&document.activeElement!==vol&&status.master_volume!==undefined){
+      vol.value=Math.round(status.master_volume*100);
+    }
+    // Sleep timer state
+    const sleepSel=document.getElementById('sleep');
+    if(sleepSel&&document.activeElement!==sleepSel){
+      sleepSel.value=String(status.sleep_selected_mins||0);
+    }
+    const cd=document.getElementById('sleep-cd');
+    if(cd){
+      if(status.sleep_remaining_secs!==null&&status.sleep_remaining_secs!==undefined){
+        cd.textContent=' '+fmtTime(status.sleep_remaining_secs);
+      }else{
+        cd.textContent='';
+      }
+    }
+    // Active-published banner
+    const banner=document.getElementById('pub-banner');
+    if(banner){
+      if(status.active_published_playlist){
+        banner.style.display='flex';
+        const name=status.active_published_playlist.replace(/\.m3u$/,'').replace(/_/g,' ');
+        document.getElementById('pub-banner-text').textContent=
+          '\u{1F4CC} Playing published: '+name;
+      }else{
+        banner.style.display='none';
+      }
+    }
   }catch(e){}
 }
 
@@ -394,11 +1065,15 @@ function renderList(totalAll){
   el.innerHTML=entries.map(t=>{
     const active=t.index===curIdx?'active':'';
     const dur=t.duration?fmtTime(t.duration):'';
+    const favClass=t.is_favorite?'heart on':'heart';
+    const favGlyph=t.is_favorite?'♥':'♡';
     return '<div class="track '+active+'" onclick="cmd(\'play/'+t.index+'\')">'+
       '<span class="idx">'+(t.index+1)+'</span>'+
       '<div class="info"><div class="t-title">'+esc(t.title)+'</div>'+
       '<div class="t-author">'+esc(t.author)+'</div></div>'+
-      '<span class="dur">'+dur+'</span></div>';
+      '<span class="dur">'+dur+'</span>'+
+      '<button class="'+favClass+'" onclick="toggleFav('+t.index+',event)">'+favGlyph+'</button>'+
+      '</div>';
   }).join('');
   // Show "load more" if there are more results
   if(entries.length<total){

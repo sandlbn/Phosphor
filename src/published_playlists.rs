@@ -13,12 +13,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const RAW_BASE_URL: &str = "https://raw.githubusercontent.com/sandlbn/Phosphor/main/playlists";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PublishedPlaylistMeta {
     pub file: String,
     pub name: String,
@@ -30,7 +30,7 @@ pub struct PublishedPlaylistMeta {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Manifest {
     #[serde(default)]
     pub version: u32,

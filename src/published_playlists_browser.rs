@@ -53,6 +53,10 @@ impl PublishedPlaylistsBrowser {
             .unwrap_or(&[])
     }
 
+    pub fn manifest(&self) -> Option<&Manifest> {
+        self.manifest.as_ref()
+    }
+
     pub fn sync_in_flight(&self) -> bool {
         self.sync_in_flight
     }
