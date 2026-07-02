@@ -1,0 +1,44 @@
+# Jekyll config for the Phosphor GitHub Pages site.
+# Enable Pages in repo settings → Pages → Source: Deploy from a branch
+# → branch: main, folder: /docs.
+
+title: Phosphor
+description: A SID music player for USBSID-Pico, software emulation, and Commodore Ultimate 64.
+url: https://sandlbn.github.io
+baseurl: /Phosphor
+
+# Use the default `null` layout so Jekyll renders Markdown but applies
+# our custom layout in `_layouts/default.html`.
+theme: null
+plugins: []
+
+# Skip the README from the source repo (it lives at the repo root and
+# would otherwise collide with our own index.md).
+exclude:
+  - README.md
+  - vendor
+  - Gemfile
+  - Gemfile.lock
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+# GitHub repo links
+repo_url: https://github.com/sandlbn/Phosphor
+releases_url: https://github.com/sandlbn/Phosphor/releases
+issues_url: https://github.com/sandlbn/Phosphor/issues
+
+# Author + social meta
+author: sandlbn
+twitter_handle: ""
+
+# Treat the site as a single-page-style landing — we don't generate
+# blog post archives or RSS.
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | default: site.title }}</title>
+  <meta name="description" content="{{ site.description }}">
+
+  <!-- Open Graph / Twitter card -->
+  <meta property="og:title" content="{{ site.title }}">
+  <meta property="og:description" content="{{ site.description }}">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="{{ site.url }}{{ site.baseurl }}/">
+  <meta property="og:image" content="{{ site.url }}{{ site.baseurl }}/assets/og-card.png">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="icon" type="image/png" href="{{ site.baseurl }}/assets/phosphor.png">
+  <link rel="stylesheet" href="{{ site.baseurl }}/style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <div class="brand">
+        <img src="{{ site.baseurl }}/assets/phosphor.png" alt="" class="brand-icon">
+        <div>
+          <h1 class="brand-name">Phosphor</h1>
+          <p class="brand-tag">SID player · USBSID-Pico · Ultimate 64 · emulation</p>
+        </div>
+      </div>
+      <nav class="site-nav">
+        <a href="#download">Download</a>
+        <a href="#getting-started">Get started</a>
+        <a href="#features">Features</a>
+        <a href="#library">Library</a>
+        <a href="#shortcuts">Shortcuts</a>
+        <a href="{{ site.repo_url }}">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    {{ content }}
+  </main>
+
+  <script>
+    // Resolve the "Download" section's buttons to actual asset URLs from
+    // the latest release. Falls back silently to the /releases/latest
+    // links already in the HTML if the fetch fails (offline / rate-limit).
+    (async function () {
+      const versionEl = document.getElementById('dl-version-line');
+      try {
+        const r = await fetch(
+          'https://api.github.com/repos/sandlbn/Phosphor/releases/latest',
+          { headers: { Accept: 'application/vnd.github+json' } }
+        );
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rel = await r.json();
+        // Skip the macOS *Uninstaller.pkg* (companion asset used to remove
+        // Phosphor + LaunchDaemon) and any other clearly non-install
+        // artefacts. Same filter applies to every platform.
+        const assets = (rel.assets || []).filter(
+          a => !/uninstall/i.test(a.name)
+        );
+        // Priority patterns per platform. First matching asset wins.
+        const patterns = {
+          macos:   [/\.pkg$/i],
+          windows: [/setup\.exe$/i, /installer.*\.exe$/i, /\.msi$/i, /\.exe$/i, /-win.*\.zip$/i],
+          linux:   [/\.deb$/i, /\.appimage$/i, /-linux.*\.tar\.gz$/i, /-linux.*\.zip$/i],
+        };
+        for (const platform of Object.keys(patterns)) {
+          const btn = document.querySelector(`a[data-dl="${platform}"]`);
+          const ext = document.querySelector(`[data-ext="${platform}"]`);
+          const asset = patterns[platform]
+            .map(rx => assets.find(a => rx.test(a.name)))
+            .find(Boolean);
+          if (btn && asset) {
+            btn.href = asset.browser_download_url;
+            btn.textContent = 'Download ' + asset.name;
+            if (ext) ext.textContent = asset.name;
+          }
+        }
+        if (versionEl) {
+          versionEl.innerHTML =
+            'Latest release: <strong style="color: var(--phosphor);">' +
+            (rel.tag_name || rel.name) +
+            '</strong> · <a href="' + rel.html_url + '">release notes ↗</a>';
+        }
+      } catch (e) {
+        if (versionEl) {
+          versionEl.innerHTML =
+            'Prebuilt binaries on the <a href="https://github.com/sandlbn/Phosphor/releases/latest">Releases page</a>.';
+        }
+      }
+    })();
+  </script>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <p>
+        Phosphor is open source — <a href="{{ site.repo_url }}">github.com/sandlbn/Phosphor</a>.
+        Bug reports and contributions welcome on the
+        <a href="{{ site.issues_url }}">issue tracker</a>.
+      </p>
+      <p class="dim">
+        SID emulation via reSID and libsidplayfp. Hardware playback via
+        <a href="https://github.com/LouDnl/USBSID-Pico">USBSID-Pico</a>
+        and <a href="https://ultimate64.com/">Ultimate 64</a>.
+      </p>
+    </div>
+  </footer>
+</body>
+</html>

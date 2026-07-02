@@ -179,6 +179,16 @@ struct App {
     /// when the user clicks Apply (avoids touching live HTTP clients
     /// on every keystroke).
     proxy_url_text: String,
+    /// First-run welcome card. Shown on cold launch when
+    /// `!config.has_seen_welcome`; hidden as soon as the user picks any
+    /// action or clicks Skip.
+    show_welcome: bool,
+    /// Sleep timer — Instant at which playback should auto-stop.
+    /// None → timer disabled. Session-only (not persisted).
+    sleep_deadline: Option<Instant>,
+    /// Configured duration for the current sleep timer, so the UI can
+    /// render "Sleep in 15 min" even after the deadline drifts.
+    sleep_selected_mins: Option<u32>,
     /// Status message shown below the Songlength download button.
     download_status: String,
     /// Combined status for auto-downloads shown in the search bar.
@@ -466,6 +476,7 @@ impl App {
         let auto_hvsc_base = config.hvsc_rsync_url.clone();
         let auto_last_sl_file = config.last_songlength_file.clone();
         let auto_last_stil_file = config.last_stil_file.clone();
+        let initial_show_welcome = !config.has_seen_welcome;
 
         let app = Self {
             cmd_tx,
@@ -489,6 +500,9 @@ impl App {
             default_length_text,
             base_font_size_text,
             proxy_url_text,
+            show_welcome: initial_show_welcome,
+            sleep_deadline: None,
+            sleep_selected_mins: None,
             download_status: String::new(),
             auto_download_status: String::new(),
             pending_auto_downloads: 0,
@@ -1692,6 +1706,17 @@ impl App {
                 self.tick = self.tick.wrapping_add(1);
                 self.poll_status();
 
+                // Sleep-timer expiry: stop playback once we cross the deadline,
+                // then clear the timer so it doesn't fire repeatedly.
+                if let Some(deadline) = self.sleep_deadline {
+                    if Instant::now() >= deadline {
+                        eprintln!("[sleep] timer expired — stopping playback");
+                        self.sleep_deadline = None;
+                        self.sleep_selected_mins = None;
+                        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                    }
+                }
+
                 // Feed tracker history every tick while playing.
                 if self.status.state == PlayState::Playing {
                     let num_sids = self
@@ -1900,6 +1925,41 @@ impl App {
             Message::DismissHelp => {
                 self.show_help = false;
             }
+
+            // ── First-run welcome card ────────────────────────────────────
+            Message::WelcomeSyncHvsc => {
+                self.show_welcome = false;
+                self.config.has_seen_welcome = true;
+                self.config.save();
+                // Reuse the existing sync toggle handler.
+                return iced::Task::done(Message::HvscRsyncStart);
+            }
+            Message::WelcomeOpenLibrary => {
+                self.show_welcome = false;
+                self.config.has_seen_welcome = true;
+                self.config.save();
+                return iced::Task::done(Message::ToggleHvscBrowser);
+            }
+            Message::WelcomeDismiss => {
+                self.show_welcome = false;
+                self.config.has_seen_welcome = true;
+                self.config.save();
+            }
+
+            // ── Sleep timer ──────────────────────────────────────────────
+            Message::SetSleepTimer(mins) => match mins {
+                Some(m) if m > 0 => {
+                    self.sleep_deadline =
+                        Some(Instant::now() + Duration::from_secs((m as u64) * 60));
+                    self.sleep_selected_mins = Some(m);
+                    eprintln!("[sleep] armed for {m} min");
+                }
+                _ => {
+                    self.sleep_deadline = None;
+                    self.sleep_selected_mins = None;
+                    eprintln!("[sleep] disarmed");
+                }
+            },
 
             Message::ToggleFavoriteCurrent => {
                 if let Some(cur_idx) = self.playlist.current {
@@ -2858,14 +2918,18 @@ impl App {
         );
         // Alarm the Library button (rotating red ring) when HVSC is unconfigured
         // or its root path no longer exists on disk. Silenced while a sync is
-        // in flight — the panel itself shows progress in that case.
+        // in flight — the panel itself shows progress in that case — and
+        // silenced permanently once the user has dismissed the first-run
+        // welcome card (the intro told them where the Library lives, so
+        // continued pulsing is just noise).
         let hvsc_needs_attention = self
             .config
             .hvsc_root
             .as_ref()
             .map(|p| !std::path::Path::new(p).exists())
             .unwrap_or(true)
-            && self.hvsc_sync.is_none();
+            && self.hvsc_sync.is_none()
+            && !self.config.has_seen_welcome;
         let controls = ui::controls_bar(
             &self.status,
             &self.playlist,
@@ -2905,6 +2969,7 @@ impl App {
                 self.hvsc_sync.is_some(),
                 &self.hvsc_sync_status,
                 self.hvsc_sync_progress,
+                self.sleep_selected_mins,
             );
             column![
                 info_bar,
@@ -3089,6 +3154,8 @@ impl App {
             .on_press(Message::Noop)
             .on_right_press(Message::Noop)
             .into()
+        } else if self.show_welcome {
+            ui::welcome_overlay(self.config.hvsc_root.is_some())
         } else if self.show_help {
             ui::help_overlay()
         } else if self.show_stil_overlay

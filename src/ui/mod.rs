@@ -240,6 +240,14 @@ pub enum Message {
     ToggleFavoriteCurrent, // keyboard shortcut H — fav current track
     ShowHelp,
     DismissHelp,
+    /// First-run welcome card actions. Setting `has_seen_welcome=true`
+    /// happens in every one so it's a one-shot.
+    WelcomeSyncHvsc,
+    WelcomeOpenLibrary,
+    WelcomeDismiss,
+    /// Sleep-timer picker on the toolbar. `None` disables the timer;
+    /// `Some(mins)` starts a fresh countdown.
+    SetSleepTimer(Option<u32>),
     HvscUpdateAvailable(String), // description string e.g. "HVSC v85 available"
     HvscCheckDone(Result<u32, String>), // remote version result
     Noop,
@@ -2825,6 +2833,8 @@ pub fn settings_panel<'a>(
     hvsc_sync_status: &'a str,
     // Optional (files_done, files_total) — rendered as a progress bar.
     hvsc_sync_progress: Option<(u32, u32)>,
+    // Currently-armed sleep timer duration (minutes). `None` = disabled.
+    sleep_selected_mins: Option<u32>,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -3046,6 +3056,63 @@ pub fn settings_panel<'a>(
     } else {
         Color::from_rgb(0.45, 0.47, 0.52)
     };
+    // ── Sleep timer ─────────────────────────────────────────────────
+    let sleep_button = |mins: Option<u32>, label: &'a str| -> Element<'a, Message> {
+        let is_selected = sleep_selected_mins == mins;
+        button(text(label).size(font::sized(12.0)))
+            .on_press(Message::SetSleepTimer(mins))
+            .padding(Padding::from([6, 12]))
+            .style(move |_t: &Theme, st| {
+                let bg = if is_selected {
+                    Color::from_rgb(0.20, 0.45, 0.28)
+                } else {
+                    match st {
+                        button::Status::Hovered => Color::from_rgb(0.24, 0.27, 0.32),
+                        _ => Color::from_rgb(0.16, 0.19, 0.24),
+                    }
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: if is_selected {
+                        Color::from_rgb(0.92, 1.0, 0.95)
+                    } else {
+                        Color::from_rgb(0.85, 0.87, 0.9)
+                    },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        width: 1.0,
+                        color: if is_selected {
+                            Color::from_rgb(0.30, 0.60, 0.38)
+                        } else {
+                            Color::from_rgb(0.28, 0.31, 0.36)
+                        },
+                    },
+                    ..Default::default()
+                }
+            })
+            .into()
+    };
+    let sleep_status_text = match sleep_selected_mins {
+        None => "Playback keeps going until you stop it.".to_string(),
+        Some(m) => format!("Playback will stop automatically after ~{m} min."),
+    };
+    let sleep_section = column![
+        text("Sleep timer:")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        row![
+            sleep_button(None, "Off"),
+            sleep_button(Some(15), "15 min"),
+            sleep_button(Some(30), "30 min"),
+            sleep_button(Some(60), "60 min"),
+        ]
+        .spacing(8),
+        text(sleep_status_text)
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
+
     let proxy_section = column![
         text("HTTP proxy:")
             .size(font::sized(14.0))
@@ -3371,6 +3438,8 @@ pub fn settings_panel<'a>(
         length_section,
         rule::horizontal(1),
         font_size_section,
+        rule::horizontal(1),
+        sleep_section,
         rule::horizontal(1),
         proxy_section,
         rule::horizontal(1),
@@ -3802,6 +3871,166 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
         .center_y(Length::Fill);
 
     iced::widget::stack![dismiss, centred]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  First-run welcome overlay
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full-screen modal shown once per install. Three primary paths + a
+/// dismiss link. Any action sets `config.has_seen_welcome = true` so
+/// the card doesn't reappear next launch.
+pub fn welcome_overlay<'a>(hvsc_configured: bool) -> Element<'a, Message> {
+    let bg = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::WelcomeDismiss);
+
+    let heading = text("Welcome to Phosphor")
+        .size(font::sized(28.0))
+        .color(Color::from_rgb(0.35, 1.0, 0.55));
+
+    let sub = text("A SID music player for USBSID-Pico, software emulation, and Ultimate 64.")
+        .size(font::sized(13.0))
+        .color(Color::from_rgb(0.65, 0.68, 0.75));
+
+    let sync_label = if hvsc_configured {
+        "⬇ Re-sync HVSC now"
+    } else {
+        "⬇ Sync HVSC now  (recommended)"
+    };
+    let sync_hint = if hvsc_configured {
+        "You already have an HVSC tree configured. Re-sync to fetch the latest additions."
+    } else {
+        "Downloads the High Voltage SID Collection (~1 GB) in the background. \
+         You can start listening as soon as the first files land."
+    };
+
+    let sync_card = column![
+        text(sync_label)
+            .size(font::sized(16.0))
+            .color(Color::from_rgb(0.35, 1.0, 0.55)),
+        text(sync_hint)
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.60, 0.62, 0.70)),
+        button(
+            text("Start sync")
+                .size(font::sized(13.0))
+                .color(Color::from_rgb(0.92, 1.0, 0.95))
+        )
+        .on_press(Message::WelcomeSyncHvsc)
+        .padding(Padding::from([8, 20]))
+        .style(|_t: &Theme, st| {
+            let bg = match st {
+                button::Status::Hovered => Color::from_rgb(0.22, 0.55, 0.32),
+                _ => Color::from_rgb(0.15, 0.45, 0.25),
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                text_color: Color::from_rgb(0.92, 1.0, 0.95),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.20, 0.60, 0.30),
+                },
+                ..Default::default()
+            }
+        }),
+    ]
+    .spacing(8)
+    .padding(Padding::from([16, 20]));
+
+    let library_card = column![
+        text("📚 Open Library")
+            .size(font::sized(15.0))
+            .color(Color::from_rgb(0.85, 0.87, 0.90)),
+        text(
+            "Browse local HVSC, search Assembly64 live, or load a curated \
+             playlist. You can also press L any time to open it."
+        )
+        .size(font::sized(11.0))
+        .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        button(text("Open the Library panel").size(font::sized(12.0)),)
+            .on_press(Message::WelcomeOpenLibrary)
+            .padding(Padding::from([6, 16]))
+            .style(|_t: &Theme, st| {
+                let bg = match st {
+                    button::Status::Hovered => Color::from_rgb(0.24, 0.27, 0.32),
+                    _ => Color::from_rgb(0.16, 0.19, 0.24),
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: Color::from_rgb(0.85, 0.87, 0.9),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.28, 0.31, 0.36),
+                    },
+                    ..Default::default()
+                }
+            }),
+    ]
+    .spacing(6)
+    .padding(Padding::from([12, 20]));
+
+    let footer = row![
+        text("Or ")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.55)),
+        button(
+            text("skip for now")
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.65, 0.68, 0.75))
+        )
+        .on_press(Message::WelcomeDismiss)
+        .padding(Padding::from([2, 4]))
+        .style(|_t: &Theme, _st| button::Style {
+            background: None,
+            text_color: Color::from_rgb(0.65, 0.68, 0.75),
+            border: iced::Border::default(),
+            ..Default::default()
+        }),
+        text(" — you can find these later in Settings and the Library button.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.55)),
+    ]
+    .align_y(Alignment::Center);
+
+    let card = container(
+        column![
+            heading,
+            sub,
+            Space::new().height(Length::Fixed(12.0)),
+            sync_card,
+            Space::new().height(Length::Fixed(4.0)),
+            library_card,
+            Space::new().height(Length::Fixed(8.0)),
+            footer,
+        ]
+        .spacing(4)
+        .padding(Padding::from([28, 32])),
+    )
+    .max_width(560.0)
+    .style(|_t: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(
+            0.07, 0.09, 0.13, 0.98,
+        ))),
+        border: iced::Border {
+            radius: 10.0.into(),
+            width: 1.0,
+            color: Color::from_rgb(0.22, 0.25, 0.32),
+        },
+        ..Default::default()
+    });
+
+    let centred = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+
+    iced::widget::stack![bg, centred]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
