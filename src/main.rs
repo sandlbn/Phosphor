@@ -1783,7 +1783,11 @@ impl App {
                 // ── Remote control ──────────────────────────────────────
                 if self.http_remote_running {
                     self.update_remote_state();
-                    self.poll_remote_commands();
+                    let t = self.poll_remote_commands();
+                    // A returned task means the remote enqueued an op
+                    // that needs to re-enter update() (Surprise / load /
+                    // restore). Fire it before we return.
+                    return t;
                 }
             }
 
@@ -3928,6 +3932,23 @@ impl App {
     fn update_remote_state(&self) {
         if let Ok(mut rs) = self.remote_state.try_lock() {
             let info = self.status.track_info.as_ref();
+
+            let current_md5 = self.playlist.current_entry().and_then(|e| e.md5.as_deref());
+            let is_favorite_current = current_md5
+                .map(|m| self.favorites.hashes.contains(m))
+                .unwrap_or(false);
+
+            // Sleep timer countdown — seconds until deadline. `None` when
+            // no timer is armed.
+            let sleep_remaining_secs = self
+                .sleep_deadline
+                .map(|dl| dl.saturating_duration_since(Instant::now()).as_secs() as u32);
+
+            let active_published_playlist = match &self.session_mode {
+                SessionMode::PublishedReadOnly { file } => Some(file.clone()),
+                _ => None,
+            };
+
             rs.status = remote::RemoteStatus {
                 state: match self.status.state {
                     PlayState::Playing => "playing",
@@ -3951,11 +3972,33 @@ impl App {
                 sid_type: info.map(|i| i.sid_type.clone()).unwrap_or_default(),
                 is_pal: info.map(|i| i.is_pal).unwrap_or(true),
                 engine: self.config.output_engine.clone(),
+                is_favorite: is_favorite_current,
+                master_volume: self.config.master_volume,
+                shuffle: self.playlist.shuffle,
+                repeat: match self.playlist.repeat {
+                    playlist::RepeatMode::Off => "off",
+                    playlist::RepeatMode::All => "all",
+                    playlist::RepeatMode::Single => "one",
+                }
+                .to_string(),
+                sleep_selected_mins: self.sleep_selected_mins,
+                sleep_remaining_secs,
+                hvsc_sync_active: self.hvsc_sync.is_some(),
+                hvsc_sync_progress: self.hvsc_sync_progress.map(|(done, total)| [done, total]),
+                active_published_playlist,
             };
 
-            // Only rebuild playlist snapshot when entries change.
-            let version = self.playlist.len() as u64;
+            // Snapshot hvsc_root + published manifest for the library
+            // browse endpoints on the HTTP thread.
+            rs.hvsc_root = self.config.hvsc_root.clone().map(PathBuf::from);
+            rs.published_manifest = self.published_playlists_browser.manifest().cloned();
+
+            // Rebuild playlist snapshot when entries OR favourites change.
+            // We stuff both into one epoch so the version check catches both.
+            let favs_epoch = self.favorites.hashes.len() as u64;
+            let version = ((self.playlist.len() as u64) << 32) | favs_epoch;
             if rs.playlist_version != version {
+                let fav_set = &self.favorites.hashes;
                 rs.playlist = self
                     .playlist
                     .entries
@@ -3968,6 +4011,11 @@ impl App {
                         duration: e.duration_secs,
                         num_sids: e.num_sids,
                         is_rsid: e.is_rsid,
+                        is_favorite: e
+                            .md5
+                            .as_deref()
+                            .map(|m| fav_set.contains(m))
+                            .unwrap_or(false),
                     })
                     .collect();
                 rs.playlist_version = version;
@@ -3976,7 +4024,14 @@ impl App {
     }
 
     /// Process commands from the HTTP remote control server.
-    fn poll_remote_commands(&mut self) {
+    ///
+    /// Returns a `Task<Message>` batch so commands that map to a full
+    /// `Message::…` handler (Surprise / LoadPublishedPlaylist / etc.)
+    /// can trigger the same code path the desktop UI uses. Simple ops
+    /// (favourites toggle, shuffle, volume) are executed in-line and
+    /// contribute `Task::none()` to the batch.
+    fn poll_remote_commands(&mut self) -> Task<Message> {
+        let mut tasks: Vec<Task<Message>> = Vec::new();
         while let Ok(cmd) = self.remote_cmd_rx.try_recv() {
             match cmd {
                 remote::RemoteCmd::PlayTrack(idx) => {
@@ -4006,6 +4061,115 @@ impl App {
                     let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(n));
                     self.clear_advance_status();
                 }
+
+                // ── Playback QOL (in-line, no Task needed) ───────────
+                remote::RemoteCmd::ToggleFavorite(idx) => {
+                    if let Some(md5) = self.playlist.entries.get(idx).and_then(|e| e.md5.clone()) {
+                        let _ = self.favorites.toggle(&md5);
+                        self.favorites.save();
+                    }
+                }
+                remote::RemoteCmd::ToggleFavoriteCurrent => {
+                    let md5 = self.playlist.current_entry().and_then(|e| e.md5.clone());
+                    if let Some(md5) = md5 {
+                        let _ = self.favorites.toggle(&md5);
+                        self.favorites.save();
+                    }
+                }
+                remote::RemoteCmd::ToggleShuffle => {
+                    self.playlist.toggle_shuffle();
+                }
+                remote::RemoteCmd::CycleRepeat => {
+                    self.playlist.repeat = self.playlist.repeat.cycle();
+                }
+                remote::RemoteCmd::SetSleepTimer(mins) => match mins {
+                    Some(m) if m > 0 => {
+                        self.sleep_deadline =
+                            Some(Instant::now() + Duration::from_secs((m as u64) * 60));
+                        self.sleep_selected_mins = Some(m);
+                    }
+                    _ => {
+                        self.sleep_deadline = None;
+                        self.sleep_selected_mins = None;
+                    }
+                },
+                remote::RemoteCmd::SetVolume(v) => {
+                    self.config.master_volume = v.clamp(0.0, 1.0);
+                    self.config.save();
+                }
+
+                // ── Ops that reuse full Message handlers via Task::done
+                remote::RemoteCmd::Surprise => {
+                    tasks.push(Task::done(Message::HvscBrowserSurpriseMe));
+                }
+                remote::RemoteCmd::LoadPublishedPlaylist(file) => {
+                    tasks.push(Task::done(Message::PublishedPlaylistsLoad(file)));
+                }
+                remote::RemoteCmd::RestoreDefaultPlaylist => {
+                    tasks.push(Task::done(Message::PublishedPlaylistsRestoreDefault));
+                }
+
+                // ── HVSC direct play / add by absolute path ──────────
+                // Reuses the same PlaylistEntry::from_path + add_entries +
+                // songlength chain as the HvscBrowserPlayTune handler.
+                remote::RemoteCmd::HvscPlay(path) => {
+                    self.direct_hvsc_action(path, /*play=*/ true);
+                }
+                remote::RemoteCmd::HvscAdd(path) => {
+                    self.direct_hvsc_action(path, /*play=*/ false);
+                }
+            }
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
+    }
+
+    /// Realise a single SID at an absolute path (typically inside the
+    /// HVSC tree, but any path works), add it to the playlist, apply
+    /// songlengths, and optionally start playback. Shared by the two
+    /// remote `HvscPlay` / `HvscAdd` commands.
+    fn direct_hvsc_action(&mut self, path: PathBuf, play: bool) {
+        let entry = match playlist::PlaylistEntry::from_path(&path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[remote] HVSC direct action failed: {e}");
+                return;
+            }
+        };
+        let entry_path = entry.path.clone();
+        let song = entry.selected_song.max(1);
+        self.playlist.add_entries(vec![entry]);
+        if let Some(db) = self.songlength_db.as_ref() {
+            db.apply_to_playlist(
+                &mut self.playlist,
+                self.config.hvsc_root.as_deref().map(std::path::Path::new),
+            );
+        }
+        self.rebuild_filter();
+        if let Some(abs_i) = self
+            .playlist
+            .entries
+            .iter()
+            .position(|e| e.path == entry_path)
+        {
+            self.selected = Some(abs_i);
+            if play {
+                let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                    path: entry_path,
+                    song,
+                    force_stereo: self.config.force_stereo_2sid
+                        || std::env::args().any(|a| a == "--stereo"),
+                    sid4_addr: 0xd420,
+                    audio_port: if self.config.u64_audio_enabled {
+                        Some(self.config.u64_audio_port)
+                    } else {
+                        None
+                    },
+                    restart_usb_on_load: self.config.restart_usb_on_load,
+                });
             }
         }
     }
