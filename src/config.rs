@@ -60,6 +60,11 @@ pub struct Config {
     /// behaviour (env vars, etc.). Accepts `http://`, `https://`, and
     /// `socks5://` schemes; basic auth via `http://user:pass@host:port`.
     pub proxy_url: Option<String>,
+    /// True once the user has dismissed (or acted on) the first-run
+    /// welcome card. Also silences the "sync HVSC" ring animation on
+    /// the Library toolbar button — after the intro, the user knows
+    /// where to find it, so continuing to pulse is just noise.
+    pub has_seen_welcome: bool,
     /// Last HVSC version string fetched from the CDN (e.g. "HVSC #80").
     /// Used to detect when a new release is available.
     pub hvsc_known_version: Option<String>,
@@ -119,6 +124,7 @@ impl Default for Config {
             assembly64_last_query: None,
             published_playlists_last_synced: None,
             proxy_url: None,
+            has_seen_welcome: false,
             hvsc_known_version: None,
             u64_audio_enabled: false,
             u64_audio_port: 11001,
@@ -282,6 +288,9 @@ impl Config {
                 if val != "null" {
                     config.proxy_url = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"has_seen_welcome\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.has_seen_welcome = val == "true";
             } else if let Some(rest) = line.strip_prefix("\"u64_audio_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.u64_audio_enabled = val == "true";
@@ -394,6 +403,7 @@ impl Config {
                 "  \"assembly64_last_query\": {},\n",
                 "  \"published_playlists_last_synced\": {},\n",
                 "  \"proxy_url\": {},\n",
+                "  \"has_seen_welcome\": {},\n",
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
@@ -427,6 +437,7 @@ impl Config {
             fmt_opt_str(&self.assembly64_last_query),
             fmt_opt_i64(self.published_playlists_last_synced),
             fmt_opt_str(&self.proxy_url),
+            self.has_seen_welcome,
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,
