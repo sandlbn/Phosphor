@@ -830,7 +830,7 @@ impl App {
                 let menu_y = (self.playlist_viewport_y + display_pos * ui::row_height()
                     - self.playlist_scroll_offset_y
                     + ui::row_height())
-                    .max(0.0);
+                .max(0.0);
 
                 eprintln!("[phosphor] ShowContextMenu idx={idx} raw=({x:.1},{y:.1}) ratio={ratio:.2} menu=({menu_x:.1},{menu_y:.1})");
 
