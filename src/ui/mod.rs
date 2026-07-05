@@ -1106,8 +1106,11 @@ pub fn row_height() -> f32 {
 }
 
 /// Number of extra rows to render above and below the visible window.
-/// Acts as a scroll lookahead so rows don't pop in mid-scroll.
-const OVERSCAN: usize = 8;
+/// Acts as a scroll lookahead so rows don't pop in mid-scroll. Kept
+/// deliberately small — every extra row is a fresh widget tree we
+/// rebuild every frame. At smaller font sizes more rows fit into the
+/// viewport, so this constant compounds the per-frame widget count.
+const OVERSCAN: usize = 3;
 
 /// Build the scrollable playlist table with sortable column headers.
 /// `filtered_indices` maps visible row position → actual `playlist.entries` index.
@@ -1691,50 +1694,57 @@ fn playlist_row_content<'a>(
     };
     let indicator = if is_current { "▶ " } else { "  " };
 
-    let title_cell: Element<'a, Message> = if has_wds {
-        row![
-            text(title).size(font::sized(size)).color(color),
-            text(" (Karaoke)")
-                .size(font::sized(10.0))
-                .color(Color::from_rgb(0.30, 0.75, 0.45)),
-        ]
-        .spacing(4)
-        .width(Length::FillPortion(4))
-        .into()
-    } else {
-        text(title)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::FillPortion(4))
+    // Column cell wrapper: forces the text to a single line AND clips
+    // any horizontal overflow so long titles / authors can't bleed
+    // into the neighbouring column. `Length::Fill` for height lets the
+    // container inherit the fixed row height instead of doing its own
+    // intrinsic layout pass every frame.
+    let nowrap_cell = |content: Element<'a, Message>, width: Length| -> Element<'a, Message> {
+        container(content)
+            .width(width)
+            .height(Length::Fill)
+            .clip(true)
             .into()
+    };
+    let nowrap_text = |s: String, col: Color, width: Length| -> Element<'a, Message> {
+        nowrap_cell(
+            text(s)
+                .size(font::sized(size))
+                .color(col)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            width,
+        )
+    };
+
+    let title_cell: Element<'a, Message> = if has_wds {
+        nowrap_cell(
+            row![
+                text(title)
+                    .size(font::sized(size))
+                    .color(color)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                text(" (Karaoke)")
+                    .size(font::sized(10.0))
+                    .color(Color::from_rgb(0.30, 0.75, 0.45))
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(4)
+            .into(),
+            Length::FillPortion(4),
+        )
+    } else {
+        nowrap_text(title, color, Length::FillPortion(4))
     };
 
     row![
-        text(format!("{indicator}{num:>3}"))
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::Fixed(50.0)),
+        nowrap_text(format!("{indicator}{num:>3}"), color, Length::Fixed(50.0)),
         title_cell,
-        text(author)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::FillPortion(3)),
-        text(released)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::FillPortion(2)),
-        text(time)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::Fixed(55.0)),
-        text(sid_type)
-            .size(font::sized(size))
-            .color(type_color)
-            .width(Length::Fixed(42.0)),
-        text(sids)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::Fixed(45.0)),
+        nowrap_text(author, color, Length::FillPortion(3)),
+        nowrap_text(released, color, Length::FillPortion(2)),
+        nowrap_text(time, color, Length::Fixed(55.0)),
+        nowrap_text(sid_type, type_color, Length::Fixed(42.0)),
+        nowrap_text(sids, color, Length::Fixed(45.0)),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
