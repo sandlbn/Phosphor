@@ -59,6 +59,11 @@ impl HeardDb {
         }
     }
 
+    /// True if this md5 is already in the heard set.
+    pub fn contains(&self, md5: &str) -> bool {
+        self.heard.contains(&md5.trim().to_lowercase())
+    }
+
     /// Record a played MD5. Returns `true` if this was a new entry (first time
     /// hearing this track), `false` if already in the set.
     pub fn record(&mut self, md5: &str) -> bool {
