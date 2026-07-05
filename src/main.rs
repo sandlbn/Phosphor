@@ -2191,7 +2191,7 @@ impl App {
                         song,
                         force_stereo: self.config.force_stereo_2sid
                             || std::env::args().any(|a| a == "--stereo"),
-                        sid4_addr: 0xd420,
+                        sid4_addr: parse_sid4_from_args(),
                         audio_port: if self.config.u64_audio_enabled {
                             Some(self.config.u64_audio_port)
                         } else {
@@ -2242,7 +2242,7 @@ impl App {
                         song,
                         force_stereo: self.config.force_stereo_2sid
                             || std::env::args().any(|a| a == "--stereo"),
-                        sid4_addr: 0xd420,
+                        sid4_addr: parse_sid4_from_args(),
                         audio_port: if self.config.u64_audio_enabled {
                             Some(self.config.u64_audio_port)
                         } else {
@@ -2293,7 +2293,7 @@ impl App {
                             song,
                             force_stereo: self.config.force_stereo_2sid
                                 || std::env::args().any(|a| a == "--stereo"),
-                            sid4_addr: 0xd420,
+                            sid4_addr: parse_sid4_from_args(),
                             audio_port: if self.config.u64_audio_enabled {
                                 Some(self.config.u64_audio_port)
                             } else {
@@ -2466,7 +2466,7 @@ impl App {
                                 song: resolved_song,
                                 force_stereo: self.config.force_stereo_2sid
                                     || std::env::args().any(|a| a == "--stereo"),
-                                sid4_addr: 0xd420,
+                                sid4_addr: parse_sid4_from_args(),
                                 audio_port: if self.config.u64_audio_enabled {
                                     Some(self.config.u64_audio_port)
                                 } else {
@@ -2958,11 +2958,33 @@ impl App {
         let _perf = ProfilerGuard::view();
         // ── Mini player mode ─────────────────────────────────────────────────
         if self.mini_mode {
-            let current_entry = self.playlist.current_entry();
-            let current_duration = current_entry.and_then(|e| e.duration_secs);
-            let md5 = current_entry.and_then(|e| e.md5.as_deref());
-            let is_fav = md5.map(|m| self.favorites.is_favorite(m)).unwrap_or(false);
-            let is_heard = md5.map(|m| self.heard_db.contains(m)).unwrap_or(false);
+            // Prefer the live TrackInfo (fresh from the player thread) as
+            // the authoritative source of md5 / current_song. Play paths
+            // like Surprise Me / Library-direct-play skip `play_track()`
+            // and therefore never update `playlist.current`, so falling
+            // back to `playlist.current_entry()` would show the *previous*
+            // track's duration. TrackInfo is always in sync with what's
+            // actually playing.
+            let live_md5 = self.status.track_info.as_ref().map(|i| i.md5.as_str());
+            let live_song = self
+                .status
+                .track_info
+                .as_ref()
+                .map(|i| i.current_song)
+                .unwrap_or(1);
+            let current_duration = live_md5
+                .and_then(|m| {
+                    self.songlength_db
+                        .as_ref()
+                        .and_then(|db| db.lookup(m, live_song.saturating_sub(1) as usize))
+                })
+                // Fallbacks: playlist entry cache, then the U64 on-screen total.
+                .or_else(|| self.playlist.current_entry().and_then(|e| e.duration_secs))
+                .or_else(|| self.status.u64_screen_total_secs.map(|s| s as u32));
+            let is_fav = live_md5
+                .map(|m| self.favorites.is_favorite(m))
+                .unwrap_or(false);
+            let is_heard = live_md5.map(|m| self.heard_db.contains(m)).unwrap_or(false);
             // 1-based position in the (unfiltered) playlist for the "01" badge.
             let track_position = self.playlist.current.map(|i| i + 1);
             return ui::mini_player_view(
@@ -4258,7 +4280,7 @@ impl App {
                     song,
                     force_stereo: self.config.force_stereo_2sid
                         || std::env::args().any(|a| a == "--stereo"),
-                    sid4_addr: 0xd420,
+                    sid4_addr: parse_sid4_from_args(),
                     audio_port: if self.config.u64_audio_enabled {
                         Some(self.config.u64_audio_port)
                     } else {

@@ -1447,6 +1447,34 @@ impl PlayContext {
     }
 }
 
+/// Build the ordered list of SID chip base addresses for a tune.
+///
+/// SID1 is always at `0xD400` (canonical C64 SID base).
+/// SID2 and SID3 come from the PSID header's `extra_sid_addrs` — a
+/// zero value in either slot means "no chip".
+/// SID4 comes from the caller-supplied `sid4_addr` (a `--sid4 XXXX`
+/// CLI override) — again, `0` means "no chip".
+///
+/// **CRITICAL**: `sid4_addr` MUST be `0` for tunes that aren't
+/// explicitly 4-SID. Passing `0xd420` (or any non-zero value) here
+/// on a 1SID tune inflates `num_sids` to 2, which flips downstream
+/// stereo routing and leaves the right channel silent. This bug
+/// bit every call site except `play_track()` for months — see PR
+/// TODO for the diagnostic + fix.
+pub(crate) fn compute_sid_bases(extra_sid_addrs: [u16; 2], sid4_addr: u16) -> Vec<u16> {
+    let mut sid_bases: Vec<u16> = vec![0xD400];
+    if extra_sid_addrs[0] != 0 {
+        sid_bases.push(extra_sid_addrs[0]);
+    }
+    if extra_sid_addrs[1] != 0 {
+        sid_bases.push(extra_sid_addrs[1]);
+    }
+    if sid4_addr != 0 {
+        sid_bases.push(sid4_addr);
+    }
+    sid_bases
+}
+
 fn setup_playback(
     sid_file: SidFile,
     path: PathBuf,
@@ -1458,16 +1486,7 @@ fn setup_playback(
 ) -> PlayContext {
     let header = &sid_file.header;
 
-    let mut sid_bases: Vec<u16> = vec![0xD400];
-    if header.extra_sid_addrs[0] != 0 {
-        sid_bases.push(header.extra_sid_addrs[0]);
-    }
-    if header.extra_sid_addrs[1] != 0 {
-        sid_bases.push(header.extra_sid_addrs[1]);
-    }
-    if sid4_addr != 0 {
-        sid_bases.push(sid4_addr);
-    }
+    let sid_bases = compute_sid_bases(header.extra_sid_addrs, sid4_addr);
 
     let num_sids = sid_bases.len();
     let is_multi = num_sids > 1;
@@ -2271,4 +2290,71 @@ fn deliver_nmi_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
     cpu.registers.program_counter = (hi << 8) | lo;
 
     7
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a 1SID tune (`extra_sid_addrs = [0, 0]`) with the
+    /// canonical `sid4_addr = 0` must yield a single-entry base list.
+    /// Prior to the fix, five `PlayerCmd::Play` call sites hardcoded
+    /// `sid4_addr = 0xd420`, which pushed a phantom SID4 onto the list,
+    /// inflated `num_sids` from 1 → 2, and left the right channel
+    /// silent because the emulator's SID2 slot received no writes.
+    #[test]
+    fn single_sid_stays_single_when_sid4_is_zero() {
+        let bases = compute_sid_bases([0, 0], 0);
+        assert_eq!(bases, vec![0xD400]);
+        assert_eq!(bases.len(), 1, "num_sids must be 1 for a 1SID tune");
+    }
+
+    #[test]
+    fn single_sid_with_nonzero_sid4_becomes_multi() {
+        // Documents the historical bug: if the caller mistakenly passes
+        // sid4_addr = 0xd420 on a 1SID tune, num_sids inflates to 2.
+        // This test enforces that anyone touching this helper knows the
+        // semantics and doesn't accidentally restore the bug.
+        let bases = compute_sid_bases([0, 0], 0xD420);
+        assert_eq!(bases, vec![0xD400, 0xD420]);
+        assert_eq!(
+            bases.len(),
+            2,
+            "non-zero sid4_addr adds a chip — callers must pass 0 for 1SID tunes"
+        );
+    }
+
+    #[test]
+    fn two_sid_from_header_no_sid4_override() {
+        // PSID v3+ tune with SID2 base at $D420 declared in the header.
+        let bases = compute_sid_bases([0xD420, 0], 0);
+        assert_eq!(bases, vec![0xD400, 0xD420]);
+    }
+
+    #[test]
+    fn three_sid_from_header_no_sid4_override() {
+        // PSID v4 tune with SID2 and SID3 both declared in the header.
+        let bases = compute_sid_bases([0xD420, 0xD440], 0);
+        assert_eq!(bases, vec![0xD400, 0xD420, 0xD440]);
+    }
+
+    #[test]
+    fn four_sid_via_cli_override() {
+        // 3SID header + explicit `--sid4 D460` CLI override → 4 chips.
+        let bases = compute_sid_bases([0xD420, 0xD440], 0xD460);
+        assert_eq!(bases, vec![0xD400, 0xD420, 0xD440, 0xD460]);
+    }
+
+    #[test]
+    fn parse_sid4_from_args_defaults_to_zero() {
+        // `parse_sid4_from_args()` inspects `std::env::args()`. In the
+        // test binary's process, --sid4 is not passed, so it must
+        // return 0. This locks in the "safe default" every caller
+        // depends on to avoid re-introducing the phantom-SID4 bug.
+        assert_eq!(crate::parse_sid4_from_args(), 0);
+    }
 }
