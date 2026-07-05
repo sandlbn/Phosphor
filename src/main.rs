@@ -80,6 +80,93 @@ use std::time::{Duration, Instant};
 
 use std::sync::{Arc, Mutex};
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Opt-in per-frame timing profiler
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Enable with `PHOSPHOR_PROFILE_UPDATE=1`. When set, each `update()` and
+// `view()` call is timed via an RAII guard; every 30 samples (roughly one
+// second at the 30 Hz tick rate) we print the per-frame averages to
+// stderr:
+//
+//   [perf] update=0.31ms/frame  view=3.14ms/frame
+//
+// Zero cost when the env var is unset (single `OnceLock` bool check per
+// frame + no accumulator writes).
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
+
+static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+static UPDATE_ACCUM_US: AtomicU64 = AtomicU64::new(0);
+static VIEW_ACCUM_US: AtomicU64 = AtomicU64::new(0);
+static SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn profile_enabled() -> bool {
+    *PROFILE_ENABLED.get_or_init(|| std::env::var("PHOSPHOR_PROFILE_UPDATE").is_ok())
+}
+
+enum ProfilerKind {
+    Update,
+    View,
+}
+
+struct ProfilerGuard {
+    kind: ProfilerKind,
+    start: Instant,
+}
+
+impl ProfilerGuard {
+    #[inline]
+    fn update() -> Option<Self> {
+        if profile_enabled() {
+            Some(Self {
+                kind: ProfilerKind::Update,
+                start: Instant::now(),
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn view() -> Option<Self> {
+        if profile_enabled() {
+            Some(Self {
+                kind: ProfilerKind::View,
+                start: Instant::now(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ProfilerGuard {
+    fn drop(&mut self) {
+        let us = self.start.elapsed().as_micros() as u64;
+        match self.kind {
+            ProfilerKind::Update => {
+                UPDATE_ACCUM_US.fetch_add(us, AtomicOrdering::Relaxed);
+            }
+            ProfilerKind::View => {
+                VIEW_ACCUM_US.fetch_add(us, AtomicOrdering::Relaxed);
+                let n = SAMPLE_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                if n >= 30 {
+                    let u = UPDATE_ACCUM_US.swap(0, AtomicOrdering::Relaxed);
+                    let v = VIEW_ACCUM_US.swap(0, AtomicOrdering::Relaxed);
+                    SAMPLE_COUNT.store(0, AtomicOrdering::Relaxed);
+                    eprintln!(
+                        "[perf] update={:.2}ms/frame  view={:.2}ms/frame  (last {n} frames)",
+                        u as f64 / (n as f64) / 1000.0,
+                        v as f64 / (n as f64) / 1000.0,
+                    );
+                }
+            }
+        }
+    }
+}
+
 use crossbeam_channel::{self, Receiver, Sender};
 use iced::widget::{column, container, mouse_area, rule, Space};
 use iced::{event, time, Color, Element, Length, Subscription, Task, Theme};
@@ -698,6 +785,7 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let _perf = ProfilerGuard::update();
         match message {
             // ── Any interaction dismisses the context menu ────────────────
             // (handled per-message below where needed; explicit dismiss too)
@@ -711,7 +799,7 @@ impl App {
                 // is stored and reused for x as well.
                 //
                 // Logical row centre y =
-                //   playlist_viewport_y + display_pos*ROW_HEIGHT - scroll_offset_y + ROW_HEIGHT/2
+                //   playlist_viewport_y + display_pos*row_height() - scroll_offset_y + row_height()/2
                 //
                 // pixel_ratio = raw_cursor_y / logical_row_y
                 // We round to the nearest common value (1.0, 1.5, 2.0, 3.0) to avoid
@@ -724,9 +812,9 @@ impl App {
                     .unwrap_or(0) as f32;
 
                 // Logical y of the centre of the clicked row.
-                let logical_row_y = self.playlist_viewport_y + display_pos * ui::ROW_HEIGHT
+                let logical_row_y = self.playlist_viewport_y + display_pos * ui::row_height()
                     - self.playlist_scroll_offset_y
-                    + ui::ROW_HEIGHT * 0.5;
+                    + ui::row_height() * 0.5;
 
                 // Calibrate ratio when we have valid logical geometry.
                 if logical_row_y > 0.0 && y > 0.0 {
@@ -739,10 +827,10 @@ impl App {
 
                 let ratio = self.pixel_ratio;
                 let menu_x = (x / ratio).max(0.0);
-                let menu_y = (self.playlist_viewport_y + display_pos * ui::ROW_HEIGHT
+                let menu_y = (self.playlist_viewport_y + display_pos * ui::row_height()
                     - self.playlist_scroll_offset_y
-                    + ui::ROW_HEIGHT)
-                    .max(0.0);
+                    + ui::row_height())
+                .max(0.0);
 
                 eprintln!("[phosphor] ShowContextMenu idx={idx} raw=({x:.1},{y:.1}) ratio={ratio:.2} menu=({menu_x:.1},{menu_y:.1})");
 
@@ -1258,7 +1346,7 @@ impl App {
                 let total = self.filtered_indices.len();
                 // Update virtual scroll offset immediately so the newly selected
                 // row is included in the render window before the snap_to fires.
-                self.playlist_scroll_offset_y = next as f32 * ui::ROW_HEIGHT;
+                self.playlist_scroll_offset_y = next as f32 * ui::row_height();
                 if total > 1 {
                     return iced::widget::operation::snap_to(
                         ui::playlist_scrollable_id(),
@@ -1283,7 +1371,7 @@ impl App {
                 self.selected = Some(self.filtered_indices[prev]);
                 let total = self.filtered_indices.len();
                 // Same immediate update for SelectPrev.
-                self.playlist_scroll_offset_y = prev as f32 * ui::ROW_HEIGHT;
+                self.playlist_scroll_offset_y = prev as f32 * ui::row_height();
                 if total > 1 {
                     return iced::widget::operation::snap_to(
                         ui::playlist_scrollable_id(),
@@ -2867,6 +2955,7 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let _perf = ProfilerGuard::view();
         // ── Mini player mode ─────────────────────────────────────────────────
         if self.mini_mode {
             let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);

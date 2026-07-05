@@ -1092,14 +1092,25 @@ pub fn search_bar<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Height of a single playlist row in logical pixels.
-/// Must match the actual rendered height: 4px top pad + 13px text + 4px bottom
-/// pad + 1px rule = 22px.  We add a small buffer (26px) so a partially visible
-/// row at either edge is always included.
-pub const ROW_HEIGHT: f32 = 26.0;
+/// Row height that scales with the user's chosen base font size. At the
+/// default 12 pt base (scale = 1.0) this returns 26.0, matching the
+/// historical constant. At a 16 pt base (scale ≈ 1.33) it returns ~35,
+/// keeping the virtual-scroll math in sync with the actually-rendered
+/// text so rows don't shake or clip into their neighbours.
+///
+/// Derived as: 13 pt text intrinsic height (~18 px) + 4+4 px top/bottom
+/// padding on the inner row + a small line-height slack — comes out to
+/// exactly 26 px at scale 1.0.
+pub fn row_height() -> f32 {
+    26.0 * font::scale()
+}
 
 /// Number of extra rows to render above and below the visible window.
-/// Acts as a scroll lookahead so rows don't pop in mid-scroll.
-const OVERSCAN: usize = 8;
+/// Acts as a scroll lookahead so rows don't pop in mid-scroll. Kept
+/// deliberately small — every extra row is a fresh widget tree we
+/// rebuild every frame. At smaller font sizes more rows fit into the
+/// viewport, so this constant compounds the per-frame widget count.
+const OVERSCAN: usize = 3;
 
 /// Build the scrollable playlist table with sortable column headers.
 /// `filtered_indices` maps visible row position → actual `playlist.entries` index.
@@ -1217,12 +1228,15 @@ pub fn playlist_view<'a>(
 
         // ── Virtual window calculation ────────────────────────────────────
         // Compute which rows are visible, with overscan on both sides.
-        let first_visible = ((scroll_offset_y / ROW_HEIGHT) as usize).saturating_sub(OVERSCAN);
-        let rows_in_view = (viewport_height / ROW_HEIGHT).ceil() as usize + 1;
+        // Snapshot the row height once so every step of the math uses the
+        // same value even if the font scale changes mid-render.
+        let rh = row_height();
+        let first_visible = ((scroll_offset_y / rh) as usize).saturating_sub(OVERSCAN);
+        let rows_in_view = (viewport_height / rh).ceil() as usize + 1;
         let last_visible = (first_visible + rows_in_view + OVERSCAN * 2).min(total_rows);
 
         // Top spacer — replaces all rows above the render window
-        let top_space = first_visible as f32 * ROW_HEIGHT;
+        let top_space = first_visible as f32 * rh;
         if top_space > 0.0 {
             rows = rows.push(Space::new().height(Length::Fixed(top_space)));
         }
@@ -1251,7 +1265,7 @@ pub fn playlist_view<'a>(
 
         // Bottom spacer — replaces all rows below the render window
         let bottom_rows = total_rows.saturating_sub(last_visible);
-        let bottom_space = bottom_rows as f32 * ROW_HEIGHT;
+        let bottom_space = bottom_rows as f32 * rh;
         if bottom_space > 0.0 {
             rows = rows.push(Space::new().height(Length::Fixed(bottom_space)));
         }
@@ -1642,6 +1656,11 @@ fn playlist_entry_row<'a>(
             .padding(Padding::from([0, 4])),
     )
     .width(Length::Fill)
+    // Pin to the same value the virtual scroller uses so 1-px intrinsic
+    // font-metric differences between rows can't accumulate into visible
+    // shaking, and font-size changes stay consistent.
+    .height(Length::Fixed(row_height()))
+    .clip(true)
     .style(move |_theme: &Theme| container::Style {
         background: bg,
         ..Default::default()
@@ -1675,54 +1694,63 @@ fn playlist_row_content<'a>(
     };
     let indicator = if is_current { "▶ " } else { "  " };
 
-    let title_cell: Element<'a, Message> = if has_wds {
-        row![
-            text(title).size(font::sized(size)).color(color),
-            text(" (Karaoke)")
-                .size(font::sized(10.0))
-                .color(Color::from_rgb(0.30, 0.75, 0.45)),
-        ]
-        .spacing(4)
-        .width(Length::FillPortion(4))
-        .into()
-    } else {
-        text(title)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::FillPortion(4))
+    // Column cell wrapper: forces the text to a single line AND clips
+    // any horizontal overflow so long titles / authors can't bleed
+    // into the neighbouring column. `Length::Fill` for height lets the
+    // container inherit the fixed row height instead of doing its own
+    // intrinsic layout pass every frame.
+    let nowrap_cell = |content: Element<'a, Message>, width: Length| -> Element<'a, Message> {
+        container(content)
+            .width(width)
+            .height(Length::Fill)
+            .clip(true)
             .into()
+    };
+    let nowrap_text = |s: String, col: Color, width: Length| -> Element<'a, Message> {
+        nowrap_cell(
+            text(s)
+                .size(font::sized(size))
+                .color(col)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            width,
+        )
+    };
+
+    let title_cell: Element<'a, Message> = if has_wds {
+        nowrap_cell(
+            row![
+                text(title)
+                    .size(font::sized(size))
+                    .color(color)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                text(" (Karaoke)")
+                    .size(font::sized(10.0))
+                    .color(Color::from_rgb(0.30, 0.75, 0.45))
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(4)
+            .into(),
+            Length::FillPortion(4),
+        )
+    } else {
+        nowrap_text(title, color, Length::FillPortion(4))
     };
 
     row![
-        text(format!("{indicator}{num:>3}"))
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::Fixed(50.0)),
+        nowrap_text(format!("{indicator}{num:>3}"), color, Length::Fixed(50.0)),
         title_cell,
-        text(author)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::FillPortion(3)),
-        text(released)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::FillPortion(2)),
-        text(time)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::Fixed(55.0)),
-        text(sid_type)
-            .size(font::sized(size))
-            .color(type_color)
-            .width(Length::Fixed(42.0)),
-        text(sids)
-            .size(font::sized(size))
-            .color(color)
-            .width(Length::Fixed(45.0)),
+        nowrap_text(author, color, Length::FillPortion(3)),
+        nowrap_text(released, color, Length::FillPortion(2)),
+        nowrap_text(time, color, Length::Fixed(55.0)),
+        nowrap_text(sid_type, type_color, Length::Fixed(42.0)),
+        nowrap_text(sids, color, Length::Fixed(45.0)),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
     .padding(Padding::from([4, 4]))
+    // Fill the fixed-height parent so intrinsic row height never wins.
+    .height(Length::Fill)
     .into()
 }
 
