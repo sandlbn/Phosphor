@@ -10,7 +10,7 @@ use std::time::Duration;
 use iced::widget::canvas::{self, Frame, Geometry};
 use iced::widget::{
     button, column, container, mouse_area, row, rule, scrollable, text, text_input,
-    vertical_slider, Canvas, Column, Space,
+    vertical_slider, Canvas, Column, Row, Space,
 };
 use iced::{mouse, Alignment, Color, Element, Length, Padding, Point, Rectangle, Size, Theme};
 
@@ -4068,77 +4068,107 @@ pub fn welcome_overlay<'a>(hvsc_configured: bool) -> Element<'a, Message> {
 //  Mini player view — compact 420×90 window
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const MINI_WIDTH: f32 = 420.0;
-pub const MINI_HEIGHT: f32 = 90.0;
+// Design-time dimensions at scale = 1.0 (12 pt base font). Callers
+// should use `mini_width()` / `mini_height()` so the window resize also
+// scales with the user's base-font-size setting.
+const MINI_WIDTH_BASE: f32 = 400.0;
+const MINI_HEIGHT_BASE: f32 = 175.0;
+
+/// Mini-player window width, scaled to the current base font size.
+pub fn mini_width() -> f32 {
+    MINI_WIDTH_BASE * font::scale()
+}
+
+/// Mini-player window height, scaled to the current base font size.
+pub fn mini_height() -> f32 {
+    MINI_HEIGHT_BASE * font::scale()
+}
 
 /// Compact single-window view shown in mini-player mode.
 /// Fits in 420×90 logical pixels — just title, author, transport + progress.
+/// Return a `visible` character slice of `line`, scrolling left over time
+/// so long strings can be read in a narrow pill. When `line` fits into
+/// `visible` characters, it's returned unchanged.
+///
+/// Character-based marquee: ~3 chars/second at the 30 Hz Tick rate — a
+/// slow, readable pace. A short spacer between loop iterations makes
+/// the wrap-around read as a break rather than a smashed-together
+/// mash-up. Also pauses briefly at the start of each loop so the reader
+/// can see the beginning of the string without having to catch it
+/// mid-scroll.
+fn marquee_line(line: &str, tick: u32, visible: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= visible {
+        return line.to_string();
+    }
+    let spacer: [char; 6] = [' ', ' ', '·', ' ', ' ', ' '];
+    let loop_len = chars.len() + spacer.len();
+    // 10 ticks per character step ≈ 3 chars/sec — comfortable reading pace.
+    let offset = (tick as usize / 10) % loop_len;
+    let doubled: Vec<char> = chars
+        .iter()
+        .chain(spacer.iter())
+        .chain(chars.iter())
+        .chain(spacer.iter())
+        .copied()
+        .collect();
+    doubled.into_iter().skip(offset).take(visible).collect()
+}
+
 pub fn mini_player_view<'a>(
     status: &'a PlayerStatus,
     current_duration: Option<u32>,
     is_favorite: bool,
+    is_heard: bool,
+    _track_position: Option<usize>,
+    tick: u32,
 ) -> Element<'a, Message> {
-    // ── Transport buttons ─────────────────────────────────────────────────────
-    let mk_btn = |label: &'a str, msg: Message| -> Element<'a, Message> {
-        button(text(label).size(font::sized(13.0)))
-            .on_press(msg)
-            .padding(Padding::from([4, 10]))
-            .style(|_theme: &Theme, st| button::Style {
-                background: Some(iced::Background::Color(match st {
-                    button::Status::Hovered => Color::from_rgb(0.22, 0.24, 0.30),
-                    button::Status::Pressed => Color::from_rgb(0.16, 0.18, 0.22),
-                    _ => Color::from_rgb(0.15, 0.16, 0.20),
-                })),
-                text_color: Color::from_rgb(0.85, 0.87, 0.92),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: Color::from_rgb(0.25, 0.27, 0.32),
-                },
-                ..Default::default()
-            })
-            .into()
-    };
+    // Vertical-stack layout matching the reference "compact music widget":
+    //   ┌─────────────────────────────────────────┐
+    //   │                                          │
+    //   │  Title with marquee scroll               │
+    //   │  Author name                              │
+    //   │                                          │
+    //   │  ●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━         │
+    //   │  00:12                            06:01  │
+    //   │                                          │
+    //   │  ♥      ⏮      ▶ / ■      ⏭      ⤢      │
+    //   │                                          │
+    //   └─────────────────────────────────────────┘
+    const BG_PILL: Color = Color::from_rgb(0.09, 0.11, 0.13);
+    const BG_BORDER: Color = Color::from_rgb(0.18, 0.21, 0.26);
+    const TXT_DIM: Color = Color::from_rgb(0.55, 0.58, 0.65);
+    const TXT_MED: Color = Color::from_rgb(0.72, 0.76, 0.82);
+    const TXT_BRIGHT: Color = Color::from_rgb(0.94, 0.96, 0.99);
+    const ACCENT: Color = Color::from_rgb(0.42, 0.68, 1.0);
+    const HEART_ON: Color = Color::from_rgb(0.98, 0.42, 0.55);
+    const BAR_TRACK: Color = Color::from_rgb(0.20, 0.23, 0.28);
 
-    let play_label = match status.state {
-        PlayState::Playing => "❚❚",
-        _ => "▶",
-    };
-
-    let fav_label = if is_favorite { "♥" } else { "♡" };
-    let fav_color = if is_favorite {
-        Color::from_rgb(0.95, 0.35, 0.45)
-    } else {
-        Color::from_rgb(0.55, 0.58, 0.65)
-    };
-
-    let transport = row![
-        mk_btn("◀◀", Message::PrevTrack),
-        mk_btn(play_label, Message::PlayPause),
-        mk_btn("■", Message::Stop),
-        mk_btn("▶▶", Message::NextTrack),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
-
-    // ── Title + author ────────────────────────────────────────────────────────
     let (title, author) = match &status.track_info {
         Some(info) => (info.name.as_str(), info.author.as_str()),
         None => ("No track loaded", "—"),
     };
 
-    let song_info = column![
-        text(title)
-            .size(font::sized(13.0))
-            .color(Color::from_rgb(0.88, 0.90, 0.95)),
-        text(author)
-            .size(font::sized(11.0))
-            .color(Color::from_rgb(0.52, 0.55, 0.65)),
-    ]
-    .spacing(2)
-    .width(Length::Fill);
+    // Marquee: only the title scrolls (author stays static). At the
+    // compact MINI_WIDTH default (400 px minus 32 px padding) at 18 pt
+    // monospace, roughly 30 characters fit before the text hits the
+    // right edge. Scroll only kicks in for titles longer than that.
+    const TITLE_VISIBLE_CHARS: usize = 30;
+    let title_display = marquee_line(title, tick, TITLE_VISIBLE_CHARS);
 
-    // ── Progress bar (thin strip) ─────────────────────────────────────────────
+    let title_line = text(title_display)
+        .size(font::sized(18.0))
+        .color(TXT_BRIGHT)
+        .font(iced::Font::MONOSPACE)
+        .wrapping(iced::widget::text::Wrapping::None);
+
+    let author_line = text(author)
+        .size(font::sized(12.0))
+        .color(TXT_DIM)
+        .font(iced::Font::MONOSPACE)
+        .wrapping(iced::widget::text::Wrapping::None);
+
+    // ── Progress bar with knob dot ────────────────────────────────────
     let elapsed_secs = status.elapsed.as_secs();
     let total_secs = current_duration.unwrap_or(0) as u64;
     let fraction = if total_secs > 0 {
@@ -4146,65 +4176,189 @@ pub fn mini_player_view<'a>(
     } else {
         0.0
     };
-    let bar_pct = (fraction * 100.0) as u16;
+    let bar_pct = (fraction * 1000.0) as u16;
+    let bar_left = bar_pct.max(1);
+    let bar_right = 1000u16.saturating_sub(bar_pct).max(1);
 
-    let progress_strip = row![
-        container(Space::new().height(Length::Fixed(3.0)))
-            .width(Length::FillPortion(bar_pct.max(1)))
-            .style(|_theme: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.30, 0.70, 0.50))),
+    // Scale-aware pixel sizes for the progress bar internals.
+    let s = font::scale();
+    let bar_h = 4.0 * s;
+    let knob = 10.0 * s;
+    let progress = row![
+        container(Space::new().height(Length::Fixed(bar_h)))
+            .width(Length::FillPortion(bar_left))
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(ACCENT)),
+                border: iced::Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
-        container(Space::new().height(Length::Fixed(3.0)))
-            .width(Length::FillPortion(100u16.saturating_sub(bar_pct).max(1)))
-            .style(|_theme: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.20, 0.24))),
+        // Knob dot marking current position
+        container(
+            Space::new()
+                .width(Length::Fixed(knob))
+                .height(Length::Fixed(knob))
+        )
+        .style(move |_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(ACCENT)),
+            border: iced::Border {
+                radius: (knob * 0.5).into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        container(Space::new().height(Length::Fixed(bar_h)))
+            .width(Length::FillPortion(bar_right))
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(BAR_TRACK)),
+                border: iced::Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
+    ]
+    .spacing(0)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let elapsed_text = format!("{:02}:{:02}", elapsed_secs / 60, elapsed_secs % 60);
+    let total_text = format!("{:02}:{:02}", total_secs / 60, total_secs % 60);
+    let time_row = row![
+        text(elapsed_text)
+            .size(font::sized(12.0))
+            .color(TXT_MED)
+            .font(iced::Font::MONOSPACE)
+            .wrapping(iced::widget::text::Wrapping::None),
+        Space::new().width(Length::Fill),
+        text(total_text)
+            .size(font::sized(12.0))
+            .color(TXT_MED)
+            .font(iced::Font::MONOSPACE)
+            .wrapping(iced::widget::text::Wrapping::None),
     ]
     .width(Length::Fill);
 
-    // ── Expand + fav buttons ──────────────────────────────────────────────────
-    let expand_btn = button(text("⤢").size(font::sized(12.0)))
-        .on_press(Message::ToggleMiniPlayer)
-        .padding(Padding::from([4, 8]))
-        .style(|_theme: &Theme, st| button::Style {
+    // ── Transport row (5 evenly-spaced buttons) ───────────────────────
+    let btn_pad_v = (8.0 * s).round() as u16;
+    let btn_pad_h = (12.0 * s).round() as u16;
+    let big_btn = move |label: &'a str, msg: Message, colour: Color| -> Element<'a, Message> {
+        button(
+            text(label)
+                .size(font::sized(18.0))
+                .color(colour)
+                .font(iced::Font::MONOSPACE),
+        )
+        .on_press(msg)
+        .padding(Padding::from([btn_pad_v, btn_pad_h]))
+        .style(|_t: &Theme, st| button::Style {
             background: Some(iced::Background::Color(match st {
-                button::Status::Hovered => Color::from_rgb(0.22, 0.24, 0.30),
+                button::Status::Hovered => Color::from_rgb(0.16, 0.19, 0.23),
+                button::Status::Pressed => Color::from_rgb(0.11, 0.13, 0.16),
                 _ => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
             })),
-            text_color: Color::from_rgb(0.45, 0.48, 0.58),
-            border: iced::Border::default(),
+            text_color: Color::from_rgb(0.85, 0.87, 0.92),
+            border: iced::Border {
+                radius: 8.0.into(),
+                ..Default::default()
+            },
             ..Default::default()
-        });
+        })
+        .into()
+    };
 
-    let fav_btn = button(text(fav_label).size(font::sized(12.0)))
-        .on_press(Message::ToggleFavoriteCurrent)
-        .padding(Padding::from([4, 8]))
-        .style(move |_theme: &Theme, _st| button::Style {
-            background: None,
-            text_color: fav_color,
-            border: iced::Border::default(),
-            ..Default::default()
-        });
+    let fav_label = if is_favorite { "♥" } else { "♡" };
+    let fav_colour = if is_favorite { HEART_ON } else { TXT_MED };
+    let (play_stop_label, play_stop_msg, play_stop_colour) = match status.state {
+        PlayState::Playing => ("■", Message::Stop, TXT_BRIGHT),
+        _ => ("▶", Message::PlayPause, TXT_BRIGHT),
+    };
+    // Suppress a nag: variable kept for future use (heard indicator can
+    // be re-added; the button was swapped for 🎲 Surprise).
+    let _ = is_heard;
 
-    // ── Main row ──────────────────────────────────────────────────────────────
-    let main_row = row![
-        transport,
-        Space::new().width(Length::Fixed(8.0)),
-        song_info,
-        fav_btn,
-        expand_btn,
+    let transport = row![
+        Space::new().width(Length::Fill),
+        big_btn(fav_label, Message::ToggleFavoriteCurrent, fav_colour),
+        Space::new().width(Length::Fill),
+        big_btn("◀◀", Message::PrevTrack, TXT_MED),
+        Space::new().width(Length::Fill),
+        big_btn(play_stop_label, play_stop_msg, play_stop_colour),
+        Space::new().width(Length::Fill),
+        big_btn("▶▶", Message::NextTrack, TXT_MED),
+        Space::new().width(Length::Fill),
+        big_btn("🎲", Message::HvscBrowserSurpriseMe, ACCENT),
+        Space::new().width(Length::Fill),
     ]
-    .spacing(4)
     .align_y(Alignment::Center)
-    .padding(Padding::from([8, 10]));
+    .width(Length::Fill);
 
-    container(column![main_row, progress_strip,])
+    // Expand button lives in the top-right corner so it's out of the
+    // main visual flow.
+    let expand_btn = button(
+        text("⤢")
+            .size(font::sized(14.0))
+            .color(TXT_DIM)
+            .font(iced::Font::MONOSPACE),
+    )
+    .on_press(Message::ToggleMiniPlayer)
+    .padding(Padding::from([4, 8]))
+    .style(|_t: &Theme, st| button::Style {
+        background: Some(iced::Background::Color(match st {
+            button::Status::Hovered => Color::from_rgb(0.16, 0.19, 0.23),
+            _ => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+        })),
+        text_color: TXT_DIM,
+        border: iced::Border {
+            radius: 4.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let top_bar = row![Space::new().width(Length::Fill), expand_btn]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+    let gap_sm = 2.0 * s;
+    let gap_md = 10.0 * s;
+    let outer_pad_v = 10.0 * s;
+    let outer_pad_h = 16.0 * s;
+    let content = column![
+        top_bar,
+        Space::new().height(Length::Fixed(gap_sm)),
+        title_line,
+        author_line,
+        Space::new().height(Length::Fixed(gap_md)),
+        progress,
+        Space::new().height(Length::Fixed(gap_sm)),
+        time_row,
+        // Any remaining vertical slack gets absorbed here so the transport
+        // row hugs the bottom of the pill instead of leaving dead space.
+        Space::new().height(Length::Fill),
+        transport,
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+
+    container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+        .padding(Padding {
+            top: outer_pad_v,
+            bottom: outer_pad_v,
+            left: outer_pad_h,
+            right: outer_pad_h,
+        })
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(BG_PILL)),
+            border: iced::Border {
+                radius: 12.0.into(),
+                width: 1.0,
+                color: BG_BORDER,
+            },
             ..Default::default()
         })
         .into()

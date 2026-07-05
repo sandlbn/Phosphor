@@ -1977,7 +1977,7 @@ impl App {
             Message::ToggleMiniPlayer => {
                 self.mini_mode = !self.mini_mode;
                 let size = if self.mini_mode {
-                    iced::Size::new(ui::MINI_WIDTH, ui::MINI_HEIGHT)
+                    iced::Size::new(ui::mini_width(), ui::mini_height())
                 } else {
                     iced::Size::new(
                         self.config.window_width_saved.max(400.0),
@@ -2958,14 +2958,21 @@ impl App {
         let _perf = ProfilerGuard::view();
         // ── Mini player mode ─────────────────────────────────────────────────
         if self.mini_mode {
-            let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
-            let is_fav = self
-                .playlist
-                .current_entry()
-                .and_then(|e| e.md5.as_deref())
-                .map(|m| self.favorites.is_favorite(m))
-                .unwrap_or(false);
-            return ui::mini_player_view(&self.status, current_duration, is_fav);
+            let current_entry = self.playlist.current_entry();
+            let current_duration = current_entry.and_then(|e| e.duration_secs);
+            let md5 = current_entry.and_then(|e| e.md5.as_deref());
+            let is_fav = md5.map(|m| self.favorites.is_favorite(m)).unwrap_or(false);
+            let is_heard = md5.map(|m| self.heard_db.contains(m)).unwrap_or(false);
+            // 1-based position in the (unfiltered) playlist for the "01" badge.
+            let track_position = self.playlist.current.map(|i| i + 1);
+            return ui::mini_player_view(
+                &self.status,
+                current_duration,
+                is_fav,
+                is_heard,
+                track_position,
+                self.tick,
+            );
         }
 
         let is_now_playing_fav = self
