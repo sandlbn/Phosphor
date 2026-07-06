@@ -374,7 +374,11 @@ pub fn build_flat_index_worker(
             Ok(e) => {
                 let e = apply_songlength(e, songlength.as_ref());
                 (
-                    if e.title.is_empty() { stem.clone() } else { e.title },
+                    if e.title.is_empty() {
+                        stem.clone()
+                    } else {
+                        e.title
+                    },
                     e.released,
                     e.songs,
                     e.duration_secs,
