@@ -139,13 +139,29 @@ If you're hacking on the `usbsid-bridge` daemon and need to swap in a fresh loca
 
 ### Windows
 
-1. Install the WinUSB driver for your USBSID-Pico using [Zadig](https://zadig.akeo.ie/)
-2. Build and run:
+Most users should just grab the installer from the [Releases](https://github.com/sandlbn/Phosphor/releases) page:
 
-```bash
-cargo build --release
-./target/release/phosphor.exe
+1. Install the WinUSB driver for your USBSID-Pico using [Zadig](https://zadig.akeo.ie/) (one-time; only needed for the USBSID-Pico hardware — software emulation and Ultimate 64 network playback work without it).
+2. Download and run **`Phosphor-<version>-windows-x86_64-setup.exe`**. It installs Phosphor with a Start-menu shortcut (and an optional desktop icon) and registers an uninstaller in Add/Remove Programs.
+
+#### Building the installer locally (unsigned / self-signed)
+
+For development you can build the installer on your own machine. You need the Rust MSVC toolchain, [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`iscc.exe`), and the Windows SDK (`signtool.exe`):
+
+```powershell
+# Validate the whole pipeline with a throwaway self-signed cert:
+make -f Makefile.windows windows_selfsign
+
+# Or a quick unsigned dev build:
+make -f Makefile.windows windows_installer   # unsigned unless WIN_CERT_* is set
+make -f Makefile.windows windows             # bare exe, no installer
 ```
+
+This produces `dist\Phosphor-<version>-windows-x86_64-setup.exe`. The script builds with a static CRT (see `.cargo/config.toml`) so the exe is self-contained, then builds the Inno Setup installer (`windows/phosphor.iss`). Passing a real certificate via `WIN_CERT_PFX` (+`WIN_CERT_PASSWORD`) or `WIN_CERT_THUMBPRINT` makes it sign with `signtool`; see the header comment in `windows/build_installer.ps1` for all options.
+
+#### Official signed releases (CI)
+
+Public releases are built and **signed by [SignPath.io](https://signpath.io)** (free code-signing for open source) via GitHub Actions — the private key never leaves SignPath, so there is no local certificate. Pushing a `v*` tag runs [`.github/workflows/windows-release.yml`](.github/workflows/windows-release.yml), which builds on a GitHub-hosted runner, submits `phosphor.exe` and the installer to SignPath for signing, and attaches the signed `Phosphor-<version>-windows-x86_64-setup.exe` to the GitHub Release. See the header comment in that workflow for the required `SIGNPATH_API_TOKEN` secret and `SIGNPATH_ORGANIZATION_ID` variable.
 
 ### Linux
 

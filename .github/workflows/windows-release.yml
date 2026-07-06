@@ -1,0 +1,134 @@
+# Build, sign (via SignPath.io), and publish the Windows installer.
+#
+# Signing uses SignPath's cloud service — there is no local .pfx. For the free
+# SignPath Foundation (OSS) certificate, ALL build steps must run on
+# GitHub-hosted runners (no self-hosted / local builds), which is why release
+# signing lives here rather than in windows/build_installer.ps1. That script is
+# still used for local UNSIGNED / self-signed dev testing.
+#
+# ── One-time setup after you are approved by SignPath ───────────────────────
+#   Repo secret:    SIGNPATH_API_TOKEN          (SignPath REST API user token)
+#   Repo variable:  SIGNPATH_ORGANIZATION_ID    (your SignPath organization id)
+# In the SignPath portal, create a project + signing policy + two artifact
+# configurations, then match the slugs below:
+#   project-slug:                 phosphor
+#   signing-policy-slug:          release-signing
+#   artifact-configuration-slug:  windows-exe  /  windows-installer
+# Adjust the literals below if you pick different slugs.
+#
+# Trigger: push a version tag (e.g. `git tag v0.4.5 && git push --tags`) or run
+# manually from the Actions tab.
+
+name: Windows Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the GitHub Release + upload the installer asset
+  actions: read     # let the SignPath action read this run's job/artifact metadata
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Read version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $v = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $v) { throw "Could not read version from Cargo.toml" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Phosphor version $v"
+
+      # Static-CRT build (see .cargo/config.toml) -> self-contained phosphor.exe
+      - name: Build (release)
+        run: cargo build --release
+
+      # ── Sign phosphor.exe via SignPath (sign the app binary first, so the
+      #    exe that ends up inside the installer is itself signed) ────────────
+      - name: Upload unsigned phosphor.exe
+        id: upload_exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: phosphor-exe-unsigned
+          path: target/release/phosphor.exe
+          if-no-files-found: error
+
+      - name: Sign phosphor.exe (SignPath)
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: phosphor
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-exe
+          github-artifact-id: ${{ steps.upload_exe.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-for-completion: true
+          output-artifact-directory: signed/exe
+
+      - name: Swap in the signed exe
+        shell: pwsh
+        run: Copy-Item signed/exe/phosphor.exe target/release/phosphor.exe -Force
+
+      # ── Build the installer around the signed exe ────────────────────────
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=${{ steps.version.outputs.version }}" `
+            windows\phosphor.iss
+
+      # ── Sign the installer via SignPath ──────────────────────────────────
+      - name: Upload unsigned installer
+        id: upload_installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: phosphor-installer-unsigned
+          path: dist/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
+          if-no-files-found: error
+
+      - name: Sign installer (SignPath)
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: phosphor
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-installer
+          github-artifact-id: ${{ steps.upload_installer.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-for-completion: true
+          output-artifact-directory: signed/installer
+
+      # Keep the signed installer as a build artifact even for manual runs.
+      - name: Upload signed installer (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: phosphor-installer-signed
+          path: signed/installer/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
+          if-no-files-found: error
+
+      # ── Publish. The asset name ends in `-setup.exe`, which the docs site's
+      #    download resolver already prefers, and the `.exe` suffix keeps the
+      #    in-app updater (src/version_check.rs) matching — no other changes. ─
+      - name: Attach signed installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: signed/installer/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
+          fail_on_unmatched_files: true

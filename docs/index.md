@@ -284,8 +284,8 @@ To uninstall, run the matching **Uninstaller.pkg** from the same release — dra
 
 ### Windows
 
-1. Install the WinUSB driver for the USBSID-Pico via [Zadig](https://zadig.akeo.ie/). One-time step.
-2. Run `phosphor.exe` — no installer, just a single self-contained executable.
+1. Install the WinUSB driver for the USBSID-Pico via [Zadig](https://zadig.akeo.ie/). One-time step, and only needed for the USBSID-Pico hardware — software emulation and Ultimate 64 network playback work without it.
+2. Download and run **Phosphor-*version*-windows-x86_64-setup.exe**. It installs Phosphor with a Start-menu shortcut (and an optional desktop icon) and registers an uninstaller in Add/Remove Programs.
 
 ### Linux
 

@@ -5,10 +5,20 @@ DIST_DIR = dist
 SHELL := powershell.exe
 .SHELLFLAGS := -NoProfile -ExecutionPolicy Bypass -Command
 
-.PHONY: windows clean
+.PHONY: windows windows_installer windows_selfsign clean
 
+# Quick dev build: bare, unsigned exe copied into dist/.
 windows:
 	$$ErrorActionPreference='Stop'; $$toml=Get-Content 'Cargo.toml' -Raw; $$m=[regex]::Match($$toml,'(?m)^version\s*=\s*"([^"]+)"'); $$ver=$$m.Groups[1].Value; New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; cargo build --release; $$out=Join-Path '$(DIST_DIR)' ('$(APP_NAME)-'+$$ver+'-windows-x86_64.exe'); Copy-Item 'target\release\$(BIN_NAME).exe' $$out -Force; Write-Host ('Built: '+$$out)
+
+# Release: build + sign exe + Inno Setup installer + sign installer.
+# Needs WIN_CERT_PFX (+WIN_CERT_PASSWORD) or WIN_CERT_THUMBPRINT in the env.
+windows_installer:
+	powershell -NoProfile -ExecutionPolicy Bypass -File windows\build_installer.ps1 -Sign
+
+# Same pipeline but with a throwaway self-signed cert (for testing only).
+windows_selfsign:
+	powershell -NoProfile -ExecutionPolicy Bypass -File windows\build_installer.ps1 -SelfSign
 
 clean:
 	if (Test-Path "$(DIST_DIR)") { Remove-Item -Recurse -Force "$(DIST_DIR)" }
