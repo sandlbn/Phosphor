@@ -4,6 +4,12 @@ A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hard
 
 ![Phosphor](assets/screenshot.gif)
 
+## Trailer
+
+[![Phosphor trailer](https://img.youtube.com/vi/EjtkkvrJL3Q/maxresdefault.jpg)](https://www.youtube.com/watch?v=EjtkkvrJL3Q)
+
+Trailer by [@exploraart](https://www.youtube.com/@exploraart) — Adam Kazmierski.
+
 
 ## Downloads
 
@@ -15,7 +21,8 @@ https://github.com/sandlbn/Phosphor/releases
 
 - **Four playback engines** — USB hardware, software emulation (reSID or SIDLite), or Commodore Ultimate 64 over the network
 - **📚 Library panel** — browse Local HVSC, search Assembly64 live, and load curated Playlists synced from the Phosphor repo
-- **🎲 Surprise me** — one-click random tune from your synced HVSC tree
+- **Rich HVSC search** — global search across the whole category shows title, released year, subsong count, duration, and STIL ✓ marker for every hit, not just the filename
+- **🎲 Surprise me** — one-click random tune from your synced HVSC tree or from the currently-loaded playlist (source is configurable in Settings)
 - **USBSID-Pico device config** — built-in Device panel (🔧 button) for chip routing, clock rate, presets, and save-to-flash, all without leaving Phosphor
 - **HTTP remote control** — built-in web server for controlling playback from any browser on the network (phone, tablet, another PC)
 - **HTTP proxy support** — single-field setting for `http://` / `https://` / `socks5://`, applied to all outbound requests
@@ -33,7 +40,8 @@ https://github.com/sandlbn/Phosphor/releases
 - **SID register panel** — real-time scrolling tracker view (note, waveform, ADSR per voice) plus live register readout for all active SID chips
 - **U64 audio streaming** — stream SID audio from the Ultimate 64 back to the host machine over UDP
 - **Keyboard shortcuts** — full keyboard control (see below)
-- **Mini player mode** — compact window mode for background listening
+- **Mini player mode** — compact window mode for background listening; all transport buttons carry hover tooltips in both mini and full player
+- **Focused Settings** — five tabs (General · Audio · Library · Network · Help) so you find the knob you want without scrolling through a wall of options
 - **Window geometry** — size and position are remembered between sessions
 - **HVSC completion tracking** — persistent log of every unique SID heard; status bar shows your progress against the full HVSC collection.
 Good luck hearing all 60,000+ — at four minutes each that's only about 167 straight days without sleep
@@ -51,7 +59,10 @@ Good luck hearing all 60,000+ — at four minutes each that's only about 167 str
 | `V` | Cycle visualiser mode (Bars → Scope → Tracker → Karaoke) |
 | `K` | Toggle karaoke lyrics (MUS files with .wds) |
 | `L` | Toggle 📚 Library panel |
+| `M` | Toggle mini player |
 | `H` | Toggle favourite for currently playing track |
+| `Shift+H` | Toggle shuffle |
+| `,` / `.` | Nudge master volume −5% / +5% |
 | `?` | Show keyboard shortcuts & about |
 | `Delete` | Remove selected track |
 | `Ctrl+F` | Focus search |
