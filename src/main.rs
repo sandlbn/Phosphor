@@ -2113,14 +2113,35 @@ impl App {
             Message::HvscBrowserSearchChanged(q) => {
                 let was_empty = self.hvsc_browser.search().is_empty();
                 self.hvsc_browser.set_search(q);
-                // The first time the user types into the search box, lazily
-                // build the flat-tune index for the current category so we
-                // can match by song filename across all authors / sections.
-                // Subsequent searches reuse the same index. ~50-200 ms for
-                // a typical category on SSD.
+                // First non-empty keystroke on a cold cache — kick off a
+                // background walk to enrich every SID/MUS in this
+                // category with title/released/duration/STIL. On SSD the
+                // build takes ~5-10 s for ~10k files; the UI keeps
+                // running because it's dispatched through Task::perform.
                 if was_empty && !self.hvsc_browser.search().is_empty() {
-                    let _ = self.hvsc_browser.build_flat_index_if_needed();
+                    if let Some((root, category, version)) =
+                        self.hvsc_browser.begin_flat_index_build()
+                    {
+                        let stil = self.stil_db.clone();
+                        let songlength = self.songlength_db.clone();
+                        return Task::perform(
+                            async move {
+                                hvsc_browser::build_flat_index_worker(
+                                    root, category, stil, songlength,
+                                )
+                            },
+                            move |index| Message::HvscFlatIndexReady(version, index),
+                        );
+                    }
                 }
+            }
+
+            Message::HvscFlatIndexReady(version, index) => {
+                self.hvsc_browser.install_flat_index(version, index);
+            }
+
+            Message::HvscBrowserSearchScopeToggled(on) => {
+                self.hvsc_browser.set_search_scope_this_author(on);
             }
 
             Message::HvscBrowserAuthorSelected(idx) => {
@@ -2256,25 +2277,35 @@ impl App {
 
             // ── HVSC: 🎲 Surprise me ───────────────────────────────────────
             Message::HvscBrowserSurpriseMe => {
-                // Ensure the flat index for the current category is loaded.
-                let total = self.hvsc_browser.build_flat_index_if_needed();
-                if total == 0 {
-                    eprintln!("[surprise] No tunes in HVSC flat index — is the tree synced?");
-                } else {
-                    use rand::Rng;
-                    let idx = rand::thread_rng().gen_range(0..total);
-                    if let Some(entry) = self
-                        .hvsc_browser
-                        .realise_flat(idx, self.songlength_db.as_ref())
+                // Pick a random SID/MUS path from the current category.
+                // Works whether the enriched flat index is loaded or
+                // not — falls back to a fresh reservoir-sampling walk
+                // so hitting Surprise on a cold cache is instant.
+                let picked = self.hvsc_browser.random_hvsc_path();
+                if picked.is_none() {
+                    eprintln!("[surprise] No tunes in current HVSC category — is the tree synced?");
+                } else if let Some(pick_path) = picked {
+                    let entry = match playlist::PlaylistEntry::from_path(&pick_path) {
+                        Ok(mut e) => {
+                            if let Some(db) = self.songlength_db.as_ref() {
+                                let song0 = e.selected_song.saturating_sub(1) as usize;
+                                if let Some(m) = &e.md5 {
+                                    if let Some(secs) = db.lookup(m, song0) {
+                                        e.duration_secs = Some(secs);
+                                    }
+                                }
+                            }
+                            e
+                        }
+                        Err(err) => {
+                            eprintln!("[surprise] {}: {}", pick_path.display(), err);
+                            return Task::none();
+                        }
+                    };
                     {
                         let path = entry.path.clone();
                         let song = entry.selected_song.max(1);
-                        eprintln!(
-                            "[surprise] picked {} of {}: {}",
-                            idx + 1,
-                            total,
-                            path.display()
-                        );
+                        eprintln!("[surprise] picked {}", path.display());
                         self.playlist.add_entries(vec![entry]);
                         if let Some(db) = self.songlength_db.as_ref() {
                             db.apply_to_playlist(

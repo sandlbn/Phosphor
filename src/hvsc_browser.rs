@@ -116,9 +116,10 @@ pub struct HvscTune {
 }
 
 /// Flat-index row for global search. Built once per category — one entry
-/// per `.sid`/`.mus` file. No SID header parsing here; we only need the
-/// filename + author dir name to drive search. When the user clicks a
-/// search hit we lazy-load the full `PlaylistEntry` for that one path.
+/// per `.sid`/`.mus` file. Enriched with SID-header + songlength + STIL
+/// metadata so the global-hit list can show the same columns as the
+/// per-author view (title / released / #songs / duration / STIL ✓).
+/// Building is off-thread — see `build_flat_index_worker`.
 #[derive(Debug, Clone)]
 pub struct HvscIndexEntry {
     pub path: PathBuf,
@@ -127,9 +128,17 @@ pub struct HvscIndexEntry {
     /// Author / section folder name as it appears on disk
     /// (`Hubbard_Rob` for MUSICIANS, `0-9` for DEMOS/GAMES).
     pub author_raw: String,
+    /// SID header title. Falls back to the stem when the header is empty.
+    pub title: String,
+    pub released: String,
+    pub songs: u16,
+    pub duration_secs: Option<u32>,
+    pub has_stil: bool,
     /// Lowercased copies for case-insensitive search.
     stem_lower: String,
     author_lower: String,
+    title_lower: String,
+    released_lower: String,
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +158,18 @@ pub struct HvscBrowser {
     /// `(root, category)` changes.
     flat_index: Vec<HvscIndexEntry>,
     flat_index_loaded: bool,
+    /// True while a background `build_flat_index_worker` is in flight.
+    /// UI shows an "Indexing tunes…" placeholder in the right pane.
+    flat_index_building: bool,
+    /// Bumped on every `(root, category)` invalidation. The background
+    /// worker's completion carries the version it was started with, so a
+    /// stale result (from a category the user has since switched away
+    /// from) can be discarded without polluting the current view.
+    flat_index_version: u64,
+    /// When true and an author is selected, the search box filters
+    /// within that author's tunes instead of falling into the global
+    /// flat-index view. Per-session; not persisted.
+    search_scope_this_author: bool,
 }
 
 impl Default for HvscCategory {
@@ -204,6 +225,8 @@ impl HvscBrowser {
             self.authors_loaded = false;
             self.flat_index.clear();
             self.flat_index_loaded = false;
+            self.flat_index_building = false;
+            self.flat_index_version = self.flat_index_version.wrapping_add(1);
         }
     }
 
@@ -216,7 +239,25 @@ impl HvscBrowser {
             self.authors_loaded = false;
             self.flat_index.clear();
             self.flat_index_loaded = false;
+            self.flat_index_building = false;
+            self.flat_index_version = self.flat_index_version.wrapping_add(1);
         }
+    }
+
+    pub fn flat_index_version(&self) -> u64 {
+        self.flat_index_version
+    }
+
+    pub fn flat_index_building(&self) -> bool {
+        self.flat_index_building
+    }
+
+    pub fn search_scope_this_author(&self) -> bool {
+        self.search_scope_this_author
+    }
+
+    pub fn set_search_scope_this_author(&mut self, on: bool) {
+        self.search_scope_this_author = on;
     }
 
     pub fn set_search(&mut self, query: String) {
@@ -231,72 +272,43 @@ impl HvscBrowser {
         self.flat_index_loaded
     }
 
-    /// Walk every `.sid`/`.mus` file under the current category and record
-    /// (path, stem, author/section dir) per file. No SID header parse —
-    /// just `walkdir` + string. Cheap (~50 ms for ~10k files on SSD).
+    /// If the flat index is empty and no build is in flight, mark a
+    /// build as pending and return a `(root, category, version)` handle
+    /// the caller can hand off to a background task. `None` means the
+    /// index is already loaded, already building, or there's no root
+    /// configured — no work needed.
     ///
-    /// Called lazily the first time the user types something into the
-    /// search box, so the cost doesn't hit users who only browse by
-    /// author. Returns the size of the built index.
-    pub fn build_flat_index_if_needed(&mut self) -> usize {
-        if self.flat_index_loaded {
-            return self.flat_index.len();
+    /// The caller is expected to `Task::perform` `build_flat_index_worker`
+    /// with the returned tuple + snapshots of the STIL and songlength
+    /// DBs, then dispatch a `HvscFlatIndexReady` message that calls
+    /// `install_flat_index` with the produced vec + the same version.
+    pub fn begin_flat_index_build(&mut self) -> Option<(PathBuf, HvscCategory, u64)> {
+        if self.flat_index_loaded || self.flat_index_building {
+            return None;
         }
-        self.flat_index.clear();
-        let root = match &self.root {
-            Some(r) => r.clone(),
-            None => {
-                self.flat_index_loaded = true;
-                return 0;
-            }
-        };
-        let category_dir = root.join(self.category.dir_name());
-        if !category_dir.is_dir() {
-            self.flat_index_loaded = true;
-            return 0;
-        }
-        for dirent in WalkDir::new(&category_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let p = dirent.path();
-            if !p.is_file() || !is_sid_or_mus(p) {
-                continue;
-            }
-            let stem = match p.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            // Author / section folder = direct parent of the file's
-            // grandparent for MUSICIANS (.../<letter>/<Author>/file.sid),
-            // direct parent for DEMOS/GAMES (.../<range>/file.sid).
-            // We pull whichever parent sits directly under the category
-            // dir — works for both layouts because we already iterate
-            // category_dir as the walk root.
-            let author_raw = parent_under_category(p, &category_dir)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let stem_lower = stem.to_ascii_lowercase();
-            let author_lower = author_raw.to_ascii_lowercase();
-            self.flat_index.push(HvscIndexEntry {
-                path: p.to_path_buf(),
-                stem,
-                author_raw,
-                stem_lower,
-                author_lower,
-            });
-        }
-        self.flat_index
-            .sort_by(|a, b| a.stem_lower.cmp(&b.stem_lower));
-        self.flat_index_loaded = true;
-        self.flat_index.len()
+        let root = self.root.as_ref()?.clone();
+        self.flat_index_building = true;
+        Some((root, self.category, self.flat_index_version))
     }
 
-    /// Indices into `flat_index` matching the current search query against
-    /// either the file stem or the author/section folder name. Capped at
-    /// 500 hits so the UI doesn't render an unbounded list while the user
-    /// types one letter at a time.
+    /// Install a completed flat index. Rejects the result if the version
+    /// stamp doesn't match the current one (user changed category /
+    /// root while the walk was in flight).
+    pub fn install_flat_index(&mut self, version: u64, index: Vec<HvscIndexEntry>) {
+        self.flat_index_building = false;
+        if version != self.flat_index_version {
+            // Stale — drop it and stay unloaded so the next keystroke
+            // triggers a fresh build for the current (root, category).
+            return;
+        }
+        self.flat_index = index;
+        self.flat_index_loaded = true;
+    }
+
+    /// Indices into `flat_index` matching the current search query
+    /// against filename stem, author/section folder name, SID header
+    /// title, or `released`. Capped at 500 hits so the UI doesn't render
+    /// an unbounded list while the user types one letter at a time.
     pub fn filtered_flat(&self) -> Vec<usize> {
         if self.search.trim().is_empty() {
             return Vec::new();
@@ -304,7 +316,11 @@ impl HvscBrowser {
         let needle = self.search.to_ascii_lowercase();
         let mut out = Vec::new();
         for (i, e) in self.flat_index.iter().enumerate() {
-            if e.stem_lower.contains(&needle) || e.author_lower.contains(&needle) {
+            if e.stem_lower.contains(&needle)
+                || e.author_lower.contains(&needle)
+                || e.title_lower.contains(&needle)
+                || e.released_lower.contains(&needle)
+            {
                 out.push(i);
                 if out.len() >= 500 {
                     break;
@@ -313,7 +329,88 @@ impl HvscBrowser {
         }
         out
     }
+}
 
+/// Off-thread flat-index builder. Walks every `.sid`/`.mus` file under
+/// `<root>/<category>/`, parses each SID header (via
+/// `PlaylistEntry::from_path`), applies the optional songlength lookup
+/// and the STIL ✓ marker, and returns the enriched rows sorted by title.
+/// Typical cost: ~5-10 s cold / ~1 s warm for ~10k files on SSD. Meant
+/// to run inside `iced::Task::perform`; the caller passes the result
+/// through `HvscBrowser::install_flat_index` with the version stamp
+/// returned by `begin_flat_index_build`.
+pub fn build_flat_index_worker(
+    root: PathBuf,
+    category: HvscCategory,
+    stil: Option<StilDb>,
+    songlength: Option<SonglengthDb>,
+) -> Vec<HvscIndexEntry> {
+    let category_dir = root.join(category.dir_name());
+    if !category_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for dirent in WalkDir::new(&category_dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let p = dirent.path();
+        if !p.is_file() || !is_sid_or_mus(p) {
+            continue;
+        }
+        let stem = match p.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let author_raw = parent_under_category(p, &category_dir)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // SID header + songlength enrichment. If the header can't be
+        // parsed we still keep the row — the stem + author folder are
+        // enough for the user to find it, and the metadata columns will
+        // just be blank.
+        let (title, released, songs, duration_secs) = match PlaylistEntry::from_path(p) {
+            Ok(e) => {
+                let e = apply_songlength(e, songlength.as_ref());
+                (
+                    if e.title.is_empty() { stem.clone() } else { e.title },
+                    e.released,
+                    e.songs,
+                    e.duration_secs,
+                )
+            }
+            Err(_) => (stem.clone(), String::new(), 1, None),
+        };
+        // stil_has_entry wants the author directory (for the fallback
+        // path it constructs when hvsc_root is unknown). The immediate
+        // parent works for both HVSC layouts here.
+        let author_dir = p.parent().unwrap_or(&category_dir);
+        let has_stil = stil_has_entry(author_dir, p, stil.as_ref(), Some(root.as_path()));
+        let stem_lower = stem.to_ascii_lowercase();
+        let author_lower = author_raw.to_ascii_lowercase();
+        let title_lower = title.to_ascii_lowercase();
+        let released_lower = released.to_ascii_lowercase();
+        out.push(HvscIndexEntry {
+            path: p.to_path_buf(),
+            stem,
+            author_raw,
+            title,
+            released,
+            songs,
+            duration_secs,
+            has_stil,
+            stem_lower,
+            author_lower,
+            title_lower,
+            released_lower,
+        });
+    }
+    out.sort_by(|a, b| a.title_lower.cmp(&b.title_lower));
+    out
+}
+
+impl HvscBrowser {
     /// Lazy-load a single `PlaylistEntry` for a flat-index hit (used when
     /// the user clicks Play/Add on a global search result). Applies the
     /// songlength DB inline; STIL ✓ is determined by the caller via
@@ -326,6 +423,46 @@ impl HvscBrowser {
         let path = &self.flat_index.get(idx)?.path;
         let entry = PlaylistEntry::from_path(path).ok()?;
         Some(apply_songlength(entry, songlength))
+    }
+
+    /// Pick a random SID/MUS path from the current category. Used by the
+    /// 🎲 Surprise Me button — independent of whether the enriched flat
+    /// index is loaded, so hitting Surprise on a cold cache doesn't
+    /// block on the 5-10 s index build. Cost: a fresh WalkDir (~100 ms
+    /// on SSD for a typical category). Uses reservoir sampling so
+    /// memory stays O(1) and files aren't loaded twice.
+    pub fn random_hvsc_path(&self) -> Option<PathBuf> {
+        // If the enriched index is already there, sample from it — same
+        // universe, zero disk I/O.
+        if self.flat_index_loaded && !self.flat_index.is_empty() {
+            use rand::Rng;
+            let i = rand::thread_rng().gen_range(0..self.flat_index.len());
+            return Some(self.flat_index[i].path.clone());
+        }
+        let root = self.root.as_ref()?;
+        let category_dir = root.join(self.category.dir_name());
+        if !category_dir.is_dir() {
+            return None;
+        }
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut chosen: Option<PathBuf> = None;
+        let mut seen: u64 = 0;
+        for dirent in WalkDir::new(&category_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let p = dirent.path();
+            if !p.is_file() || !is_sid_or_mus(p) {
+                continue;
+            }
+            seen += 1;
+            if chosen.is_none() || rng.gen_range(0..seen) == 0 {
+                chosen = Some(p.to_path_buf());
+            }
+        }
+        chosen
     }
 
     /// True when no `hvsc_root` is configured — the UI shows the empty

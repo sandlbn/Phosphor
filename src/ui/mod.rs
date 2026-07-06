@@ -281,6 +281,14 @@ pub enum Message {
     /// 🎲 Surprise Me — pick a random tune from the current HVSC category
     /// and play it. Builds the flat index lazily on first click.
     HvscBrowserSurpriseMe,
+    /// Background flat-index build has finished. Payload: `(version, index)`.
+    /// The version is compared against the browser's current
+    /// `flat_index_version` and stale results (from a category the user
+    /// has switched away from) are discarded.
+    HvscFlatIndexReady(u64, Vec<crate::hvsc_browser::HvscIndexEntry>),
+    /// Toggle "search within selected author only" — visible in the search
+    /// row when an author is selected.
+    HvscBrowserSearchScopeToggled(bool),
 
     // Browse panel: source toggle (Local HVSC vs Assembly64)
     BrowserSourceChanged(crate::hvsc_browser::BrowserSource),
@@ -2570,8 +2578,20 @@ pub fn hvsc_browser_view<'a>(
         )
     };
 
+    // Scope toggle: only meaningful once the user has picked an author.
+    // When ON, typing in the search box filters within that author's
+    // tunes; when OFF, typing surfaces the global flat-index hits.
+    let scope_chip: Element<'a, Message> = if browser.selected_author().is_some() {
+        let on = browser.search_scope_this_author();
+        let label = if on { "👤 This author" } else { "🌍 All" };
+        tool_button(label, Message::HvscBrowserSearchScopeToggled(!on))
+    } else {
+        Space::new().width(Length::Fixed(0.0)).into()
+    };
+
     let search_row = row![
         search_input,
+        scope_chip,
         tool_button("🎲 Surprise me", Message::HvscBrowserSurpriseMe),
     ]
     .spacing(6)
@@ -2589,28 +2609,35 @@ pub fn hvsc_browser_view<'a>(
     .width(Length::Fixed(320.0));
 
     // When the search box has text, prefer the flat global tune search
-    // over the per-author view. This is the "search song doesn't work"
-    // path the user hit: typing a song name without first selecting an
-    // author should still surface matches.
+    // over the per-author view — unless the "this author only" scope
+    // toggle is on and an author is selected, in which case the user
+    // wants to filter within that author's tunes.
     let has_search = !browser.search().trim().is_empty();
-    let flat_results: Vec<usize> = if has_search {
+    let author_selected = browser.selected_author().is_some();
+    let scope_author = browser.search_scope_this_author() && author_selected;
+    let flat_results: Vec<usize> = if has_search && !scope_author {
         browser.filtered_flat()
     } else {
         Vec::new()
     };
-    let show_flat_results = has_search && !flat_results.is_empty();
+    let flat_building = has_search
+        && !scope_author
+        && browser.flat_index_building()
+        && !browser.flat_index_loaded();
+    let show_flat_results =
+        has_search && !scope_author && (browser.flat_index_loaded() || flat_building);
 
     // ── Right column: tune list ─────────────────────────────────────────────
     let right_header: Element<'a, Message> = if show_flat_results {
         let total = browser.flat_index().len();
-        let label = if browser.flat_index_loaded() {
+        let label = if flat_building {
+            "Indexing tunes…".to_string()
+        } else {
             format!(
                 "{} matches across all (showing up to 500 of {})",
                 flat_results.len(),
                 total
             )
-        } else {
-            "Indexing tunes…".to_string()
         };
         row![
             text("🔍 Search results")
@@ -2653,13 +2680,17 @@ pub fn hvsc_browser_view<'a>(
     // Tune rows (no virtualisation for MVP — typical author has <50 tunes).
     let mut tune_col: Column<'a, Message> = column![].spacing(1);
     if show_flat_results {
-        // Global search results: each row shows filename + author/section
-        // attribution, since hits can come from anywhere in the category.
+        // Global search results — mirror the per-author column layout so
+        // the user sees the same signal (title / author / released / #
+        // songs / duration / STIL) whether browsing an author or
+        // searching across the whole category.
         let col_author_w = Length::FillPortion(3);
-        let col_actions_pad = Length::Fixed(72.0);
+        let col_subs_w = Length::Fixed(40.0);
+        let col_len_w = Length::Fixed(60.0);
+        let col_stil_w = Length::Fixed(40.0);
         tune_col = tune_col.push(
             row![
-                text("Filename")
+                text("Title")
                     .size(font::sized(11.0))
                     .color(Color::from_rgb(0.55, 0.57, 0.62))
                     .width(Length::FillPortion(5)),
@@ -2667,33 +2698,68 @@ pub fn hvsc_browser_view<'a>(
                     .size(font::sized(11.0))
                     .color(Color::from_rgb(0.55, 0.57, 0.62))
                     .width(col_author_w),
-                Space::new().width(col_actions_pad),
+                text("#")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_subs_w),
+                text("Len")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_len_w),
+                text("STIL")
+                    .size(font::sized(11.0))
+                    .color(Color::from_rgb(0.55, 0.57, 0.62))
+                    .width(col_stil_w),
+                Space::new().width(Length::Fixed(72.0)),
             ]
             .padding(Padding::from([2, 10]))
             .spacing(8)
             .align_y(Alignment::Center),
         );
-        for &fi in &flat_results {
-            let f = &browser.flat_index()[fi];
-            let row_widget = row![
-                text(&f.stem)
-                    .size(font::sized(13.0))
-                    .color(Color::from_rgb(0.85, 0.87, 0.9))
-                    .width(Length::FillPortion(5))
-                    .wrapping(text::Wrapping::None),
-                text(&f.author_raw)
-                    .size(font::sized(12.0))
-                    .color(Color::from_rgb(0.65, 0.67, 0.72))
-                    .width(col_author_w)
-                    .wrapping(text::Wrapping::None),
-                tool_button("▶", Message::HvscBrowserPlayFlat(fi)),
-                Space::new().width(Length::Fixed(4.0)),
-                tool_button("➕", Message::HvscBrowserAddFlat(fi)),
-            ]
-            .padding(Padding::from([2, 10]))
-            .spacing(8)
-            .align_y(Alignment::Center);
-            tune_col = tune_col.push(row_widget);
+        if flat_building {
+            // No rows yet — the header already shows "Indexing tunes…";
+            // leave the tune column empty rather than flashing a stale
+            // list from a prior category.
+        } else {
+            for &fi in &flat_results {
+                let f = &browser.flat_index()[fi];
+                let duration_label = match f.duration_secs {
+                    Some(s) => format!("{}:{:02}", s / 60, s % 60),
+                    None => "—".to_string(),
+                };
+                let stil_marker = if f.has_stil { "✓" } else { "" };
+                let row_widget = row![
+                    text(&f.title)
+                        .size(font::sized(13.0))
+                        .color(Color::from_rgb(0.85, 0.87, 0.9))
+                        .width(Length::FillPortion(5))
+                        .wrapping(text::Wrapping::None),
+                    text(&f.author_raw)
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.65, 0.67, 0.72))
+                        .width(col_author_w)
+                        .wrapping(text::Wrapping::None),
+                    text(f.songs.to_string())
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.65, 0.67, 0.72))
+                        .width(col_subs_w),
+                    text(duration_label)
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.65, 0.67, 0.72))
+                        .width(col_len_w),
+                    text(stil_marker)
+                        .size(font::sized(12.0))
+                        .color(Color::from_rgb(0.4, 0.85, 0.5))
+                        .width(col_stil_w),
+                    tool_button("▶", Message::HvscBrowserPlayFlat(fi)),
+                    Space::new().width(Length::Fixed(4.0)),
+                    tool_button("➕", Message::HvscBrowserAddFlat(fi)),
+                ]
+                .padding(Padding::from([2, 10]))
+                .spacing(8)
+                .align_y(Alignment::Center);
+                tune_col = tune_col.push(row_widget);
+            }
         }
     } else if browser.selected_author().is_some() {
         // Column widths. Title + Released share the flexible space with
