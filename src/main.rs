@@ -243,6 +243,10 @@ struct App {
     config: Config,
     /// Whether the settings panel is currently visible.
     show_settings: bool,
+    /// Which tab of the Settings panel is currently in view. In-memory
+    /// only — resets to `General` on each launch (intentional; see
+    /// `SettingsTab` doc-comment).
+    settings_tab: ui::SettingsTab,
     /// Whether the USBSID-Pico Device Config panel is currently visible.
     show_device_config: bool,
     /// Cached state for the Device Config panel. `None` means we haven't
@@ -579,6 +583,7 @@ impl App {
             sort_direction: SortDirection::Ascending,
             config,
             show_settings: false,
+            settings_tab: ui::SettingsTab::General,
             show_device_config: false,
             device_cfg: None,
             device_cfg_status: String::new(),
@@ -1441,7 +1446,15 @@ impl App {
                     self.show_sid_panel = false;
                     self.show_device_config = false;
                     self.show_hvsc_browser = false;
+                    // Reset the tab to General each time the panel is opened
+                    // — the tab strip is a quick swap, and re-opening is
+                    // when you want a fresh look at "everything".
+                    self.settings_tab = ui::SettingsTab::General;
                 }
+            }
+
+            Message::SettingsTabChanged(t) => {
+                self.settings_tab = t;
             }
 
             Message::ToggleDeviceConfig => {
@@ -3158,6 +3171,7 @@ impl App {
                 &self.hvsc_sync_status,
                 self.hvsc_sync_progress,
                 self.sleep_selected_mins,
+                self.settings_tab,
             );
             column![
                 info_bar,
