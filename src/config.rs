@@ -102,6 +102,12 @@ pub struct Config {
     /// effect on the USB hardware engine (analog output, not reachable
     /// from host). Default 1.0 = unity gain (no change vs prior versions).
     pub master_volume: f32,
+    /// Where the 🎲 Surprise Me button (mini + big player) picks from.
+    /// `"hvsc"` = random tune from the HVSC library (default),
+    /// `"playlist"` = random entry from the currently-loaded playlist.
+    /// Falls back to HVSC when the playlist mode is set but the
+    /// playlist is empty, so the button always does something.
+    pub surprise_source: String,
 }
 
 impl Default for Config {
@@ -139,6 +145,7 @@ impl Default for Config {
             window_height_saved: DEFAULT_WINDOW_HEIGHT,
             base_font_size: 12.0,
             master_volume: 1.0,
+            surprise_source: "hvsc".to_string(),
         }
     }
 }
@@ -356,6 +363,13 @@ impl Config {
                 if let Ok(n) = val.parse::<f32>() {
                     config.master_volume = n.clamp(0.0, 1.0);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"surprise_source\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(s) = strip_json_string(val) {
+                    if s == "hvsc" || s == "playlist" {
+                        config.surprise_source = s;
+                    }
+                }
             }
         }
 
@@ -416,7 +430,8 @@ impl Config {
                 "  \"window_width_saved\": {},\n",
                 "  \"window_height_saved\": {},\n",
                 "  \"base_font_size\": {},\n",
-                "  \"master_volume\": {}\n",
+                "  \"master_volume\": {},\n",
+                "  \"surprise_source\": \"{}\"\n",
                 "}}\n",
             ),
             self.skip_rsid,
@@ -451,6 +466,7 @@ impl Config {
             self.window_height_saved,
             self.base_font_size,
             self.master_volume,
+            self.surprise_source,
         )
     }
 

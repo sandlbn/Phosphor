@@ -1595,6 +1595,15 @@ impl App {
                 }
             }
 
+            Message::VolumeNudge(delta) => {
+                let target = (self.config.master_volume + delta).clamp(0.0, 1.0);
+                if (target - self.config.master_volume).abs() > 1e-4 {
+                    self.config.master_volume = target;
+                    crate::audio_volume::set(target);
+                    self.config.save();
+                }
+            }
+
             Message::BaseFontSizeChanged(val) => {
                 // Echo the keystroke back into the input buffer so the
                 // field remains editable mid-type. On a successful parse
@@ -2334,6 +2343,32 @@ impl App {
                         });
                         self.show_hvsc_browser = false;
                     }
+                }
+            }
+
+            // ── 🎲 Surprise Me (mini + big player button) ──────────────────
+            // Dispatches to either the HVSC handler or a playlist pick,
+            // based on `config.surprise_source`. Falls back to HVSC when
+            // playlist mode is selected but nothing is loaded.
+            Message::SurpriseMe => {
+                let want_playlist = self.config.surprise_source == "playlist";
+                let has_playlist = !self.playlist.entries.is_empty();
+                if want_playlist && has_playlist {
+                    use rand::Rng;
+                    let n = self.playlist.entries.len();
+                    let idx = rand::thread_rng().gen_range(0..n);
+                    self.selected = Some(idx);
+                    self.play_track(idx);
+                } else {
+                    return iced::Task::done(Message::HvscBrowserSurpriseMe);
+                }
+            }
+
+            Message::SetSurpriseSource(src) => {
+                if matches!(src.as_str(), "hvsc" | "playlist") && self.config.surprise_source != src
+                {
+                    self.config.surprise_source = src;
+                    self.config.save();
                 }
             }
 
@@ -3374,9 +3409,35 @@ impl App {
                     {
                         Some(Message::ToggleVisFull)
                     }
+                    // Shift+H — toggle shuffle (checked before plain H so
+                    // the shift variant wins even though the H handler
+                    // is case-sensitive on lowercase "h").
+                    Key::Character(ref c)
+                        if c.as_str().eq_ignore_ascii_case("h")
+                            && modifiers.shift()
+                            && status != Status::Captured =>
+                    {
+                        Some(Message::ToggleShuffle)
+                    }
                     // H — toggle favourite for currently playing track
                     Key::Character(ref c) if c.as_str() == "h" && status != Status::Captured => {
                         Some(Message::ToggleFavoriteCurrent)
+                    }
+                    // , — nudge master volume down 5%
+                    Key::Character(ref c)
+                        if c.as_str() == ","
+                            && !modifiers.shift()
+                            && status != Status::Captured =>
+                    {
+                        Some(Message::VolumeNudge(-0.05))
+                    }
+                    // . — nudge master volume up 5%
+                    Key::Character(ref c)
+                        if c.as_str() == "."
+                            && !modifiers.shift()
+                            && status != Status::Captured =>
+                    {
+                        Some(Message::VolumeNudge(0.05))
                     }
                     // K — toggle karaoke mode (MUS files with WDS lyrics)
                     Key::Character(ref c) if c.as_str() == "k" && status != Status::Captured => {
