@@ -20,6 +20,25 @@ title: Phosphor — SID music player
   </div>
 </section>
 
+<section id="trailer" markdown="1">
+## Watch the trailer
+
+<div class="video-wrap">
+  <iframe
+    src="https://www.youtube-nocookie.com/embed/EjtkkvrJL3Q"
+    title="Phosphor — SID music player trailer"
+    loading="lazy"
+    frameborder="0"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    allowfullscreen>
+  </iframe>
+</div>
+
+<p class="dim" style="margin-top: 12px; text-align: center;">
+  Trailer by <a href="https://www.youtube.com/@exploraart">@exploraart</a> — Adam Kazmierski.
+</p>
+</section>
+
 <section id="what" markdown="1">
 ## What is Phosphor?
 
@@ -129,6 +148,24 @@ Features that go beyond a basic player: full sub-tune navigation, multi-SID (1/2
     <div class="icon">❤️</div>
     <h3>Favorites + history</h3>
     <p>Heart any tune, filter to favorites only, plus a persistent log of the last 100 played and every unique SID heard.</p>
+  </div>
+
+  <div class="feature">
+    <div class="icon">🔍</div>
+    <h3>Rich HVSC search</h3>
+    <p>Global search across a whole category shows title, released, subsong count, duration, and STIL ✓ for every hit — not just filenames. Indexes lazily in the background on your first keystroke.</p>
+  </div>
+
+  <div class="feature">
+    <div class="icon">⚙️</div>
+    <h3>Focused Settings</h3>
+    <p>Five tabs — General, Audio, Library, Network, Help — so you find the knob you want without scrolling a wall of options.</p>
+  </div>
+
+  <div class="feature">
+    <div class="icon">💡</div>
+    <h3>Button tooltips + shortcuts</h3>
+    <p>Every transport / toolbar button carries a hover hint in both mini and full player. Volume, shuffle, favourite, and mini-player toggles are all keyboard-driven.</p>
   </div>
 
 </div>
@@ -281,6 +318,8 @@ Full per-platform build instructions (macOS bundle signing, Linux .deb packaging
       <tr><td><kbd>V</kbd></td><td>Cycle visualiser mode (Bars / Scope / Tracker / Karaoke)</td></tr>
       <tr><td><kbd>K</kbd></td><td>Toggle karaoke lyrics (MUS files with <code>.wds</code>)</td></tr>
       <tr><td><kbd>H</kbd></td><td>Toggle favourite for currently playing track</td></tr>
+      <tr><td><kbd>Shift</kbd> + <kbd>H</kbd></td><td>Toggle shuffle</td></tr>
+      <tr><td><kbd>,</kbd> / <kbd>.</kbd></td><td>Nudge master volume −5% / +5%</td></tr>
       <tr><td><kbd>M</kbd></td><td>Toggle mini player mode</td></tr>
       <tr><td><kbd>Delete</kbd></td><td>Remove selected track</td></tr>
       <tr><td><kbd>Ctrl</kbd> + <kbd>F</kbd></td><td>Focus search</td></tr>
