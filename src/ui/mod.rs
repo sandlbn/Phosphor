@@ -93,6 +93,50 @@ pub struct DeviceConfigSnapshot {
     pub config: usbsid_pico_config::DeviceConfig,
 }
 
+/// Which tab of the Settings panel is currently in view. Defaults to
+/// General on each launch — the tabs are cheap to switch and persisting
+/// this would hide the user's other pinned state (e.g. mid-typing in
+/// the HTTP proxy URL) when they reopen Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    Audio,
+    Library,
+    Network,
+    Help,
+}
+
+impl SettingsTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "⏯ General",
+            SettingsTab::Audio => "🔊 Audio",
+            SettingsTab::Library => "📚 Library",
+            SettingsTab::Network => "🌐 Network",
+            SettingsTab::Help => "❓ Help",
+        }
+    }
+
+    pub fn tip(self) -> &'static str {
+        match self {
+            SettingsTab::General => "Skip RSID · stereo · length · sleep · surprise · font size",
+            SettingsTab::Audio => "Output engine · Ultimate 64 · macOS USB transport",
+            SettingsTab::Library => "HVSC sync · Songlengths · STIL",
+            SettingsTab::Network => "HTTP proxy · Remote-control server",
+            SettingsTab::Help => "Keyboard shortcuts",
+        }
+    }
+
+    pub const ALL: [SettingsTab; 5] = [
+        SettingsTab::General,
+        SettingsTab::Audio,
+        SettingsTab::Library,
+        SettingsTab::Network,
+        SettingsTab::Help,
+    ];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Messages
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +241,9 @@ pub enum Message {
 
     // Settings
     ToggleSettings,
+    /// Switch which Settings tab is in view. In-memory only, no config
+    /// persistence — see `SettingsTab` doc-comment.
+    SettingsTabChanged(SettingsTab),
     ToggleSkipRsid,
     ToggleForceStereo2sid,
     /// macOS-only: switch USB transport between root bridge daemon and
@@ -3009,6 +3056,9 @@ pub fn settings_panel<'a>(
     hvsc_sync_progress: Option<(u32, u32)>,
     // Currently-armed sleep timer duration (minutes). `None` = disabled.
     sleep_selected_mins: Option<u32>,
+    // Which tab is currently in view — selects which section subset is
+    // composed into the scrollable content column at the end.
+    active_tab: SettingsTab,
 ) -> Element<'a, Message> {
     let header = row![
         text("Settings")
@@ -3606,17 +3656,29 @@ pub fn settings_panel<'a>(
     .spacing(6);
 
     // ── Keyboard shortcuts ───────────────────────────────────────
+    // Kept in sync with the keyboard subscription in main.rs — every
+    // key the app actually handles is listed here. Groups: transport,
+    // navigation, mode toggles, volume, panels, meta.
     let mut kb_col = column![text("Keyboard shortcuts:")
         .size(font::sized(14.0))
         .color(Color::from_rgb(0.75, 0.77, 0.82))]
     .spacing(4);
     for (key, desc) in [
         ("Space", "Play / Pause (when search inactive)"),
-        ("← →", "Previous / Next track"),
-        ("↑ ↓", "Navigate playlist"),
+        ("← / →", "Previous / Next track"),
+        ("↑ / ↓", "Select previous / next in playlist"),
+        ("Delete", "Remove selected track"),
+        ("H", "Toggle favourite for current track"),
+        ("Shift+H", "Toggle shuffle"),
+        (", / .", "Nudge master volume −5% / +5%"),
+        ("V", "Cycle visualiser (Bars / Scope / Tracker / Karaoke)"),
+        ("F", "Toggle full-screen visualiser"),
+        ("K", "Toggle karaoke lyrics (MUS files)"),
+        ("M", "Toggle mini player"),
         ("L", "Toggle 📚 Library panel"),
-        ("Delete", "Remove selected"),
         ("Ctrl+F", "Focus search"),
+        ("?", "Show / hide help overlay"),
+        ("Escape", "Close overlay / context menu"),
     ] {
         kb_col = kb_col.push(
             row![
@@ -3632,42 +3694,124 @@ pub fn settings_panel<'a>(
         );
     }
 
+    // ── Tab strip ───────────────────────────────────────────────
+    // Horizontal row of 5 pill buttons; the active tab gets a bright
+    // green background (same treatment as the sleep-timer picker
+    // above), the rest stay dim. Hovering any tab shows a one-line
+    // hint of what's inside — helpful before you know the layout.
+    let tab_button = |tab: SettingsTab| -> Element<'a, Message> {
+        let is_active = tab == active_tab;
+        let btn: Element<'a, Message> = button(text(tab.label()).size(font::sized(12.0)).color(
+            if is_active {
+                Color::from_rgb(0.10, 0.12, 0.15)
+            } else {
+                Color::from_rgb(0.80, 0.82, 0.90)
+            },
+        ))
+        .on_press(Message::SettingsTabChanged(tab))
+        .padding(Padding::from([6, 14]))
+        .style(move |_theme: &Theme, st| {
+            let bg = if is_active {
+                match st {
+                    button::Status::Hovered => Color::from_rgb(0.40, 0.85, 0.55),
+                    button::Status::Pressed => Color::from_rgb(0.30, 0.70, 0.45),
+                    _ => Color::from_rgb(0.35, 0.80, 0.50),
+                }
+            } else {
+                match st {
+                    button::Status::Hovered => Color::from_rgb(0.22, 0.25, 0.30),
+                    button::Status::Pressed => Color::from_rgb(0.15, 0.17, 0.20),
+                    _ => Color::from_rgb(0.16, 0.18, 0.22),
+                }
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                text_color: if is_active {
+                    Color::from_rgb(0.10, 0.12, 0.15)
+                } else {
+                    Color::from_rgb(0.80, 0.82, 0.90)
+                },
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    width: 1.0,
+                    color: if is_active {
+                        Color::from_rgb(0.40, 0.85, 0.55)
+                    } else {
+                        Color::from_rgb(0.25, 0.27, 0.32)
+                    },
+                },
+                ..Default::default()
+            }
+        })
+        .into();
+        with_tip(btn, tab.tip())
+    };
+
+    let mut tab_strip: Row<'a, Message> = row![].spacing(6);
+    for &t in SettingsTab::ALL.iter() {
+        tab_strip = tab_strip.push(tab_button(t));
+    }
+
+    // ── Per-tab content ─────────────────────────────────────────
+    // Only the sections belonging to the active tab are pushed into
+    // the scrollable column. Every *_section is a cheap `Element`
+    // tree with no I/O — building all of them upfront and picking
+    // here is simpler than plumbing conditional construction.
+    let mut tab_content: Column<'a, Message> = column![].spacing(16);
+    match active_tab {
+        SettingsTab::General => {
+            tab_content = tab_content
+                .push(rsid_section)
+                .push(rule::horizontal(1))
+                .push(surprise_section)
+                .push(rule::horizontal(1))
+                .push(stereo_section)
+                .push(rule::horizontal(1))
+                .push(length_section)
+                .push(rule::horizontal(1))
+                .push(sleep_section)
+                .push(rule::horizontal(1))
+                .push(font_size_section);
+        }
+        SettingsTab::Audio => {
+            tab_content = tab_content
+                .push(engine_col)
+                .push(rule::horizontal(1))
+                .push(macos_usb_section);
+        }
+        SettingsTab::Library => {
+            tab_content = tab_content
+                .push(hvsc_section)
+                .push(rule::horizontal(1))
+                .push(dl_section)
+                .push(rule::horizontal(1))
+                .push(stil_section);
+        }
+        SettingsTab::Network => {
+            tab_content = tab_content
+                .push(proxy_section)
+                .push(rule::horizontal(1))
+                .push(remote_section);
+        }
+        SettingsTab::Help => {
+            tab_content = tab_content.push(kb_col);
+        }
+    }
+
+    // Header + tab strip stay anchored; only the tab body scrolls.
     let content = column![
         header,
         rule::horizontal(1),
-        engine_col,
+        tab_strip,
         rule::horizontal(1),
-        macos_usb_section,
-        rule::horizontal(1),
-        rsid_section,
-        rule::horizontal(1),
-        surprise_section,
-        rule::horizontal(1),
-        stereo_section,
-        rule::horizontal(1),
-        length_section,
-        rule::horizontal(1),
-        font_size_section,
-        rule::horizontal(1),
-        sleep_section,
-        rule::horizontal(1),
-        proxy_section,
-        rule::horizontal(1),
-        dl_section,
-        rule::horizontal(1),
-        stil_section,
-        rule::horizontal(1),
-        hvsc_section,
-        rule::horizontal(1),
-        remote_section,
-        rule::horizontal(1),
-        kb_col,
+        scrollable(tab_content.padding(Padding::from([4, 0]))).height(Length::Fill),
     ]
-    .spacing(16)
+    .spacing(12)
     .padding(Padding::from([16, 24]))
-    .width(Length::Fill);
+    .width(Length::Fill)
+    .height(Length::Fill);
 
-    container(scrollable(content))
+    container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_theme: &Theme| container::Style {
