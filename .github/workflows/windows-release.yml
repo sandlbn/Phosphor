@@ -25,6 +25,19 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+  # Build/package test on branches. Opening a PR that touches the Windows
+  # packaging files runs the full build + installer, uploading the installer as
+  # a downloadable workflow artifact. Signing is auto-skipped unless the
+  # SignPath secret/variable are set (see DO_SIGN below), so it stays green
+  # before SignPath is wired up and on PRs from forks.
+  pull_request:
+    paths:
+      - '.github/workflows/windows-release.yml'
+      - 'windows/**'
+      - '.cargo/config.toml'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 permissions:
   contents: write   # create the GitHub Release + upload the installer asset
@@ -33,6 +46,11 @@ permissions:
 jobs:
   build-sign-release:
     runs-on: windows-latest
+    # 'true' only when both the token and org id are present. Referenced as
+    # env.DO_SIGN in step `if:` guards so the signing + release steps skip
+    # cleanly (green) when SignPath isn't configured yet.
+    env:
+      DO_SIGN: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,10 +76,15 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      - name: Signing status
+        if: env.DO_SIGN != 'true'
+        run: echo "::warning::SignPath not configured (SIGNPATH_API_TOKEN / SIGNPATH_ORGANIZATION_ID missing) — building an UNSIGNED installer for testing. Signing + release publishing are skipped."
+
       # ── Sign phosphor.exe via SignPath (sign the app binary first, so the
       #    exe that ends up inside the installer is itself signed) ────────────
       - name: Upload unsigned phosphor.exe
         id: upload_exe
+        if: env.DO_SIGN == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: phosphor-exe-unsigned
@@ -69,6 +92,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign phosphor.exe (SignPath)
+        if: env.DO_SIGN == 'true'
         uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -82,10 +106,11 @@ jobs:
           output-artifact-directory: signed/exe
 
       - name: Swap in the signed exe
+        if: env.DO_SIGN == 'true'
         shell: pwsh
         run: Copy-Item signed/exe/phosphor.exe target/release/phosphor.exe -Force
 
-      # ── Build the installer around the signed exe ────────────────────────
+      # ── Build the installer around the (signed, if enabled) exe ──────────
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -93,9 +118,11 @@ jobs:
             "/DMyAppVersion=${{ steps.version.outputs.version }}" `
             windows\phosphor.iss
 
-      # ── Sign the installer via SignPath ──────────────────────────────────
+      # ── Sign the installer via SignPath, then overwrite dist\ in place so
+      #    dist\...-setup.exe is always the final artifact (signed or not) ────
       - name: Upload unsigned installer
         id: upload_installer
+        if: env.DO_SIGN == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: phosphor-installer-unsigned
@@ -103,6 +130,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign installer (SignPath)
+        if: env.DO_SIGN == 'true'
         uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -115,20 +143,28 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: signed/installer
 
-      # Keep the signed installer as a build artifact even for manual runs.
-      - name: Upload signed installer (workflow artifact)
+      - name: Promote signed installer into dist
+        if: env.DO_SIGN == 'true'
+        shell: pwsh
+        run: Copy-Item "signed/installer/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe" "dist/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe" -Force
+
+      # Always publish the installer as a downloadable workflow artifact — this
+      # is what you grab to test the installer on a branch/PR run. It is signed
+      # when DO_SIGN is true, unsigned otherwise.
+      - name: Upload installer (workflow artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: phosphor-installer-signed
-          path: signed/installer/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
+          name: phosphor-windows-installer
+          path: dist/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
           if-no-files-found: error
 
-      # ── Publish. The asset name ends in `-setup.exe`, which the docs site's
-      #    download resolver already prefers, and the `.exe` suffix keeps the
-      #    in-app updater (src/version_check.rs) matching — no other changes. ─
-      - name: Attach signed installer to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+      # ── Publish to a GitHub Release on tag pushes only. The asset name ends
+      #    in `-setup.exe`, which the docs site's download resolver already
+      #    prefers, and the `.exe` suffix keeps the in-app updater
+      #    (src/version_check.rs) matching — no other changes needed. ─────────
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && env.DO_SIGN == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: signed/installer/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
+          files: dist/Phosphor-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
           fail_on_unmatched_files: true

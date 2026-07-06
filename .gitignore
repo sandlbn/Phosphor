@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Packaging / distribution artifacts (installers, bundles, .deb/.pkg/.exe)
+/dist/
+
+# CI signing working directories (SignPath downloads signed artifacts here)
+/signed/
+
+# Code-signing material — never commit private keys / certificates
+*.pfx
+*.p12
+*.snk
+
+# Stray local archive
+/src.zip
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
