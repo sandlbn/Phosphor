@@ -211,6 +211,9 @@ pub enum Message {
     /// Clear `config.proxy_url` so all clients drop their proxy on next request.
     ProxyClear,
     VolumeChanged(f32),
+    /// Nudge master volume by a signed delta (e.g. -0.05 / +0.05 from the
+    /// , / . keyboard shortcuts). Clamped to [0, 1] in the handler.
+    VolumeNudge(f32),
     DownloadSonglength,
     SonglengthDownloaded(Result<PathBuf, String>),
     SetOutputEngine(String),
@@ -281,6 +284,14 @@ pub enum Message {
     /// 🎲 Surprise Me — pick a random tune from the current HVSC category
     /// and play it. Builds the flat index lazily on first click.
     HvscBrowserSurpriseMe,
+    /// 🎲 Surprise Me (mini / big player button) — dispatches based on
+    /// `Config::surprise_source`: `"hvsc"` walks the HVSC library,
+    /// `"playlist"` picks a random entry from the loaded playlist.
+    /// Falls back to HVSC when playlist is set but empty.
+    SurpriseMe,
+    /// Change the source that the 🎲 button picks from. Payload is
+    /// `"hvsc"` or `"playlist"`; persisted to config on change.
+    SetSurpriseSource(String),
     /// Background flat-index build has finished. Payload: `(version, index)`.
     /// The version is compared against the browser's current
     /// `flat_index_version` and stale results (from a category the user
@@ -748,30 +759,52 @@ pub fn controls_bar<'a>(
         .into()
     };
 
+    let play_tip = match status.state {
+        PlayState::Playing => "Pause (Space)",
+        _ => "Play (Space)",
+    };
     let transport = row![
-        small_button("◄◄", Message::PrevTrack),
-        small_button(play_label, Message::PlayPause),
-        small_button("■", Message::Stop),
-        small_button("►►", Message::NextTrack),
+        with_tip(small_button("◄◄", Message::PrevTrack), "Previous track (←)"),
+        with_tip(small_button(play_label, Message::PlayPause), play_tip),
+        with_tip(small_button("■", Message::Stop), "Stop"),
+        with_tip(small_button("►►", Message::NextTrack), "Next track (→)"),
+        with_tip(
+            small_button("🎲", Message::SurpriseMe),
+            "Surprise me — random tune (source is configurable in Settings)",
+        ),
     ]
     .spacing(4);
 
     let subtune_controls = row![
-        small_button("◄ tune", Message::PrevSubtune),
-        small_button("tune ►", Message::NextSubtune),
+        with_tip(
+            small_button("◄ tune", Message::PrevSubtune),
+            "Previous subtune"
+        ),
+        with_tip(small_button("tune ►", Message::NextSubtune), "Next subtune"),
     ]
     .spacing(4);
 
+    let shuffle_tip = if playlist.shuffle {
+        "Shuffle: on — click to disable (Shift+H)"
+    } else {
+        "Shuffle: off — click to enable (Shift+H)"
+    };
     let mode_controls = row![
-        small_button(
-            if playlist.shuffle {
-                "🔀 On"
-            } else {
-                "🔀 Off"
-            },
-            Message::ToggleShuffle
+        with_tip(
+            small_button(
+                if playlist.shuffle {
+                    "🔀 On"
+                } else {
+                    "🔀 Off"
+                },
+                Message::ToggleShuffle,
+            ),
+            shuffle_tip,
         ),
-        small_button(playlist.repeat.label(), Message::CycleRepeat),
+        with_tip(
+            small_button(playlist.repeat.label(), Message::CycleRepeat),
+            "Cycle repeat mode (off → all → one)",
+        ),
     ]
     .spacing(4);
 
@@ -856,20 +889,50 @@ pub fn controls_bar<'a>(
     // File-ops sub-group (add to playlist, open/save/clear).
     let file_ops = if compact {
         row![
-            small_button("➕", Message::AddFiles),
-            small_button("📁", Message::AddFolder),
-            small_button("📂", Message::LoadPlaylist),
-            small_button("💾", Message::SavePlaylist),
-            small_button("🗑", Message::ClearPlaylist),
+            with_tip(
+                small_button("➕", Message::AddFiles),
+                "Add SID files to playlist"
+            ),
+            with_tip(
+                small_button("📁", Message::AddFolder),
+                "Add all SIDs from a folder"
+            ),
+            with_tip(
+                small_button("📂", Message::LoadPlaylist),
+                "Load a saved playlist (.m3u)"
+            ),
+            with_tip(
+                small_button("💾", Message::SavePlaylist),
+                "Save current playlist (.m3u)"
+            ),
+            with_tip(
+                small_button("🗑", Message::ClearPlaylist),
+                "Clear the playlist"
+            ),
         ]
         .spacing(3)
     } else {
         row![
-            small_button("➕ Files", Message::AddFiles),
-            small_button("📁 Folder", Message::AddFolder),
-            small_button("📂 Open", Message::LoadPlaylist),
-            small_button("💾 Save", Message::SavePlaylist),
-            small_button("🗑 Clear", Message::ClearPlaylist),
+            with_tip(
+                small_button("➕ Files", Message::AddFiles),
+                "Add SID files to playlist"
+            ),
+            with_tip(
+                small_button("📁 Folder", Message::AddFolder),
+                "Add all SIDs from a folder"
+            ),
+            with_tip(
+                small_button("📂 Open", Message::LoadPlaylist),
+                "Load a saved playlist (.m3u)"
+            ),
+            with_tip(
+                small_button("💾 Save", Message::SavePlaylist),
+                "Save current playlist (.m3u)"
+            ),
+            with_tip(
+                small_button("🗑 Clear", Message::ClearPlaylist),
+                "Clear the playlist"
+            ),
         ]
         .spacing(4)
     };
@@ -884,7 +947,12 @@ pub fn controls_bar<'a>(
         } else {
             accent_button("📚 Library", Message::ToggleHvscBrowser)
         };
-        if hvsc_needs_attention {
+        let library_tip = if hvsc_needs_attention {
+            "Open HVSC Library (needs sync — click to open Settings)"
+        } else {
+            "Open HVSC Library — browse authors and tunes (L)"
+        };
+        let inner: Element<'a, Message> = if hvsc_needs_attention {
             let ring = Canvas::new(LibraryRing { tick, active: true })
                 .width(Length::Fill)
                 .height(Length::Fill);
@@ -895,24 +963,36 @@ pub fn controls_bar<'a>(
             iced::widget::stack![btn, ring].into()
         } else {
             btn
-        }
+        };
+        with_tip(inner, library_tip)
     };
 
     // Panel-toggles sub-group (history / SID panel / device config / settings).
+    let recent_btn_tipped = with_tip(recent_btn, "Recently played");
+    let sid_btn_tipped = with_tip(sid_btn, "SID register panel");
     let panel_toggles = if compact {
         row![
-            recent_btn,
-            sid_btn,
-            small_button("🔧", Message::ToggleDeviceConfig),
-            small_button("⚙", Message::ToggleSettings),
+            recent_btn_tipped,
+            sid_btn_tipped,
+            with_tip(
+                small_button("🔧", Message::ToggleDeviceConfig),
+                "USB SID Pico device configuration"
+            ),
+            with_tip(small_button("⚙", Message::ToggleSettings), "Settings"),
         ]
         .spacing(3)
     } else {
         row![
-            recent_btn,
-            sid_btn,
-            small_button("🔧 Device", Message::ToggleDeviceConfig),
-            small_button("⚙ Settings", Message::ToggleSettings),
+            recent_btn_tipped,
+            sid_btn_tipped,
+            with_tip(
+                small_button("🔧 Device", Message::ToggleDeviceConfig),
+                "USB SID Pico device configuration"
+            ),
+            with_tip(
+                small_button("⚙ Settings", Message::ToggleSettings),
+                "Settings"
+            ),
         ]
         .spacing(4)
     };
@@ -3052,6 +3132,40 @@ pub fn settings_panel<'a>(
                 .color(Color::from_rgb(0.45, 0.47, 0.52)),
         );
 
+    // ── Surprise Me source ───────────────────────────────────────
+    let surprise_playlist = config.surprise_source == "playlist";
+    let surprise_section = column![
+        text("🎲 Surprise Me source:")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        iced::widget::row![
+            tool_button(
+                if !surprise_playlist {
+                    "✓ HVSC library"
+                } else {
+                    "  HVSC library"
+                },
+                Message::SetSurpriseSource("hvsc".to_string()),
+            ),
+            tool_button(
+                if surprise_playlist {
+                    "✓ Current playlist"
+                } else {
+                    "  Current playlist"
+                },
+                Message::SetSurpriseSource("playlist".to_string()),
+            ),
+        ]
+        .spacing(8),
+        text(
+            "Where the 🎲 button picks from. Playlist mode falls back to HVSC \
+             when the playlist is empty, so the button always does something."
+        )
+        .size(font::sized(11.0))
+        .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
+
     // ── Skip RSID ────────────────────────────────────────────────
     let rsid_section = column![
         text("Skip RSID tunes:")
@@ -3527,6 +3641,8 @@ pub fn settings_panel<'a>(
         rule::horizontal(1),
         rsid_section,
         rule::horizontal(1),
+        surprise_section,
+        rule::horizontal(1),
         stereo_section,
         rule::horizontal(1),
         length_section,
@@ -3727,6 +3843,33 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Small utility button used throughout the settings panel and toolbars.
+/// Wrap `content` so hovering shows a small `tip` bubble above it.
+/// Used on transport / mode buttons in both mini and big player so a
+/// user new to the layout can discover what each icon does.
+fn with_tip<'a>(content: impl Into<Element<'a, Message>>, tip: &'a str) -> Element<'a, Message> {
+    let bubble = container(
+        text(tip)
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.90, 0.92, 0.96))
+            .wrapping(text::Wrapping::None),
+    )
+    .padding(Padding::from([4, 8]))
+    .style(|_t: &Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.10, 0.12, 0.15))),
+        text_color: Some(Color::from_rgb(0.90, 0.92, 0.96)),
+        border: iced::Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: Color::from_rgb(0.30, 0.32, 0.36),
+        },
+        ..Default::default()
+    });
+    iced::widget::Tooltip::new(content, bubble, iced::widget::tooltip::Position::Top)
+        .gap(6)
+        .snap_within_viewport(true)
+        .into()
+}
+
 fn tool_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
     button(text(label).size(font::sized(12.0)))
         .on_press(msg)
@@ -3886,6 +4029,8 @@ pub fn help_overlay<'a>() -> Element<'a, Message> {
         ),
         ("K", "Toggle karaoke lyrics (MUS files)"),
         ("H", "Toggle favourite for current track"),
+        ("Shift+H", "Toggle shuffle"),
+        (", / .", "Nudge master volume −5% / +5%"),
         ("M", "Toggle mini player"),
         ("L", "Toggle 📚 Library panel"),
         ("Ctrl+F", "Focus search"),
@@ -4345,17 +4490,38 @@ pub fn mini_player_view<'a>(
     // be re-added; the button was swapped for 🎲 Surprise).
     let _ = is_heard;
 
+    let play_stop_tip = match status.state {
+        PlayState::Playing => "Stop (Space)",
+        _ => "Play / Pause (Space)",
+    };
+    let fav_tip = if is_favorite {
+        "Remove favourite (H)"
+    } else {
+        "Add favourite (H)"
+    };
     let transport = row![
         Space::new().width(Length::Fill),
-        big_btn(fav_label, Message::ToggleFavoriteCurrent, fav_colour),
+        with_tip(
+            big_btn(fav_label, Message::ToggleFavoriteCurrent, fav_colour),
+            fav_tip,
+        ),
         Space::new().width(Length::Fill),
-        big_btn("◀◀", Message::PrevTrack, TXT_MED),
+        with_tip(
+            big_btn("◀◀", Message::PrevTrack, TXT_MED),
+            "Previous track (←)"
+        ),
         Space::new().width(Length::Fill),
-        big_btn(play_stop_label, play_stop_msg, play_stop_colour),
+        with_tip(
+            big_btn(play_stop_label, play_stop_msg, play_stop_colour),
+            play_stop_tip,
+        ),
         Space::new().width(Length::Fill),
-        big_btn("▶▶", Message::NextTrack, TXT_MED),
+        with_tip(big_btn("▶▶", Message::NextTrack, TXT_MED), "Next track (→)"),
         Space::new().width(Length::Fill),
-        big_btn("🎲", Message::HvscBrowserSurpriseMe, ACCENT),
+        with_tip(
+            big_btn("🎲", Message::SurpriseMe, ACCENT),
+            "Surprise me — random tune (source is configurable in Settings)",
+        ),
         Space::new().width(Length::Fill),
     ]
     .align_y(Alignment::Center)
@@ -4363,7 +4529,7 @@ pub fn mini_player_view<'a>(
 
     // Expand button lives in the top-right corner so it's out of the
     // main visual flow.
-    let expand_btn = button(
+    let expand_btn: Element<'a, Message> = button(
         text("⤢")
             .size(font::sized(14.0))
             .color(TXT_DIM)
@@ -4382,11 +4548,15 @@ pub fn mini_player_view<'a>(
             ..Default::default()
         },
         ..Default::default()
-    });
+    })
+    .into();
 
-    let top_bar = row![Space::new().width(Length::Fill), expand_btn]
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
+    let top_bar = row![
+        Space::new().width(Length::Fill),
+        with_tip(expand_btn, "Expand to full player (M)"),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
 
     let gap_sm = 2.0 * s;
     let gap_md = 10.0 * s;
