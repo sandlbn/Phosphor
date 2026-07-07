@@ -10,7 +10,10 @@ fn main() {
         let version = env!("CARGO_PKG_VERSION");
         res.set("CompanyName", "Marcin Spoczynski");
         res.set("ProductName", "Phosphor");
-        res.set("FileDescription", "Phosphor — a SID player for USBSID-Pico / Ultimate 64");
+        res.set(
+            "FileDescription",
+            "Phosphor — a SID player for USBSID-Pico / Ultimate 64",
+        );
         res.set("ProductVersion", version);
         res.set("FileVersion", version);
         res.set("LegalCopyright", "Copyright © Marcin Spoczynski");

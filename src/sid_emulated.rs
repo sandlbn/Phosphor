@@ -302,7 +302,7 @@ impl EmulatedDevice {
 
         let mut sid1 = SendSid::new(chip_model);
         sid1.inner()
-            .set_sampling_parameters(SamplingMethod::Fast, clock_freq, sample_rate);
+            .set_sampling_parameters(SamplingMethod::Resample, clock_freq, sample_rate);
 
         // Build ExternalFilter for the audio output rate (NOT the C64 clock rate).
         // The filter is applied per-sample at the audio rate, so coefficients
@@ -316,8 +316,11 @@ impl EmulatedDevice {
         ext3.set_clock_frequency(sample_rate as f64);
 
         eprintln!(
-            "[emulated] SID opened: MOS6581, clock={}Hz, output={}Hz, ExternalFilter=ON",
-            clock_freq, sample_rate,
+            "[emulated] SID opened: {}, clock={}Hz, output={}Hz, \
+             resampler=Resample, ExternalFilter=ON",
+            chip_model_name(chip_model),
+            clock_freq,
+            sample_rate,
         );
 
         Ok(Self {
@@ -358,11 +361,63 @@ impl EmulatedDevice {
     fn make_sid(&self) -> SendSid {
         let mut sid = SendSid::new(self.chip_model);
         sid.inner().set_sampling_parameters(
-            SamplingMethod::Fast,
+            SamplingMethod::Resample,
             self.clock_freq,
             self.sample_rate,
         );
         sid
+    }
+}
+
+/// Map the PSID/RSID header's chip-model bits to a concrete `ChipModel`.
+///
+/// Header encoding (bits 5:4 of flags at 0x76-0x77):
+///   0 = unknown, 1 = MOS6581, 2 = MOS8580, 3 = both/unknown.
+///
+/// "Both" and "unknown" both fall back to 6581 — same choice as
+/// libsidplayfp's sidplay2 default; keeps ambiguous tunes consistent
+/// with the historical baseline.
+pub fn chip_model_from_header(model_bits: u8) -> ChipModel {
+    match model_bits {
+        2 => ChipModel::Mos8580,
+        _ => ChipModel::Mos6581,
+    }
+}
+
+/// resid-rs's `ChipModel` derives only `Clone + Copy`, no `Debug` or
+/// `PartialEq`. These small helpers give us both.
+fn chip_model_name(m: ChipModel) -> &'static str {
+    match m {
+        ChipModel::Mos6581 => "MOS6581",
+        ChipModel::Mos8580 => "MOS8580",
+    }
+}
+
+fn chip_models_eq(a: ChipModel, b: ChipModel) -> bool {
+    matches!(
+        (a, b),
+        (ChipModel::Mos6581, ChipModel::Mos6581) | (ChipModel::Mos8580, ChipModel::Mos8580)
+    )
+}
+
+impl EmulatedDevice {
+    /// Rebuild every populated SID with a new chip model. Cheap
+    /// (~microseconds — `resid::Sid::new` just resets internal state).
+    fn rebuild_sids(&mut self) {
+        self.sid1 = self.make_sid();
+        if self.sid2.is_some() {
+            self.sid2 = Some(self.make_sid());
+        }
+        if self.sid3.is_some() {
+            self.sid3 = Some(self.make_sid());
+        }
+        if self.sid4.is_some() {
+            self.sid4 = Some(self.make_sid());
+        }
+        self.ext1.reset();
+        self.ext2.reset();
+        self.ext3.reset();
+        self.ext4.reset();
     }
 
     /// Clock one SID by `delta` C64 cycles, collect generated samples.
@@ -549,6 +604,20 @@ impl SidDevice for EmulatedDevice {
         );
     }
 
+    fn set_sid_model(&mut self, model: u8) {
+        let new = chip_model_from_header(model);
+        if chip_models_eq(new, self.chip_model) {
+            return;
+        }
+        self.chip_model = new;
+        self.rebuild_sids();
+        eprintln!(
+            "[emulated] SID model → {} (header={})",
+            chip_model_name(new),
+            model
+        );
+    }
+
     fn set_cycles_per_frame(&mut self, cycles: u32) {
         if cycles != self.cycles_per_frame {
             eprintln!(
@@ -698,5 +767,39 @@ impl Drop for EmulatedDevice {
         self.mute();
         self.audio_shutdown.store(true, Ordering::Relaxed);
         eprintln!("[emulated] Software SID shut down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ChipModel has no PartialEq, so match on the variant.
+    #[test]
+    fn model_0_unknown_defaults_to_6581() {
+        assert!(matches!(chip_model_from_header(0), ChipModel::Mos6581));
+    }
+
+    #[test]
+    fn model_1_maps_to_6581() {
+        assert!(matches!(chip_model_from_header(1), ChipModel::Mos6581));
+    }
+
+    #[test]
+    fn model_2_maps_to_8580() {
+        assert!(matches!(chip_model_from_header(2), ChipModel::Mos8580));
+    }
+
+    #[test]
+    fn model_3_both_defaults_to_6581_like_sidplay2() {
+        assert!(matches!(chip_model_from_header(3), ChipModel::Mos6581));
+    }
+
+    #[test]
+    fn out_of_range_falls_back_to_6581() {
+        // Real headers can't exceed 3 (bits 5:4 masked with 0x03), but
+        // the mapping should still be defensive so a corrupted header
+        // doesn't panic.
+        assert!(matches!(chip_model_from_header(255), ChipModel::Mos6581));
     }
 }
