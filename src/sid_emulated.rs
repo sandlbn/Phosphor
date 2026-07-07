@@ -301,11 +301,8 @@ impl EmulatedDevice {
         let clock_freq = PAL_CLOCK;
 
         let mut sid1 = SendSid::new(chip_model);
-        sid1.inner().set_sampling_parameters(
-            SamplingMethod::Resample,
-            clock_freq,
-            sample_rate,
-        );
+        sid1.inner()
+            .set_sampling_parameters(SamplingMethod::Resample, clock_freq, sample_rate);
 
         // Build ExternalFilter for the audio output rate (NOT the C64 clock rate).
         // The filter is applied per-sample at the audio rate, so coefficients
