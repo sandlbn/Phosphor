@@ -33,6 +33,16 @@ pub trait SidDevice: Send {
     /// Only meaningful for emulated engine; hardware devices ignore this.
     fn set_cycles_per_frame(&mut self, _cycles: u32) {}
 
+    /// Hint the SID chip model from the loaded tune's header.
+    /// Values follow the PSID/RSID flags encoding:
+    /// 0 = unknown, 1 = MOS6581, 2 = MOS8580, 3 = both/unknown.
+    /// Default no-op — the USB / U64 engines have their own model
+    /// handling (or none), and SIDLite reads the header itself.
+    /// Only the `EmulatedDevice` (resid-rs) implementation swaps chips
+    /// per tune; without this hint every tune plays through a 6581,
+    /// which sounds muffled on 8580-composed material.
+    fn set_sid_model(&mut self, _model: u8) {}
+
     /// Send a complete SID file for native playback on real hardware.
     ///
     /// Returns `Ok(true)` if the engine handles playback natively
@@ -115,8 +125,10 @@ pub fn available_engines() -> Vec<&'static str> {
 
 /// Create a SidDevice for the given engine name.
 ///
-/// "auto" tries USB first, then emulated, then U64 (if address configured).
-/// `macos_usb_mode` is "bridge" or "direct"; ignored on Linux/Windows.
+/// "auto" tries USB first, then SIDLite (libsidplayfp — better default
+/// sound than resid-rs), then the reSID emulated engine, then U64 (if
+/// address configured). `macos_usb_mode` is "bridge" or "direct";
+/// ignored on Linux/Windows.
 pub fn create_engine(
     name: &str,
     u64_address: &str,
@@ -137,7 +149,11 @@ pub fn create_engine(
     }
 }
 
-/// Auto: try USB → emulated → U64 (if address set).
+/// Auto: try USB → SIDLite → reSID emulated → U64 (if address set).
+/// SIDLite (libsidplayfp) is preferred over the resid-rs "emulated"
+/// engine because it picks the correct chip model per tune from the SID
+/// header and uses a proper resampler by default — noticeably better
+/// out-of-the-box sound than resid-rs.
 fn create_auto(
     u64_address: &str,
     u64_password: &str,
@@ -148,10 +164,16 @@ fn create_auto(
         Err(e) => eprintln!("[phosphor] USB unavailable: {e}"),
     }
 
-    eprintln!("[phosphor] Falling back to software SID emulation");
+    eprintln!("[phosphor] Falling back to SIDLite (libsidplayfp)");
+    match create_sidlite() {
+        Ok(dev) => return Ok(dev),
+        Err(e) => eprintln!("[phosphor] SIDLite unavailable: {e}"),
+    }
+
+    eprintln!("[phosphor] Falling back to reSID software emulation");
     match create_emulated() {
         Ok(dev) => return Ok(dev),
-        Err(e) => eprintln!("[phosphor] Emulation unavailable: {e}"),
+        Err(e) => eprintln!("[phosphor] reSID emulation unavailable: {e}"),
     }
 
     if !u64_address.is_empty() {

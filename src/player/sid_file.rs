@@ -242,3 +242,52 @@ pub fn parse_header(data: &[u8]) -> Result<SidHeader, String> {
 pub fn compute_hvsc_md5(sid: &SidFile) -> String {
     format!("{:x}", md5::compute(&sid.raw))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the smallest legal PSID v2 header carrying the given flags
+    /// word. Only the fields `parse_header` inspects need to be sensible
+    /// — magic, version, data_offset (0x7C for v2), and the flags word
+    /// at 0x76. Everything else stays zero.
+    fn synth_psid(flags: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 0x7C];
+        buf[0..4].copy_from_slice(b"PSID");
+        buf[4] = 0x00;
+        buf[5] = 0x02; // version 2 (required for flags to be parsed)
+        buf[6] = 0x00;
+        buf[7] = 0x7C; // data offset
+        buf[0x76] = (flags >> 8) as u8;
+        buf[0x77] = (flags & 0xff) as u8;
+        buf
+    }
+
+    #[test]
+    fn flags_sid_model_0_unknown() {
+        // bits 5:4 = 00
+        let h = parse_header(&synth_psid(0b0000_0000_0000_0000)).unwrap();
+        assert_eq!(h.sid_model, 0);
+    }
+
+    #[test]
+    fn flags_sid_model_1_6581() {
+        // bits 5:4 = 01
+        let h = parse_header(&synth_psid(0b0000_0000_0001_0000)).unwrap();
+        assert_eq!(h.sid_model, 1);
+    }
+
+    #[test]
+    fn flags_sid_model_2_8580() {
+        // bits 5:4 = 10
+        let h = parse_header(&synth_psid(0b0000_0000_0010_0000)).unwrap();
+        assert_eq!(h.sid_model, 2);
+    }
+
+    #[test]
+    fn flags_sid_model_3_both() {
+        // bits 5:4 = 11
+        let h = parse_header(&synth_psid(0b0000_0000_0011_0000)).unwrap();
+        assert_eq!(h.sid_model, 3);
+    }
+}

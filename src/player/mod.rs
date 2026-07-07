@@ -1549,6 +1549,10 @@ fn setup_playback(
     if let Some(ref mut br) = bridge {
         br.set_clock_rate(header.is_pal);
         br.reset();
+        // Emulated (resid-rs) engine swaps 6581/8580 per tune; the
+        // other engines default no-op this. Called after reset() so the
+        // fresh chip state comes up with the correct model.
+        br.set_sid_model(header.sid_model);
         thread::sleep(Duration::from_millis(50));
 
         if use_stereo {
