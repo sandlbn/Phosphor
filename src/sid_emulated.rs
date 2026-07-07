@@ -287,6 +287,22 @@ pub struct EmulatedDevice {
 
     /// Diagnostic frame counter.
     frame_counter: u64,
+
+    // Per-SID sample-carry buffers. resid-rs's resampler can emit
+    // slightly different sample counts for the same input `delta`
+    // across two SIDs (independent phase accumulators, priming after a
+    // fresh chip creation). If we mix to `filtered1.len()` unconditionally,
+    // the trailing indices fall into `.unwrap_or(&0)` and inject a 0
+    // sample on one channel — audible as clicks/cracks.
+    //
+    // Fix: after each `clock_and_push`, keep any samples beyond the
+    // mixable min-count in these buffers and prepend them to the next
+    // call's fresh output. Zero clicks; no samples lost; the resampler's
+    // phase state naturally re-aligns over the next few calls.
+    carry1: Vec<i16>,
+    carry2: Vec<i16>,
+    carry3: Vec<i16>,
+    carry4: Vec<i16>,
 }
 
 impl EmulatedDevice {
@@ -340,6 +356,10 @@ impl EmulatedDevice {
             audio_buf,
             audio_shutdown,
             frame_counter: 0,
+            carry1: Vec::new(),
+            carry2: Vec::new(),
+            carry3: Vec::new(),
+            carry4: Vec::new(),
         })
     }
 
@@ -418,6 +438,12 @@ impl EmulatedDevice {
         self.ext2.reset();
         self.ext3.reset();
         self.ext4.reset();
+        // Fresh resamplers → any queued carry belongs to the old
+        // chip's state and would be a discontinuity if mixed in.
+        self.carry1.clear();
+        self.carry2.clear();
+        self.carry3.clear();
+        self.carry4.clear();
     }
 
     /// Clock one SID by `delta` C64 cycles, collect generated samples.
@@ -507,31 +533,89 @@ impl EmulatedDevice {
             return;
         }
 
-        let filtered1: Vec<i16> = s1.iter().map(|&s| self.ext1.clock(s)).collect();
-        let filtered2: Vec<i16> = s2.iter().map(|&s| self.ext2.clock(s)).collect();
-        let filtered3: Vec<i16> = s3.iter().map(|&s| self.ext3.clock(s)).collect();
-        let filtered4: Vec<i16> = s4.iter().map(|&s| self.ext4.clock(s)).collect();
+        // Filter each SID's raw samples through the RC output-stage
+        // ExternalFilter, then prepend the previous call's leftover so
+        // this call's mix window covers "carry + fresh" continuously.
+        // The SID2/3/4 branches produce an empty vec when the chip is
+        // absent — we skip prepend + mixing for those below.
+        let mut all1: Vec<i16> = std::mem::take(&mut self.carry1);
+        all1.extend(s1.iter().map(|&s| self.ext1.clock(s)));
+        let mut all2: Vec<i16> = std::mem::take(&mut self.carry2);
+        if self.sid2.is_some() {
+            all2.extend(s2.iter().map(|&s| self.ext2.clock(s)));
+        }
+        let mut all3: Vec<i16> = std::mem::take(&mut self.carry3);
+        if self.sid3.is_some() {
+            all3.extend(s3.iter().map(|&s| self.ext3.clock(s)));
+        }
+        let mut all4: Vec<i16> = std::mem::take(&mut self.carry4);
+        if self.sid4.is_some() {
+            all4.extend(s4.iter().map(|&s| self.ext4.clock(s)));
+        }
 
-        // Push to ring buffer as stereo pairs.
+        // Mix only as many samples as EVERY populated channel can cover.
+        // The trailing samples of any longer channel(s) become carry for
+        // the next call. This eliminates the length-mismatch click.
+        let mut count = all1.len();
+        if self.sid2.is_some() {
+            count = count.min(all2.len());
+        }
+        if self.sid3.is_some() {
+            count = count.min(all3.len());
+        }
+        if self.sid4.is_some() {
+            count = count.min(all4.len());
+        }
+
+        // ── PHOSPHOR_AUDIT_LENGTHS: log mismatches after prepend ─────
+        // Now shows the delta between fresh outputs *and* the residual
+        // carry that will be preserved for the next call. Values should
+        // shrink over time as the phase accumulators settle.
+        if std::env::var("PHOSPHOR_AUDIT_LENGTHS").is_ok() {
+            let n1 = all1.len();
+            let n2 = all2.len();
+            let n3 = all3.len();
+            let n4 = all4.len();
+            let any_diff = (self.sid2.is_some() && n1 != n2)
+                || (self.sid3.is_some() && n1 != n3)
+                || (self.sid4.is_some() && n1 != n4);
+            if any_diff {
+                eprintln!(
+                    "[audit-lengths] delta={} n1={} n2={} n3={} n4={} mix={} \
+                     diff21={:+} diff31={:+} diff41={:+}",
+                    delta,
+                    n1,
+                    n2,
+                    n3,
+                    n4,
+                    count,
+                    (n2 as i32) - (n1 as i32),
+                    (n3 as i32) - (n1 as i32),
+                    (n4 as i32) - (n1 as i32),
+                );
+            }
+        }
+
+        // Push to ring buffer as stereo pairs, clipped to available room.
         let mut buf = self.audio_buf.lock().unwrap();
         let room = MAX_BUFFER_SAMPLES.saturating_sub(buf.len());
-        let count = filtered1.len().min(room);
+        let mix_count = count.min(room);
 
-        for i in 0..count {
-            let left = filtered1[i];
-            let right = if !filtered2.is_empty() {
-                *filtered2.get(i).unwrap_or(&0)
+        for i in 0..mix_count {
+            let left = all1[i];
+            let right = if self.sid2.is_some() {
+                all2[i]
             } else {
                 left // mono: mirror SID1 to right channel
             };
 
             // SID3/SID4 centre-mixed at half volume
             let mut centre: i16 = 0;
-            if !filtered3.is_empty() {
-                centre = centre.saturating_add(*filtered3.get(i).unwrap_or(&0) / 2);
+            if self.sid3.is_some() {
+                centre = centre.saturating_add(all3[i] / 2);
             }
-            if !filtered4.is_empty() {
-                centre = centre.saturating_add(*filtered4.get(i).unwrap_or(&0) / 2);
+            if self.sid4.is_some() {
+                centre = centre.saturating_add(all4[i] / 2);
             }
 
             if centre != 0 {
@@ -540,6 +624,35 @@ impl EmulatedDevice {
                 buf.push_back((left, right));
             }
         }
+        drop(buf);
+
+        // Preserve the trailing samples of every populated channel — they
+        // are next call's leading edge. Consume exactly `count`, NOT
+        // `mix_count`: if the ring buffer was near-full and we clipped
+        // mix, those clipped samples should still get consumed here so
+        // channels stay length-aligned; the alternative would preserve
+        // them, but then we'd never make progress under sustained
+        // ring-buffer pressure.
+        self.carry1 = if all1.len() > count {
+            all1.split_off(count)
+        } else {
+            Vec::new()
+        };
+        self.carry2 = if self.sid2.is_some() && all2.len() > count {
+            all2.split_off(count)
+        } else {
+            Vec::new()
+        };
+        self.carry3 = if self.sid3.is_some() && all3.len() > count {
+            all3.split_off(count)
+        } else {
+            Vec::new()
+        };
+        self.carry4 = if self.sid4.is_some() && all4.len() > count {
+            all4.split_off(count)
+        } else {
+            Vec::new()
+        };
     }
 }
 
@@ -562,27 +675,27 @@ impl SidDevice for EmulatedDevice {
 
         // Reconfigure all SIDs with the correct clock-to-sample ratio.
         self.sid1.inner().set_sampling_parameters(
-            SamplingMethod::Fast,
+            SamplingMethod::Resample,
             self.clock_freq,
             self.sample_rate,
         );
         if let Some(ref mut s) = self.sid2 {
             s.inner().set_sampling_parameters(
-                SamplingMethod::Fast,
+                SamplingMethod::Resample,
                 self.clock_freq,
                 self.sample_rate,
             );
         }
         if let Some(ref mut s) = self.sid3 {
             s.inner().set_sampling_parameters(
-                SamplingMethod::Fast,
+                SamplingMethod::Resample,
                 self.clock_freq,
                 self.sample_rate,
             );
         }
         if let Some(ref mut s) = self.sid4 {
             s.inner().set_sampling_parameters(
-                SamplingMethod::Fast,
+                SamplingMethod::Resample,
                 self.clock_freq,
                 self.sample_rate,
             );
@@ -643,6 +756,13 @@ impl SidDevice for EmulatedDevice {
         self.ext2.reset();
         self.ext3.reset();
         self.ext4.reset();
+        // Drop stale per-SID carry — pre-reset samples belong to the
+        // previous tune and would land as a step transient in the new
+        // one otherwise.
+        self.carry1.clear();
+        self.carry2.clear();
+        self.carry3.clear();
+        self.carry4.clear();
 
         self.cycles_this_frame = 0;
         if let Ok(mut buf) = self.audio_buf.lock() {
