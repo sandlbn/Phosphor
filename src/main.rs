@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[allow(dead_code)]
+mod audio_stream;
+#[allow(dead_code)]
 mod audio_volume;
 mod c64_emu;
 mod config;
@@ -4173,6 +4175,15 @@ impl App {
                 _ => None,
             };
 
+            // Compute the playlist-snapshot version now so the same
+            // value goes into both `rs.status.playlist_version` (what
+            // the web UI polls to auto-refresh) and `rs.playlist_version`
+            // (the cache-invalidation key for the snapshot rebuild
+            // below). Bumped whenever entry count OR favourite count
+            // changes — both surface as "playlist state moved".
+            let favs_epoch = self.favorites.hashes.len() as u64;
+            let playlist_version = ((self.playlist.len() as u64) << 32) | favs_epoch;
+
             rs.status = remote::RemoteStatus {
                 state: match self.status.state {
                     PlayState::Playing => "playing",
@@ -4210,6 +4221,7 @@ impl App {
                 hvsc_sync_active: self.hvsc_sync.is_some(),
                 hvsc_sync_progress: self.hvsc_sync_progress.map(|(done, total)| [done, total]),
                 active_published_playlist,
+                playlist_version,
             };
 
             // Snapshot hvsc_root + published manifest for the library
@@ -4217,11 +4229,10 @@ impl App {
             rs.hvsc_root = self.config.hvsc_root.clone().map(PathBuf::from);
             rs.published_manifest = self.published_playlists_browser.manifest().cloned();
 
-            // Rebuild playlist snapshot when entries OR favourites change.
-            // We stuff both into one epoch so the version check catches both.
-            let favs_epoch = self.favorites.hashes.len() as u64;
-            let version = ((self.playlist.len() as u64) << 32) | favs_epoch;
-            if rs.playlist_version != version {
+            // Rebuild playlist snapshot when entries OR favourites
+            // change. Same `playlist_version` we already computed above
+            // for `rs.status`.
+            if rs.playlist_version != playlist_version {
                 let fav_set = &self.favorites.hashes;
                 rs.playlist = self
                     .playlist
@@ -4242,7 +4253,7 @@ impl App {
                             .unwrap_or(false),
                     })
                     .collect();
-                rs.playlist_version = version;
+                rs.playlist_version = playlist_version;
             }
         }
     }
