@@ -117,6 +117,11 @@ pub struct SharedRemoteState {
     /// Snapshot of the loaded Published Playlists manifest so the
     /// GET /api/library/playlists endpoint can return it directly.
     pub published_manifest: Option<Manifest>,
+    /// Live mirror of `config.http_stream_enabled`. When false the
+    /// `/api/stream.mp3` endpoint returns 503 without touching the
+    /// encoder, so a user who never turns streaming on pays zero CPU
+    /// for it regardless of what the web UI does.
+    pub stream_enabled: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +192,20 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                     // `Read`, so tiny_http drives an infinite chunked
                     // response until the browser closes the connection.
                     ("GET", p) if p == "/api/stream.mp3" || p.starts_with("/api/stream.mp3?") => {
+                        // Gate on config.http_stream_enabled. When the
+                        // user hasn't opted in, return 503 so the URL
+                        // exists (avoids 404 confusion) but no encoder
+                        // spins up — saves ~15% CPU when the feature
+                        // isn't in use.
+                        let enabled = state
+                            .lock()
+                            .map(|s| s.stream_enabled)
+                            .unwrap_or(false);
+                        if !enabled {
+                            eprintln!("[remote] /api/stream.mp3 refused — disabled in Settings");
+                            respond_error(request, 503, "Audio streaming disabled — enable in Settings → Network");
+                            return;
+                        }
                         // Move the stream handling to its OWN thread —
                         // tiny_http's `incoming_requests()` is a single
                         // consumer, so serving the infinite stream body
@@ -258,9 +277,13 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                     // whether audio has flowed recently enough that a
                     // subscribe would produce audible output.
                     ("GET", "/api/stream/status") => {
+                        let enabled = state
+                            .lock()
+                            .map(|s| s.stream_enabled)
+                            .unwrap_or(false);
+                        let available = enabled && crate::audio_stream::is_available();
                         let json = format!(
-                            r#"{{"available":{}}}"#,
-                            crate::audio_stream::is_available()
+                            r#"{{"available":{available},"enabled":{enabled}}}"#
                         );
                         respond_json(request, &json);
                     }

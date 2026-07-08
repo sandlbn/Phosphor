@@ -269,6 +269,10 @@ pub enum Message {
 
     // Remote control
     ToggleHttpRemote,
+    /// Enable / disable the `/api/stream.mp3` audio-broadcast endpoint.
+    /// When off, the browser 🔊 button greys out and the encoder never
+    /// runs — no CPU cost. Persisted to config.
+    ToggleHttpStream,
     HttpRemotePortChanged(String),
 
     // Favorites
@@ -3650,6 +3654,22 @@ pub fn settings_panel<'a>(
             .size(font::sized(12.0))
             .color(remote_status_color),
         text("Control Phosphor from any browser on the same network.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        Space::new().height(Length::Fixed(6.0)),
+        // Sub-toggle for the audio stream endpoint. Gated separately
+        // from the whole remote server because streaming has a real
+        // (~15% single-core) CPU cost — a user who just wants remote
+        // playback control shouldn't pay for that unless they ask.
+        tool_button(
+            if config.http_stream_enabled {
+                "🔊 Audio streaming: ✓ enabled"
+            } else {
+                "🔊 Audio streaming: ✗ disabled"
+            },
+            Message::ToggleHttpStream,
+        ),
+        text("Stream SID audio back to any browser as MP3. Costs ~15% single-core CPU while a listener is connected.")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.52)),
     ]

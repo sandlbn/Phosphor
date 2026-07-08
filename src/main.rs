@@ -3011,6 +3011,19 @@ impl App {
                 }
             }
 
+            Message::ToggleHttpStream => {
+                self.config.http_stream_enabled = !self.config.http_stream_enabled;
+                self.config.save();
+                eprintln!(
+                    "[phosphor] Audio streaming {} (encoder will spin up on next subscribe)",
+                    if self.config.http_stream_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                );
+            }
+
             Message::HttpRemotePortChanged(val) => {
                 self.http_port_text = val.clone();
                 if let Ok(port) = val.trim().parse::<u16>() {
@@ -4228,6 +4241,7 @@ impl App {
             // browse endpoints on the HTTP thread.
             rs.hvsc_root = self.config.hvsc_root.clone().map(PathBuf::from);
             rs.published_manifest = self.published_playlists_browser.manifest().cloned();
+            rs.stream_enabled = self.config.http_stream_enabled;
 
             // Rebuild playlist snapshot when entries OR favourites
             // change. Same `playlist_version` we already computed above
