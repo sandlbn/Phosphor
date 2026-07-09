@@ -890,6 +890,7 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button onclick="cmd('next')" title="Next">&#9197;</button>
   <button onclick="cmd('surprise')" title="Surprise me — random HVSC tune">&#127922;</button>
   <button onclick="toggleListen()" id="listen-btn" title="Listen in browser">&#128266;</button>
+  <span id="stream-state" style="font-size:11px;color:#8090a0;margin-left:4px;">idle</span>
 </div>
 
 <!-- Hidden <audio> element driven by the 🔊 button.
@@ -972,64 +973,66 @@ async function cmd(c){
 // is polled from /api/stream/status so the button dims for engines
 // (USB / U64) that can't be tapped.
 let streamOn=false;
+let streamEnabled=false;   // Config toggle from /api/stream/status.
+let streamAvailable=false; // Audio flowed recently — informational only.
 const MEDIA_ERR = {
-  1: 'MEDIA_ERR_ABORTED (user aborted)',
-  2: 'MEDIA_ERR_NETWORK (network problem)',
-  3: 'MEDIA_ERR_DECODE (broken bytes)',
-  4: 'MEDIA_ERR_SRC_NOT_SUPPORTED (browser rejected the format)',
+  1: 'aborted',
+  2: 'network',
+  3: 'decode',
+  4: 'not supported',
 };
+function setStreamState(txt, colour){
+  const el=document.getElementById('stream-state');
+  if(!el)return;
+  el.textContent=txt;
+  el.style.color=colour||'#8090a0';
+}
 function attachDiag(el){
+  el.addEventListener('loadstart',()=>{ console.info('[stream] loadstart'); setStreamState('buffering','#c0a050'); });
+  el.addEventListener('waiting',  ()=>{ console.info('[stream] waiting');   setStreamState('buffering','#c0a050'); });
+  el.addEventListener('stalled',  ()=>{ console.warn('[stream] stalled');   setStreamState('stalled','#c05050'); });
+  el.addEventListener('canplay',  ()=>{ console.info('[stream] canplay');   setStreamState('ready','#5cb870'); });
+  el.addEventListener('playing',  ()=>{ console.info('[stream] playing');   setStreamState('playing','#5cb870'); });
+  el.addEventListener('pause',    ()=>{ console.info('[stream] pause');     if(streamOn) setStreamState('paused','#8090a0'); });
   el.addEventListener('error',()=>{
     const err=el.error||{};
     const code=err.code||0;
-    const name=MEDIA_ERR[code]||'unknown ('+code+')';
+    const name=MEDIA_ERR[code]||'unknown';
     console.error('[stream] audio error:',name,'| src:',el.currentSrc,'| readyState=',el.readyState,'networkState=',el.networkState);
-  },{once:true});
-  el.addEventListener('loadstart',()=>console.info('[stream] loadstart'),{once:true});
-  el.addEventListener('progress',()=>console.info('[stream] progress'),{once:true});
-  el.addEventListener('loadedmetadata',()=>console.info('[stream] loadedmetadata'),{once:true});
-  el.addEventListener('canplay',()=>console.info('[stream] canplay'),{once:true});
-  el.addEventListener('playing',()=>console.info('[stream] playing'),{once:true});
-  el.addEventListener('stalled',()=>console.warn('[stream] stalled'),{once:true});
-  el.addEventListener('waiting',()=>console.info('[stream] waiting'),{once:true});
+    setStreamState('error: '+name,'#c05050');
+  });
 }
 function toggleListen(){
   const el=document.getElementById('stream-audio');
   const btn=document.getElementById('listen-btn');
   if(streamOn){
     el.pause();
-    // Nuke <source> children and src; some browsers keep the previous
-    // fetch alive until we do both.
-    el.removeAttribute('src');
-    while(el.firstChild)el.removeChild(el.firstChild);
-    el.load();
+    el.src='';
     btn.innerHTML='&#128266;';
     btn.title='Listen in browser';
     streamOn=false;
+    setStreamState('idle');
     return;
   }
-  attachDiag(el);
-  // Safari-preferred loading pattern: <source type="audio/mpeg"> child
-  // element with explicit type hint, then load() to kick the fetch.
-  // Assigning .src directly works in Chrome but Safari sometimes routes
-  // it through its plugin fallback path when .src is on a live stream.
-  while(el.firstChild)el.removeChild(el.firstChild);
-  const source=document.createElement('source');
-  source.type='audio/mpeg';
-  source.src='/api/stream.mp3?t='+Date.now();
-  el.appendChild(source);
-  el.load();
-  // Button flips SYNCHRONOUSLY — Safari's play() promise on live
-  // streams often never resolves and never rejects, so relying on the
-  // promise to update the button leaves it stuck.
+  // Simplest possible form: bare .src assignment + .play(). Every
+  // fancier pattern we tried (<source> child, explicit load(),
+  // preload=none, removeAttribute dance) caused problems in one
+  // browser or another. `.src=` + `.play()` is what the working
+  // direct-URL case boils down to inside the browser, so we mirror it.
+  //
+  // Diagnostic listeners are re-attached once on first click; they
+  // stay for the page's lifetime and drive the state indicator.
+  if(!el._diagAttached){ attachDiag(el); el._diagAttached=true; }
+  el.src='/api/stream.mp3?t='+Date.now();
   btn.innerHTML='&#128263;';
   btn.title='Stop listening';
   streamOn=true;
+  setStreamState('connecting…','#c0a050');
   const pp=el.play();
   if(pp&&pp.catch){
     pp.catch(e=>{
       console.error('[stream] play() rejected:',e.name,e.message);
-      btn.title='Play blocked: '+e.name+' — check console';
+      setStreamState('blocked: '+e.name,'#c05050');
     });
   }
   setupMediaSession();
@@ -1048,15 +1051,26 @@ async function pollStreamStatus(){
   try{
     const r=await fetch('/api/stream/status');
     const j=await r.json();
+    streamEnabled=!!j.enabled;
+    streamAvailable=!!j.available;
     const btn=document.getElementById('listen-btn');
-    if(j.available){
-      btn.disabled=false;
-      btn.style.opacity='1';
-      if(!streamOn) btn.title='Listen in browser';
-    } else {
-      btn.disabled=!streamOn; // keep clickable to allow "stop" if we ARE listening
-      btn.style.opacity=streamOn?'1':'0.4';
-      if(!streamOn) btn.title='Streaming not available on the current engine';
+    if(!btn)return;
+    // Button clickability depends ONLY on the config flag. Whether
+    // audio is currently flowing (`available`) is informational —
+    // silence is a legitimate thing to stream. Previously we were
+    // disabling the button whenever nothing was playing on the
+    // desktop, which made it impossible to start listening before
+    // starting a tune.
+    btn.disabled=!streamEnabled;
+    btn.style.opacity=streamEnabled?'1':'0.4';
+    if(!streamOn){
+      if(!streamEnabled){
+        btn.title='Audio streaming disabled — enable in Settings → Network';
+        setStreamState('disabled');
+      } else {
+        btn.title=streamAvailable?'Listen in browser':'Listen in browser (silence — nothing playing)';
+        setStreamState(streamAvailable?'idle':'idle (no audio)');
+      }
     }
   }catch(_){}
 }
