@@ -128,22 +128,33 @@ pub struct SharedRemoteState {
 //  Server
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sender<RemoteCmd>) {
+/// Spawn the HTTP server thread and return an `Arc<Server>` handle
+/// that lets the caller shut it down cleanly via `Server::unblock()`.
+///
+/// Returns `None` if the socket bind fails (address in use, permission
+/// denied, etc.) — the caller keeps `http_remote_running = false` and
+/// surfaces the error to the user via the eprintln we emit below.
+pub fn start_server(
+    port: u16,
+    state: Arc<Mutex<SharedRemoteState>>,
+    cmd_tx: Sender<RemoteCmd>,
+) -> Option<Arc<tiny_http::Server>> {
+    let addr = format!("0.0.0.0:{}", port);
+    let server = match tiny_http::Server::http(&addr) {
+        Ok(s) => {
+            eprintln!("[phosphor] Remote control: http://localhost:{}", port);
+            Arc::new(s)
+        }
+        Err(e) => {
+            eprintln!("[phosphor] Failed to start HTTP server on {}: {e}", addr);
+            return None;
+        }
+    };
+    let server_for_thread = server.clone();
     thread::Builder::new()
         .name("phosphor-http".into())
         .spawn(move || {
-            let addr = format!("0.0.0.0:{}", port);
-            let server = match tiny_http::Server::http(&addr) {
-                Ok(s) => {
-                    eprintln!("[phosphor] Remote control: http://localhost:{}", port);
-                    s
-                }
-                Err(e) => {
-                    eprintln!("[phosphor] Failed to start HTTP server on {}: {e}", addr);
-                    return;
-                }
-            };
-
+            let server = server_for_thread;
             // Liveness heartbeat state. Prints every ~60 s so the
             // server log confirms the thread is still alive even in
             // long idle stretches.
@@ -566,9 +577,12 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                     );
                 }
             }
-            eprintln!("[remote] server thread exiting (iterator ended)");
+            eprintln!(
+                "[remote] server thread exiting cleanly after {requests_handled} requests"
+            );
         })
         .expect("Failed to spawn HTTP server thread");
+    Some(server)
 }
 
 fn respond_json(request: tiny_http::Request, json: &str) {
