@@ -16,20 +16,31 @@
 #   artifact-configuration-slug:  windows-exe  /  windows-installer
 # Adjust the literals below if you pick different slugs.
 #
-# Trigger: push a version tag (e.g. `git tag v0.4.5 && git push --tags`) or run
-# manually from the Actions tab.
+# Triggers:
+#   - Every push to `main` (i.e. every PR merge). Builds + uploads the
+#     installer as a downloadable workflow artifact. No GitHub Release is
+#     published — only tag pushes do that (see the last step's `if:`).
+#   - Push of a version tag (e.g. `git tag v0.4.5 && git push --tags`) —
+#     builds, signs, and attaches the installer to the auto-created
+#     GitHub Release.
+#   - Manual run from the Actions tab.
+#   - PRs that touch packaging files — same build + artifact, no release.
+#
+# Note on SignPath free tier: every main-branch build submits two signing
+# requests (exe + installer). If you hit their monthly OSS quota, disable
+# main-branch builds and rely on tag pushes only.
 
 name: Windows Release
 
 on:
   push:
+    branches: [main]
     tags: ['*']
   workflow_dispatch:
-  # Build/package test on branches. Opening a PR that touches the Windows
-  # packaging files runs the full build + installer, uploading the installer as
-  # a downloadable workflow artifact. Signing is auto-skipped unless the
-  # SignPath secret/variable are set (see DO_SIGN below), so it stays green
-  # before SignPath is wired up and on PRs from forks.
+  # PRs that touch the Windows packaging files still get a full build so
+  # you can grab the installer artifact before merging. Signing is
+  # auto-skipped unless the SignPath secret/variable are set (see
+  # DO_SIGN below), so this stays green on PRs from forks.
   pull_request:
     paths:
       - '.github/workflows/windows-release.yml'
