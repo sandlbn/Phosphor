@@ -1855,7 +1855,11 @@ impl App {
                     );
                 }
                 self.rebuild_filter();
-                self.selected = if self.playlist.is_empty() { None } else { Some(0) };
+                self.selected = if self.playlist.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
                 eprintln!(
                     "[phosphor] Loaded {} liked track(s){}",
                     total,
@@ -1901,8 +1905,10 @@ impl App {
                     Err(e) => eprintln!("[phosphor] Favourites export failed: {e}"),
                 }
                 if let Some(parent) = path.parent() {
-                    self.config.last_playlist_dir =
-                        parent.to_str().map(|s| s.to_string()).or_else(|| self.config.last_playlist_dir.clone());
+                    self.config.last_playlist_dir = parent
+                        .to_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| self.config.last_playlist_dir.clone());
                     self.config.save();
                 }
             }
@@ -1917,22 +1923,20 @@ impl App {
                 );
             }
 
-            Message::ImportFavouritesFrom(Some(path)) => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => {
-                        let (new_c, existing, missing) = self.favorites.import_m3u(&text);
-                        self.favorites.save();
-                        eprintln!(
-                            "[phosphor] Favourites import: {new_c} new, \
+            Message::ImportFavouritesFrom(Some(path)) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let (new_c, existing, missing) = self.favorites.import_m3u(&text);
+                    self.favorites.save();
+                    eprintln!(
+                        "[phosphor] Favourites import: {new_c} new, \
                              {existing} already-liked, {missing} missing"
-                        );
-                        if self.favorites_only {
-                            self.rebuild_filter();
-                        }
+                    );
+                    if self.favorites_only {
+                        self.rebuild_filter();
                     }
-                    Err(e) => eprintln!("[phosphor] Favourites import read failed: {e}"),
                 }
-            }
+                Err(e) => eprintln!("[phosphor] Favourites import read failed: {e}"),
+            },
             Message::ImportFavouritesFrom(None) => {}
 
             Message::ScrollToNowPlaying => {

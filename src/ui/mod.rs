@@ -1298,7 +1298,10 @@ pub fn search_bar<'a>(
             ..Default::default()
         })
         .into();
-        with_tip(btn, "Load every liked track as a fresh playlist (resolves paths from disk)")
+        with_tip(
+            btn,
+            "Load every liked track as a fresh playlist (resolves paths from disk)",
+        )
     } else {
         Space::new().width(Length::Fixed(0.0)).into()
     };
