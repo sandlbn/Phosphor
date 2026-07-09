@@ -7,6 +7,7 @@ mod audio_volume;
 mod c64_emu;
 mod config;
 mod device_config;
+mod favorites;
 mod heard_db;
 mod petscii;
 mod player;
@@ -907,7 +908,7 @@ impl App {
                 if let Some(cm) = self.context_menu.take() {
                     if let Some(entry) = self.playlist.entries.get(cm.track_idx) {
                         if let Some(ref md5) = entry.md5 {
-                            let is_fav = self.favorites.toggle(md5);
+                            let is_fav = self.favorites.toggle(entry);
                             self.favorites.save();
                             eprintln!(
                                 "[phosphor] {} \"{}\" via context menu",
@@ -1758,7 +1759,7 @@ impl App {
             Message::ToggleFavorite(idx) => {
                 if let Some(entry) = self.playlist.entries.get(idx) {
                     if let Some(ref md5) = entry.md5 {
-                        let is_fav = self.favorites.toggle(md5);
+                        let is_fav = self.favorites.toggle(entry);
                         self.favorites.save();
                         eprintln!(
                             "[phosphor] {} \"{}\" ({})",
@@ -1787,7 +1788,7 @@ impl App {
                 if let Some(idx) = self.playlist.current {
                     if let Some(entry) = self.playlist.entries.get(idx) {
                         if let Some(ref md5) = entry.md5 {
-                            let is_fav = self.favorites.toggle(md5);
+                            let is_fav = self.favorites.toggle(entry);
                             self.favorites.save();
                             eprintln!(
                                 "[phosphor] {} \"{}\"",
@@ -1801,6 +1802,142 @@ impl App {
                     }
                 }
             }
+
+            Message::LoadFavoritesPlaylist => {
+                self.context_menu = None;
+                let hvsc_root = self.config.hvsc_root.clone().map(PathBuf::from);
+                let songlength = self.songlength_db.clone();
+                let mut resolved: Vec<playlist::PlaylistEntry> = Vec::new();
+                let mut skipped = 0usize;
+                let mut prune: Vec<usize> = Vec::new();
+                let count = self.favorites.total_len();
+                for idx in 0..count {
+                    match self
+                        .favorites
+                        .resolve(idx, songlength.as_ref(), hvsc_root.as_deref())
+                    {
+                        Some(path) => match playlist::PlaylistEntry::from_path(&path) {
+                            Ok(entry) => resolved.push(entry),
+                            Err(_) => skipped += 1,
+                        },
+                        None => {
+                            skipped += 1;
+                            // Ghost entries (path=None + empty
+                            // metadata, usually from legacy
+                            // favorites.txt migration) can't ever
+                            // resolve — prune them silently so the ❤
+                            // badge shows the honest count.
+                            if let Some(e) = self.favorites.entries.get(idx) {
+                                if e.is_ghost() {
+                                    prune.push(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !prune.is_empty() {
+                    let n = prune.len();
+                    self.favorites.remove_indices(prune);
+                    eprintln!(
+                        "[phosphor] Pruned {n} orphan favourite(s) that could not be resolved"
+                    );
+                }
+                // Persist any healed paths written back by `resolve()`.
+                self.favorites.save();
+                let total = resolved.len();
+                let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                self.playlist.clear();
+                self.playlist.add_entries(resolved);
+                if let Some(db) = self.songlength_db.as_ref() {
+                    db.apply_to_playlist(
+                        &mut self.playlist,
+                        self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                    );
+                }
+                self.rebuild_filter();
+                self.selected = if self.playlist.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                eprintln!(
+                    "[phosphor] Loaded {} liked track(s){}",
+                    total,
+                    if skipped > 0 {
+                        format!(" — {skipped} unresolvable (file moved or HVSC not synced)")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+
+            Message::RerootFavourites(prev_root) => {
+                let touched = self.favorites.reroot(prev_root.as_deref());
+                if touched > 0 {
+                    self.favorites.save();
+                    eprintln!(
+                        "[phosphor] Reroot: cleared cached paths on {touched} favourite(s); \
+                         will re-resolve via songlength DB on next load"
+                    );
+                }
+            }
+
+            Message::ExportFavouritesPick => {
+                self.context_menu = None;
+                if self.favorites.count() == 0 {
+                    return Task::none();
+                }
+                let start_dir = self.config.last_playlist_dir.clone();
+                return Task::perform(
+                    pick_favourites_export_dialog(start_dir),
+                    Message::ExportFavouritesTo,
+                );
+            }
+
+            Message::ExportFavouritesTo(Some(path)) => {
+                let m3u = self.favorites.export_m3u();
+                match std::fs::write(&path, m3u) {
+                    Ok(_) => eprintln!(
+                        "[phosphor] Exported {} favourite(s) to {}",
+                        self.favorites.count(),
+                        path.display()
+                    ),
+                    Err(e) => eprintln!("[phosphor] Favourites export failed: {e}"),
+                }
+                if let Some(parent) = path.parent() {
+                    self.config.last_playlist_dir = parent
+                        .to_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| self.config.last_playlist_dir.clone());
+                    self.config.save();
+                }
+            }
+            Message::ExportFavouritesTo(None) => {}
+
+            Message::ImportFavouritesPick => {
+                self.context_menu = None;
+                let start_dir = self.config.last_playlist_dir.clone();
+                return Task::perform(
+                    pick_favourites_import_dialog(start_dir),
+                    Message::ImportFavouritesFrom,
+                );
+            }
+
+            Message::ImportFavouritesFrom(Some(path)) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let (new_c, existing, missing) = self.favorites.import_m3u(&text);
+                    self.favorites.save();
+                    eprintln!(
+                        "[phosphor] Favourites import: {new_c} new, \
+                             {existing} already-liked, {missing} missing"
+                    );
+                    if self.favorites_only {
+                        self.rebuild_filter();
+                    }
+                }
+                Err(e) => eprintln!("[phosphor] Favourites import read failed: {e}"),
+            },
+            Message::ImportFavouritesFrom(None) => {}
 
             Message::ScrollToNowPlaying => {
                 if let Some(cur_idx) = self.playlist.current {
@@ -2085,13 +2222,11 @@ impl App {
 
             Message::ToggleFavoriteCurrent => {
                 if let Some(cur_idx) = self.playlist.current {
-                    let md5 = self
-                        .playlist
-                        .entries
-                        .get(cur_idx)
-                        .and_then(|e| e.md5.clone());
-                    if let Some(ref md5) = md5 {
-                        let is_fav = self.favorites.toggle(md5);
+                    // Clone the entry to release the immutable borrow
+                    // before we mutate `self.favorites`.
+                    let entry = self.playlist.entries.get(cur_idx).cloned();
+                    if let Some(entry) = entry {
+                        let is_fav = self.favorites.toggle(&entry);
                         self.favorites.save();
                         eprintln!(
                             "[phosphor] {} current track",
@@ -2866,6 +3001,7 @@ impl App {
             }
 
             Message::SetHvscRoot(root) => {
+                let previous_root = self.config.hvsc_root.clone().map(PathBuf::from);
                 self.config.hvsc_root = if root.trim().is_empty() {
                     None
                 } else {
@@ -2873,6 +3009,17 @@ impl App {
                 };
                 self.config.save();
                 self.refresh_stil_entry();
+                // Blank cached paths on favourites so they get
+                // re-resolved under the new HVSC root next time
+                // "Load liked" runs. Silent — no user prompt needed.
+                let touched = self.favorites.reroot(previous_root.as_deref());
+                if touched > 0 {
+                    self.favorites.save();
+                    eprintln!(
+                        "[phosphor] HVSC root changed — cleared cached paths on \
+                         {touched} favourite(s)"
+                    );
+                }
             }
 
             Message::HvscRsyncUrlChanged(url) => {
@@ -3595,6 +3742,12 @@ impl App {
                 // save() is deferred — only writes when dirty.
                 self.heard_db.record(md5);
                 self.heard_db.save();
+                // Enrich the favourite entry so legacy MD5-only rows
+                // pick up their metadata + path as they're re-played.
+                if self.favorites.is_favorite(md5) {
+                    self.favorites.upsert(entry);
+                    self.favorites.save();
+                }
             }
 
             self.silence_frames = 0;
@@ -4348,15 +4501,14 @@ impl App {
 
                 // ── Playback QOL (in-line, no Task needed) ───────────
                 remote::RemoteCmd::ToggleFavorite(idx) => {
-                    if let Some(md5) = self.playlist.entries.get(idx).and_then(|e| e.md5.clone()) {
-                        let _ = self.favorites.toggle(&md5);
+                    if let Some(entry) = self.playlist.entries.get(idx).cloned() {
+                        let _ = self.favorites.toggle(&entry);
                         self.favorites.save();
                     }
                 }
                 remote::RemoteCmd::ToggleFavoriteCurrent => {
-                    let md5 = self.playlist.current_entry().and_then(|e| e.md5.clone());
-                    if let Some(md5) = md5 {
-                        let _ = self.favorites.toggle(&md5);
+                    if let Some(entry) = self.playlist.current_entry().cloned() {
+                        let _ = self.favorites.toggle(&entry);
                         self.favorites.save();
                     }
                 }
@@ -4391,6 +4543,9 @@ impl App {
                 // ── Ops that reuse full Message handlers via Task::done
                 remote::RemoteCmd::Surprise => {
                     tasks.push(Task::done(Message::HvscBrowserSurpriseMe));
+                }
+                remote::RemoteCmd::LoadFavoritesPlaylist => {
+                    tasks.push(Task::done(Message::LoadFavoritesPlaylist));
                 }
                 remote::RemoteCmd::LoadPublishedPlaylist(file) => {
                     tasks.push(Task::done(Message::PublishedPlaylistsLoad(file)));
@@ -4806,6 +4961,34 @@ async fn pick_songlength_file(start_dir: Option<String>) -> Option<PathBuf> {
     let mut d = rfd::AsyncFileDialog::new()
         .set_title("Load HVSC Songlength.md5")
         .add_filter("Songlength", &["md5", "txt"]);
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            d = d.set_directory(&p);
+        }
+    }
+    d.pick_file().await.map(|h| h.path().to_path_buf())
+}
+
+async fn pick_favourites_export_dialog(start_dir: Option<String>) -> Option<PathBuf> {
+    let mut d = rfd::AsyncFileDialog::new()
+        .set_title("Export Liked Tracks as M3U")
+        .add_filter("M3U Playlist", &["m3u"])
+        .set_file_name("liked-tracks.m3u");
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            d = d.set_directory(&p);
+        }
+    }
+    d.save_file().await.map(|h| h.path().to_path_buf())
+}
+
+async fn pick_favourites_import_dialog(start_dir: Option<String>) -> Option<PathBuf> {
+    let mut d = rfd::AsyncFileDialog::new()
+        .set_title("Import Liked Tracks from M3U")
+        .add_filter("M3U Playlist", &["m3u", "m3u8"])
+        .add_filter("All files", &["*"]);
     if let Some(ref dir) = start_dir {
         let p = PathBuf::from(dir);
         if p.is_dir() {

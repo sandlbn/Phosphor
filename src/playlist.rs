@@ -587,6 +587,11 @@ impl Playlist {
 pub struct SonglengthDb {
     pub entries: HashMap<String, Vec<u32>>,
     pub by_path: HashMap<String, Vec<u32>>,
+    /// Reverse index: MD5 → HVSC-relative path (lowercase, no leading
+    /// slash). Populated from the same `; /path` comments that feed
+    /// `by_path`. Used by `FavoritesDb::resolve()` to heal favourite
+    /// entries whose stored absolute path has gone stale.
+    pub md5_to_path: HashMap<String, String>,
 }
 
 impl SonglengthDb {
@@ -594,6 +599,7 @@ impl SonglengthDb {
         Self {
             entries: HashMap::new(),
             by_path: HashMap::new(),
+            md5_to_path: HashMap::new(),
         }
     }
 
@@ -690,7 +696,8 @@ impl SonglengthDb {
 
                 if !durations.is_empty() {
                     if let Some(p) = pending_path.take() {
-                        db.by_path.insert(p, durations.clone());
+                        db.by_path.insert(p.clone(), durations.clone());
+                        db.md5_to_path.insert(md5.clone(), p);
                     }
                     db.entries.insert(md5, durations);
                 } else {

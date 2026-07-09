@@ -1,7 +1,6 @@
 // Persistent configuration: skip RSID, default song length, songlength download URL.
 // Stored as JSON in <config_dir>/phosphor/config.json
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Default HTTPS URL for the HVSC C64Music/ tree. Single source of truth:
@@ -545,85 +544,11 @@ pub async fn download_songlength(hvsc_base: String) -> Result<PathBuf, String> {
     crate::hvsc_sync::fetch_hvsc_document(hvsc_base, "Songlengths.md5", dest).await
 }
 
-/// Persistent set of favorite tunes, keyed by MD5 hash.
-/// Stored as one hash per line in <config_dir>/favorites.txt
-#[derive(Debug, Clone)]
-pub struct FavoritesDb {
-    pub hashes: HashSet<String>,
-}
-
-impl FavoritesDb {
-    pub fn new() -> Self {
-        Self {
-            hashes: HashSet::new(),
-        }
-    }
-
-    fn path() -> Option<PathBuf> {
-        config_dir().map(|d| d.join("favorites.txt"))
-    }
-
-    /// Load favorites from disk, or return empty set.
-    pub fn load() -> Self {
-        let path = match Self::path() {
-            Some(p) if p.exists() => p,
-            _ => return Self::new(),
-        };
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let hashes: HashSet<String> = content
-                    .lines()
-                    .map(|l| l.trim().to_lowercase())
-                    .filter(|l| !l.is_empty() && l.len() == 32)
-                    .collect();
-                eprintln!("[phosphor] Loaded {} favorites", hashes.len());
-                Self { hashes }
-            }
-            Err(e) => {
-                eprintln!("[phosphor] Cannot read favorites: {e}");
-                Self::new()
-            }
-        }
-    }
-
-    /// Save favorites to disk.
-    pub fn save(&self) {
-        let path = match Self::path() {
-            Some(p) => p,
-            None => return,
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut lines: Vec<&str> = self.hashes.iter().map(|s| s.as_str()).collect();
-        lines.sort();
-        let content = lines.join("\n") + "\n";
-        if let Err(e) = std::fs::write(&path, content) {
-            eprintln!("[phosphor] Cannot save favorites: {e}");
-        }
-    }
-
-    /// Toggle a hash in/out of favorites. Returns new state (true = now favorite).
-    pub fn toggle(&mut self, md5: &str) -> bool {
-        let key = md5.to_lowercase();
-        if self.hashes.contains(&key) {
-            self.hashes.remove(&key);
-            false
-        } else {
-            self.hashes.insert(key);
-            true
-        }
-    }
-
-    pub fn is_favorite(&self, md5: &str) -> bool {
-        self.hashes.contains(&md5.to_lowercase())
-    }
-
-    pub fn count(&self) -> usize {
-        self.hashes.len()
-    }
-}
+// Legacy re-export — the real `FavoritesDb` lives in [`crate::favorites`]
+// with JSON persistence, path resolution, and M3U import/export. This
+// alias keeps every existing `use config::{Config, FavoritesDb};`
+// import working without a repo-wide rename.
+pub use crate::favorites::FavoritesDb;
 
 /// Get the application config directory.
 pub fn config_dir() -> Option<PathBuf> {
