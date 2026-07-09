@@ -235,6 +235,10 @@ impl SidLiteDevice {
             "[sidlite] SID opened: MOS6581, clock={}Hz, output={}Hz (device={}Hz), ExternalFilter=ON",
             clock_freq, effective_rate, sample_rate,
         );
+        // Lock the MP3 stream tap's rate now so a browser subscribing
+        // before playback begins gets the encoder built at the actual
+        // cpal rate (not the 48kHz default).
+        crate::audio_stream::set_sample_rate(effective_rate as u32);
 
         Ok(Self {
             sid1,
@@ -339,6 +343,7 @@ impl SidLiteDevice {
         let mut buf = self.audio_buf.lock().unwrap();
         let room = MAX_BUFFER_SAMPLES.saturating_sub(buf.len());
         let count = filtered1.len().min(room);
+        let mut mixed: Vec<(i16, i16)> = Vec::with_capacity(count);
 
         for i in 0..count {
             let left = filtered1[i];
@@ -356,11 +361,20 @@ impl SidLiteDevice {
                 centre = centre.saturating_add(*filtered4.get(i).unwrap_or(&0) / 2);
             }
 
-            if centre != 0 {
-                buf.push_back((left.saturating_add(centre), right.saturating_add(centre)));
+            let pair = if centre != 0 {
+                (left.saturating_add(centre), right.saturating_add(centre))
             } else {
-                buf.push_back((left, right));
-            }
+                (left, right)
+            };
+            buf.push_back(pair);
+            mixed.push(pair);
+        }
+        drop(buf);
+
+        // Also fan out to the /api/stream.mp3 tap. Fast-path bails when
+        // no browsers are listening.
+        if !mixed.is_empty() {
+            crate::audio_stream::push_pairs(&mixed, self.sample_rate);
         }
     }
 }

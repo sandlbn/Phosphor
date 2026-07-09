@@ -87,6 +87,11 @@ pub struct Config {
     pub http_remote_enabled: bool,
     /// Port for the HTTP remote control server (default 8364).
     pub http_remote_port: u16,
+    /// Enable the `/api/stream.mp3` audio-broadcast endpoint. When
+    /// disabled, the endpoint returns 503 and the encoder never spins
+    /// up — saves ~15% CPU on the machine running Phosphor. Off by
+    /// default so the encoder only runs when the user opts in.
+    pub http_stream_enabled: bool,
     /// Last known window position — restored on next launch.
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -139,6 +144,7 @@ impl Default for Config {
             macos_usb_mode: "bridge".to_string(),
             http_remote_enabled: false,
             http_remote_port: 8364,
+            http_stream_enabled: false,
             window_x: None,
             window_y: None,
             window_width_saved: DEFAULT_WINDOW_WIDTH,
@@ -328,6 +334,9 @@ impl Config {
                 if let Ok(n) = val.parse::<u16>() {
                     config.http_remote_port = n;
                 }
+            } else if let Some(rest) = line.strip_prefix("\"http_stream_enabled\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.http_stream_enabled = val == "true";
             } else if let Some(rest) = line.strip_prefix("\"window_x\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if val != "null" {
@@ -425,6 +434,7 @@ impl Config {
                 "  \"macos_usb_mode\": \"{}\",\n",
                 "  \"http_remote_enabled\": {},\n",
                 "  \"http_remote_port\": {},\n",
+                "  \"http_stream_enabled\": {},\n",
                 "  \"window_x\": {},\n",
                 "  \"window_y\": {},\n",
                 "  \"window_width_saved\": {},\n",
@@ -460,6 +470,7 @@ impl Config {
             self.macos_usb_mode,
             self.http_remote_enabled,
             self.http_remote_port,
+            self.http_stream_enabled,
             fmt_opt_i32(self.window_x),
             fmt_opt_i32(self.window_y),
             self.window_width_saved,

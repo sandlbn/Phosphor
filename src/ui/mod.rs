@@ -269,6 +269,14 @@ pub enum Message {
 
     // Remote control
     ToggleHttpRemote,
+    /// Open a URL in the user's default browser (via the `open` crate).
+    /// Used from the clickable URL in Settings and the green-dot
+    /// indicator on the main toolbar.
+    OpenUrl(String),
+    /// Enable / disable the `/api/stream.mp3` audio-broadcast endpoint.
+    /// When off, the browser 🔊 button greys out and the encoder never
+    /// runs — no CPU cost. Persisted to config.
+    ToggleHttpStream,
     HttpRemotePortChanged(String),
 
     // Favorites
@@ -727,6 +735,11 @@ pub fn controls_bar<'a>(
     show_sid_panel: bool,
     tick: u32,
     hvsc_needs_attention: bool,
+    // Some(<url>) when the HTTP remote-control server is running.
+    // Rendered as a small green-dot pill on the bottom toolbar so the
+    // user always knows the server is up and can click to open it in
+    // their browser. `None` = server not running → no pill.
+    http_remote_url: Option<String>,
 ) -> Element<'a, Message> {
     let compact = window_width < 760.0;
     let btn_size = if compact { 11.0_f32 } else { 12.0 };
@@ -1085,6 +1098,44 @@ pub fn controls_bar<'a>(
     ]
     .spacing(row_spacing)
     .align_y(Alignment::Center);
+    // "Server is live" green-dot pill. Clickable — opens the URL in
+    // the default browser via `Message::OpenUrl`. Only rendered when
+    // the HTTP remote server is actually running; disappears the
+    // instant it's stopped.
+    if let Some(url) = http_remote_url.as_ref() {
+        let url_owned = url.clone();
+        let url_label = url.clone();
+        let dot_btn: Element<'a, Message> = button(
+            text(if compact {
+                "● Remote".to_string()
+            } else {
+                format!("● Remote · {url_label}")
+            })
+            .size(font::sized(if compact { 11.0 } else { 12.0 }))
+            .color(Color::from_rgb(0.55, 0.85, 0.65)),
+        )
+        .on_press(Message::OpenUrl(url_owned))
+        .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+        .style(|_t: &Theme, st| button::Style {
+            background: Some(iced::Background::Color(match st {
+                button::Status::Hovered => Color::from_rgb(0.14, 0.22, 0.17),
+                button::Status::Pressed => Color::from_rgb(0.10, 0.17, 0.13),
+                _ => Color::from_rgb(0.10, 0.16, 0.12),
+            })),
+            text_color: Color::from_rgb(0.55, 0.85, 0.65),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.45, 0.30),
+            },
+            ..Default::default()
+        })
+        .into();
+        bottom_row = bottom_row.push(with_tip(
+            dot_btn,
+            "HTTP remote server is running — click to open it in your browser",
+        ));
+    }
     if let Some(info) = new_version {
         bottom_row = bottom_row.push(update_badge(&info.version));
     }
@@ -3611,16 +3662,44 @@ pub fn settings_panel<'a>(
     .spacing(6);
 
     // ── HTTP Remote Control ─────────────────────────────────────
-    let remote_status = if http_remote_running {
+    let remote_url = if http_remote_running {
         let ip = local_ip_address().unwrap_or_else(|| "localhost".to_string());
-        format!("● Running on http://{}:{}", ip, config.http_remote_port)
+        Some(format!("http://{}:{}", ip, config.http_remote_port))
     } else {
-        "○ Stopped".to_string()
+        None
     };
-    let remote_status_color = if http_remote_running {
-        Color::from_rgb(0.4, 0.9, 0.5)
-    } else {
-        Color::from_rgb(0.5, 0.5, 0.6)
+    // Small helper that renders either a clickable pill-button with
+    // the URL (when the server is running) or a muted "○ Stopped" line.
+    let remote_status_row: Element<'a, Message> = match remote_url.as_deref() {
+        Some(url) => {
+            let url_owned = url.to_string();
+            let btn: Element<'a, Message> = button(
+                text(format!("● Running on {url}"))
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.55, 0.85, 0.65)),
+            )
+            .on_press(Message::OpenUrl(url_owned))
+            .padding(Padding::from([2, 6]))
+            .style(|_t: &Theme, st| button::Style {
+                background: Some(iced::Background::Color(match st {
+                    button::Status::Hovered => Color::from_rgb(0.14, 0.22, 0.17),
+                    button::Status::Pressed => Color::from_rgb(0.10, 0.17, 0.13),
+                    _ => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+                })),
+                text_color: Color::from_rgb(0.55, 0.85, 0.65),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into();
+            with_tip(btn, "Click to open in your default browser")
+        }
+        None => text("○ Stopped")
+            .size(font::sized(12.0))
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .into(),
     };
     let remote_section = column![
         text("Remote control (HTTP):")
@@ -3646,10 +3725,24 @@ pub fn settings_panel<'a>(
                 .width(Length::Fixed(80.0)),
         ]
         .align_y(Alignment::Center),
-        text(remote_status)
-            .size(font::sized(12.0))
-            .color(remote_status_color),
+        remote_status_row,
         text("Control Phosphor from any browser on the same network.")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        Space::new().height(Length::Fixed(6.0)),
+        // Sub-toggle for the audio stream endpoint. Gated separately
+        // from the whole remote server because streaming has a real
+        // (~15% single-core) CPU cost — a user who just wants remote
+        // playback control shouldn't pay for that unless they ask.
+        tool_button(
+            if config.http_stream_enabled {
+                "🔊 Audio streaming: ✓ enabled"
+            } else {
+                "🔊 Audio streaming: ✗ disabled"
+            },
+            Message::ToggleHttpStream,
+        ),
+        text("Stream SID audio back to any browser as MP3.")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.52)),
     ]
@@ -5031,7 +5124,7 @@ impl<Message> canvas::Program<Message> for LoadingScroller {
 }
 
 /// Get the first non-loopback IPv4 address of this machine.
-fn local_ip_address() -> Option<String> {
+pub fn local_ip_address() -> Option<String> {
     use std::net::UdpSocket;
     // Connect to a public IP (doesn't actually send data) to discover
     // which local interface the OS would route through.

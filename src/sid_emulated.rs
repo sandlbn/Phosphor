@@ -338,6 +338,10 @@ impl EmulatedDevice {
             clock_freq,
             sample_rate,
         );
+        // Lock the MP3 stream tap's sample rate now so if a browser
+        // subscribes before playback starts, the encoder builds at
+        // the correct rate from the first frame.
+        crate::audio_stream::set_sample_rate(sample_rate);
 
         Ok(Self {
             sid1,
@@ -596,10 +600,13 @@ impl EmulatedDevice {
             }
         }
 
-        // Push to ring buffer as stereo pairs, clipped to available room.
+        // Build the mixed pairs in a local vec so we can push them into
+        // both the local ring buffer (for cpal) and the global audio
+        // stream tap (for the browser MP3 endpoint) in one pass.
         let mut buf = self.audio_buf.lock().unwrap();
         let room = MAX_BUFFER_SAMPLES.saturating_sub(buf.len());
         let mix_count = count.min(room);
+        let mut mixed: Vec<(i16, i16)> = Vec::with_capacity(mix_count);
 
         for i in 0..mix_count {
             let left = all1[i];
@@ -618,13 +625,22 @@ impl EmulatedDevice {
                 centre = centre.saturating_add(all4[i] / 2);
             }
 
-            if centre != 0 {
-                buf.push_back((left.saturating_add(centre), right.saturating_add(centre)));
+            let pair = if centre != 0 {
+                (left.saturating_add(centre), right.saturating_add(centre))
             } else {
-                buf.push_back((left, right));
-            }
+                (left, right)
+            };
+            buf.push_back(pair);
+            mixed.push(pair);
         }
         drop(buf);
+
+        // Fan the same samples out to the /api/stream.mp3 tap. Fast-path
+        // bails out immediately when no browsers are listening — cost
+        // is one atomic-bool load.
+        if !mixed.is_empty() {
+            crate::audio_stream::push_pairs(&mixed, self.sample_rate);
+        }
 
         // Preserve the trailing samples of every populated channel — they
         // are next call's leading edge. Consume exactly `count`, NOT

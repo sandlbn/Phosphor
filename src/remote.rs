@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use serde::Serialize;
@@ -83,6 +84,13 @@ pub struct RemoteStatus {
     /// this is the source filename (e.g. `HVSC_Favorite_Top_100.m3u`);
     /// otherwise `None`.
     pub active_published_playlist: Option<String>,
+    /// Monotonic playlist-snapshot version. Bumped whenever the
+    /// server's cached playlist changes (tracks added/removed, favs
+    /// flipped). The web UI mirrors this on the client side and, when
+    /// it sees a new value, re-fetches `/api/playlist` to refresh
+    /// itself. Without this the browser only knew about the playlist
+    /// state it saw at page load.
+    pub playlist_version: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -109,32 +117,75 @@ pub struct SharedRemoteState {
     /// Snapshot of the loaded Published Playlists manifest so the
     /// GET /api/library/playlists endpoint can return it directly.
     pub published_manifest: Option<Manifest>,
+    /// Live mirror of `config.http_stream_enabled`. When false the
+    /// `/api/stream.mp3` endpoint returns 503 without touching the
+    /// encoder, so a user who never turns streaming on pays zero CPU
+    /// for it regardless of what the web UI does.
+    pub stream_enabled: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Server
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sender<RemoteCmd>) {
+/// Spawn the HTTP server thread and return an `Arc<Server>` handle
+/// that lets the caller shut it down cleanly via `Server::unblock()`.
+///
+/// Returns `None` if the socket bind fails (address in use, permission
+/// denied, etc.) — the caller keeps `http_remote_running = false` and
+/// surfaces the error to the user via the eprintln we emit below.
+pub fn start_server(
+    port: u16,
+    state: Arc<Mutex<SharedRemoteState>>,
+    cmd_tx: Sender<RemoteCmd>,
+) -> Option<Arc<tiny_http::Server>> {
+    let addr = format!("0.0.0.0:{}", port);
+    let server = match tiny_http::Server::http(&addr) {
+        Ok(s) => {
+            eprintln!("[phosphor] Remote control: http://localhost:{}", port);
+            Arc::new(s)
+        }
+        Err(e) => {
+            eprintln!("[phosphor] Failed to start HTTP server on {}: {e}", addr);
+            return None;
+        }
+    };
+    let server_for_thread = server.clone();
     thread::Builder::new()
         .name("phosphor-http".into())
         .spawn(move || {
-            let addr = format!("0.0.0.0:{}", port);
-            let server = match tiny_http::Server::http(&addr) {
-                Ok(s) => {
-                    eprintln!("[phosphor] Remote control: http://localhost:{}", port);
-                    s
-                }
-                Err(e) => {
-                    eprintln!("[phosphor] Failed to start HTTP server on {}: {e}", addr);
-                    return;
-                }
-            };
+            let server = server_for_thread;
+            // Liveness heartbeat state. Prints every ~60 s so the
+            // server log confirms the thread is still alive even in
+            // long idle stretches.
+            let mut requests_handled: u64 = 0;
+            let mut last_heartbeat = Instant::now();
 
             for mut request in server.incoming_requests() {
+                if last_heartbeat.elapsed() >= Duration::from_secs(60) {
+                    eprintln!(
+                        "[remote] server alive: {requests_handled} requests handled"
+                    );
+                    last_heartbeat = Instant::now();
+                }
+                requests_handled += 1;
                 let url = request.url().to_string();
                 let method = request.method().to_string();
 
+                // Wrap the whole match in `catch_unwind` so a panic in
+                // ONE handler doesn't kill the server thread. Previous
+                // behaviour: any panic (e.g. via a poisoned mutex from
+                // the encoder or SID engines) tore down the whole
+                // TcpListener, giving every subsequent request
+                // ERR_CONNECTION_REFUSED.
+                //
+                // `AssertUnwindSafe` is needed because `Request` isn't
+                // `UnwindSafe`. It's sound here: on panic the request
+                // is dropped (tiny_http closes the socket), so no
+                // half-mutated shared state escapes.
+                let method_s = method.clone();
+                let url_s = url.clone();
+                let handler = std::panic::AssertUnwindSafe(|| {
                 match (method.as_str(), url.as_str()) {
                     // ── Web UI ───────────────────────────────────────────
                     ("GET", "/") | ("GET", "/index.html") => {
@@ -144,6 +195,108 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                                 .unwrap(),
                         );
                         let _ = request.respond(resp);
+                    }
+
+                    // ── API: audio stream (MP3 to <audio> tag) ───────────
+                    // Opens a subscriber and hands it to tiny_http as
+                    // the response body. The subscriber implements
+                    // `Read`, so tiny_http drives an infinite chunked
+                    // response until the browser closes the connection.
+                    ("GET", p) if p == "/api/stream.mp3" || p.starts_with("/api/stream.mp3?") => {
+                        // Gate on config.http_stream_enabled. When the
+                        // user hasn't opted in, return 503 so the URL
+                        // exists (avoids 404 confusion) but no encoder
+                        // spins up — saves ~15% CPU when the feature
+                        // isn't in use.
+                        let enabled = state
+                            .lock()
+                            .map(|s| s.stream_enabled)
+                            .unwrap_or(false);
+                        if !enabled {
+                            eprintln!("[remote] /api/stream.mp3 refused — disabled in Settings");
+                            respond_error(request, 503, "Audio streaming disabled — enable in Settings → Network");
+                            return;
+                        }
+                        // Move the stream handling to its OWN thread —
+                        // tiny_http's `incoming_requests()` is a single
+                        // consumer, so serving the infinite stream body
+                        // inline blocks every other request. Safari
+                        // routinely opens 2+ parallel probes on an
+                        // <audio> URL and the second probe stalls
+                        // waiting for the first to close, which looks
+                        // exactly like "server dead" from the outside.
+                        //
+                        // Panic guard: this thread is its own panic
+                        // domain — a panic here can't kill the main
+                        // server thread.
+                        let range_header = request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Range"))
+                            .map(|h| h.value.as_str().to_string());
+                        eprintln!(
+                            "[remote] /api/stream.mp3 subscribe (range={})",
+                            range_header.as_deref().unwrap_or("none"),
+                        );
+                        let handled = std::thread::Builder::new()
+                            .name("phosphor-stream".into())
+                            .spawn(move || {
+                                let reader = crate::audio_stream::subscribe();
+                                let mut headers: Vec<tiny_http::Header> = Vec::new();
+                                headers.push(
+                                    "Content-Type: audio/mpeg"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                                headers.push(
+                                    "Cache-Control: no-cache, no-store, must-revalidate"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                                headers.push(
+                                    "Pragma: no-cache"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                                headers.push(
+                                    "Accept-Ranges: none"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                                headers.push(
+                                    "Access-Control-Allow-Origin: *"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                                let resp = tiny_http::Response::new(
+                                    tiny_http::StatusCode(200),
+                                    headers,
+                                    reader,
+                                    None,
+                                    None,
+                                );
+                                let _ = request.respond(resp);
+                                eprintln!("[remote] /api/stream.mp3 disconnect");
+                            });
+                        if let Err(e) = handled {
+                            eprintln!("[remote] stream thread spawn failed: {e}");
+                        }
+                    }
+
+                    // ── API: stream availability ────────────────────────
+                    // Web UI polls this to gate the 🔊 button — reports
+                    // whether audio has flowed recently enough that a
+                    // subscribe would produce audible output.
+                    ("GET", "/api/stream/status") => {
+                        let enabled = state
+                            .lock()
+                            .map(|s| s.stream_enabled)
+                            .unwrap_or(false);
+                        let available = enabled && crate::audio_stream::is_available();
+                        let json = format!(
+                            r#"{{"available":{available},"enabled":{enabled}}}"#
+                        );
+                        respond_json(request, &json);
                     }
 
                     // ── API: status ──────────────────────────────────────
@@ -410,9 +563,26 @@ pub fn start_server(port: u16, state: Arc<Mutex<SharedRemoteState>>, cmd_tx: Sen
                         respond_error(request, 404, "Not found");
                     }
                 }
+                });
+                if let Err(payload) = std::panic::catch_unwind(handler) {
+                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    eprintln!(
+                        "[remote] handler panic on {method_s} {url_s}: {msg}"
+                    );
+                }
             }
+            eprintln!(
+                "[remote] server thread exiting cleanly after {requests_handled} requests"
+            );
         })
         .expect("Failed to spawn HTTP server thread");
+    Some(server)
 }
 
 fn respond_json(request: tiny_http::Request, json: &str) {
@@ -733,7 +903,20 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button onclick="cmd('pause')" title="Play/Pause" id="pp-btn">&#9208;</button>
   <button onclick="cmd('next')" title="Next">&#9197;</button>
   <button onclick="cmd('surprise')" title="Surprise me — random HVSC tune">&#127922;</button>
+  <button onclick="toggleListen()" id="listen-btn" title="Listen in browser">&#128266;</button>
+  <span id="stream-state" style="font-size:11px;color:#8090a0;margin-left:4px;">idle</span>
 </div>
+
+<!-- Hidden <audio> element driven by the 🔊 button.
+     - No `preload="none"` — Safari's <audio> pipeline stalls silently
+       when you set .src on a preload=none element and call .play():
+       the play() promise never resolves, no error event fires, no
+       canplay ever comes. `preload="auto"` (default) is what Safari
+       expects.
+     - No `crossorigin` attr — switches on CORS-attributed media
+       semantics; Safari silently refuses without matching CORS on
+       every chunk. -->
+<audio id="stream-audio"></audio>
 
 <div class="extras">
   <label>&#128554;
@@ -784,12 +967,129 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
 
 <script>
 let entries=[], status={}, curIdx=null, total=0, loading=false, searchTimer=null;
+// Last-seen server playlist snapshot version. Bumped by the server
+// whenever tracks are added/removed or favourites flip. We compare on
+// every /api/status poll and re-fetch the playlist when it changes so
+// desktop-side actions (Surprise Me, drag-add, folder-add) show up on
+// the web UI without a manual refresh.
+let lastPlaylistVersion=null;
 let volDebounce=null;
 
 async function cmd(c){
   await fetch('/api/'+c,{method:'POST'});
   setTimeout(poll,150);
 }
+
+// ── Server-side audio → browser <audio> ────────────────────────
+// The 🔊 button toggles a hidden <audio> element that streams MP3
+// from the built-in encoder. Cache-busts on each start so browsers
+// don't try to resume an old (already-closed) stream. Availability
+// is polled from /api/stream/status so the button dims for engines
+// (USB / U64) that can't be tapped.
+let streamOn=false;
+let streamEnabled=false;   // Config toggle from /api/stream/status.
+let streamAvailable=false; // Audio flowed recently — informational only.
+const MEDIA_ERR = {
+  1: 'aborted',
+  2: 'network',
+  3: 'decode',
+  4: 'not supported',
+};
+function setStreamState(txt, colour){
+  const el=document.getElementById('stream-state');
+  if(!el)return;
+  el.textContent=txt;
+  el.style.color=colour||'#8090a0';
+}
+function attachDiag(el){
+  el.addEventListener('loadstart',()=>{ console.info('[stream] loadstart'); setStreamState('buffering','#c0a050'); });
+  el.addEventListener('waiting',  ()=>{ console.info('[stream] waiting');   setStreamState('buffering','#c0a050'); });
+  el.addEventListener('stalled',  ()=>{ console.warn('[stream] stalled');   setStreamState('stalled','#c05050'); });
+  el.addEventListener('canplay',  ()=>{ console.info('[stream] canplay');   setStreamState('ready','#5cb870'); });
+  el.addEventListener('playing',  ()=>{ console.info('[stream] playing');   setStreamState('playing','#5cb870'); });
+  el.addEventListener('pause',    ()=>{ console.info('[stream] pause');     if(streamOn) setStreamState('paused','#8090a0'); });
+  el.addEventListener('error',()=>{
+    const err=el.error||{};
+    const code=err.code||0;
+    const name=MEDIA_ERR[code]||'unknown';
+    console.error('[stream] audio error:',name,'| src:',el.currentSrc,'| readyState=',el.readyState,'networkState=',el.networkState);
+    setStreamState('error: '+name,'#c05050');
+  });
+}
+function toggleListen(){
+  const el=document.getElementById('stream-audio');
+  const btn=document.getElementById('listen-btn');
+  if(streamOn){
+    el.pause();
+    el.src='';
+    btn.innerHTML='&#128266;';
+    btn.title='Listen in browser';
+    streamOn=false;
+    setStreamState('idle');
+    return;
+  }
+  // Simplest possible form: bare .src assignment + .play(). Every
+  // fancier pattern we tried (<source> child, explicit load(),
+  // preload=none, removeAttribute dance) caused problems in one
+  // browser or another. `.src=` + `.play()` is what the working
+  // direct-URL case boils down to inside the browser, so we mirror it.
+  //
+  // Diagnostic listeners are re-attached once on first click; they
+  // stay for the page's lifetime and drive the state indicator.
+  if(!el._diagAttached){ attachDiag(el); el._diagAttached=true; }
+  el.src='/api/stream.mp3?t='+Date.now();
+  btn.innerHTML='&#128263;';
+  btn.title='Stop listening';
+  streamOn=true;
+  setStreamState('connecting…','#c0a050');
+  const pp=el.play();
+  if(pp&&pp.catch){
+    pp.catch(e=>{
+      console.error('[stream] play() rejected:',e.name,e.message);
+      setStreamState('blocked: '+e.name,'#c05050');
+    });
+  }
+  setupMediaSession();
+}
+
+function setupMediaSession(){
+  if(!('mediaSession' in navigator)) return;
+  navigator.mediaSession.setActionHandler('play',   ()=>cmd('play'));
+  navigator.mediaSession.setActionHandler('pause',  ()=>cmd('pause'));
+  navigator.mediaSession.setActionHandler('previoustrack', ()=>cmd('prev'));
+  navigator.mediaSession.setActionHandler('nexttrack',     ()=>cmd('next'));
+  navigator.mediaSession.setActionHandler('stop', ()=>cmd('stop'));
+}
+
+async function pollStreamStatus(){
+  try{
+    const r=await fetch('/api/stream/status');
+    const j=await r.json();
+    streamEnabled=!!j.enabled;
+    streamAvailable=!!j.available;
+    const btn=document.getElementById('listen-btn');
+    if(!btn)return;
+    // Button clickability depends ONLY on the config flag. Whether
+    // audio is currently flowing (`available`) is informational —
+    // silence is a legitimate thing to stream. Previously we were
+    // disabling the button whenever nothing was playing on the
+    // desktop, which made it impossible to start listening before
+    // starting a tune.
+    btn.disabled=!streamEnabled;
+    btn.style.opacity=streamEnabled?'1':'0.4';
+    if(!streamOn){
+      if(!streamEnabled){
+        btn.title='Audio streaming disabled — enable in Settings → Network';
+        setStreamState('disabled');
+      } else {
+        btn.title=streamAvailable?'Listen in browser':'Listen in browser (silence — nothing playing)';
+        setStreamState(streamAvailable?'idle':'idle (no audio)');
+      }
+    }
+  }catch(_){}
+}
+setInterval(pollStreamStatus,5000);
+setTimeout(pollStreamStatus,500);
 
 async function toggleFavCurrent(){
   await fetch('/api/favorite/current',{method:'POST'});
@@ -980,6 +1280,16 @@ async function poll(){
     document.getElementById('pp-btn').innerHTML=
       status.state==='playing'?'\u23F8':'\u25B6';
     if(status.current_index!==curIdx){curIdx=status.current_index;highlightCurrent();}
+    // Auto-refresh playlist when the desktop side changes it
+    // (Surprise Me, drag-add, folder import, favourite toggle).
+    if(status.playlist_version!==undefined){
+      if(lastPlaylistVersion===null){
+        lastPlaylistVersion=status.playlist_version;
+      } else if(status.playlist_version!==lastPlaylistVersion){
+        lastPlaylistVersion=status.playlist_version;
+        loadPlaylist(false);
+      }
+    }
     // Heart button (♥/♡) reflects current-track favourite state
     const heart=document.getElementById('np-heart');
     if(heart){

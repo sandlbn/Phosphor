@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[allow(dead_code)]
+mod audio_stream;
+#[allow(dead_code)]
 mod audio_volume;
 mod c64_emu;
 mod config;
@@ -438,6 +440,10 @@ struct App {
     remote_cmd_tx: Sender<remote::RemoteCmd>,
     /// Whether the HTTP server is currently running.
     http_remote_running: bool,
+    /// Handle to the tiny_http server; used to call `.unblock()` which
+    /// terminates the accept loop and frees the port immediately.
+    /// `None` means no server running.
+    http_server: Option<Arc<tiny_http::Server>>,
     /// Editable text for the HTTP port field in settings.
     http_port_text: String,
 }
@@ -552,13 +558,14 @@ impl App {
         let (remote_cmd_tx, remote_cmd_rx) = crossbeam_channel::bounded(32);
         let http_port_text = config.http_remote_port.to_string();
         let mut http_remote_running = false;
+        let mut http_server: Option<Arc<tiny_http::Server>> = None;
         if config.http_remote_enabled {
-            remote::start_server(
+            http_server = remote::start_server(
                 config.http_remote_port,
                 Arc::clone(&remote_state),
                 remote_cmd_tx.clone(),
             );
-            http_remote_running = true;
+            http_remote_running = http_server.is_some();
         }
 
         // Snapshot fields needed for auto-download before config moves into app.
@@ -669,6 +676,7 @@ impl App {
             remote_cmd_rx,
             remote_cmd_tx,
             http_remote_running,
+            http_server,
             http_port_text,
         };
 
@@ -2990,23 +2998,48 @@ impl App {
 
             Message::ToggleHttpRemote => {
                 if self.http_remote_running {
-                    // Can't stop tiny_http gracefully, but we can flag it.
-                    // The server thread will keep running but commands will
-                    // be ignored because we won't poll them.
+                    // Actually shut the server down. `unblock()` makes
+                    // `incoming_requests()` return None, the loop exits,
+                    // the thread drops its Arc<Server>, our Arc is
+                    // dropped by `take()`, and the socket is freed. The
+                    // port is available for immediate re-bind — no app
+                    // restart needed.
+                    if let Some(server) = self.http_server.take() {
+                        server.unblock();
+                    }
                     self.http_remote_running = false;
                     self.config.http_remote_enabled = false;
                     self.config.save();
-                    eprintln!("[phosphor] Remote control disabled (restart app to free the port)");
+                    eprintln!("[phosphor] Remote control disabled (port freed)");
                 } else {
-                    remote::start_server(
+                    self.http_server = remote::start_server(
                         self.config.http_remote_port,
                         Arc::clone(&self.remote_state),
                         self.remote_cmd_tx.clone(),
                     );
-                    self.http_remote_running = true;
-                    self.config.http_remote_enabled = true;
+                    self.http_remote_running = self.http_server.is_some();
+                    self.config.http_remote_enabled = self.http_remote_running;
                     self.config.save();
                 }
+            }
+
+            Message::OpenUrl(url) => {
+                if let Err(e) = open::that(&url) {
+                    eprintln!("[phosphor] Failed to open {url}: {e}");
+                }
+            }
+
+            Message::ToggleHttpStream => {
+                self.config.http_stream_enabled = !self.config.http_stream_enabled;
+                self.config.save();
+                eprintln!(
+                    "[phosphor] Audio streaming {} (encoder will spin up on next subscribe)",
+                    if self.config.http_stream_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                );
             }
 
             Message::HttpRemotePortChanged(val) => {
@@ -3016,12 +3049,22 @@ impl App {
                         self.config.http_remote_port = port;
                         self.config.save();
                         // Restart server on the new port if running.
+                        // Shut the old socket down FIRST (unblock →
+                        // thread exit → Arc drop → port freed) so the
+                        // new bind on the new port doesn't collide with
+                        // a still-listening old server. Note: since we
+                        // release the OLD port here, this also frees
+                        // the previous port for any other process.
                         if self.http_remote_running {
-                            remote::start_server(
+                            if let Some(server) = self.http_server.take() {
+                                server.unblock();
+                            }
+                            self.http_server = remote::start_server(
                                 port,
                                 Arc::clone(&self.remote_state),
                                 self.remote_cmd_tx.clone(),
                             );
+                            self.http_remote_running = self.http_server.is_some();
                         }
                     }
                 }
@@ -3131,6 +3174,12 @@ impl App {
             .unwrap_or(true)
             && self.hvsc_sync.is_none()
             && !self.config.has_seen_welcome;
+        let http_remote_url = if self.http_remote_running {
+            let ip = ui::local_ip_address().unwrap_or_else(|| "localhost".to_string());
+            Some(format!("http://{}:{}", ip, self.config.http_remote_port))
+        } else {
+            None
+        };
         let controls = ui::controls_bar(
             &self.status,
             &self.playlist,
@@ -3140,6 +3189,7 @@ impl App {
             self.show_sid_panel,
             self.tick,
             hvsc_needs_attention,
+            http_remote_url,
         );
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
         let progress = ui::progress_bar(&self.status, current_duration);
@@ -4173,6 +4223,15 @@ impl App {
                 _ => None,
             };
 
+            // Compute the playlist-snapshot version now so the same
+            // value goes into both `rs.status.playlist_version` (what
+            // the web UI polls to auto-refresh) and `rs.playlist_version`
+            // (the cache-invalidation key for the snapshot rebuild
+            // below). Bumped whenever entry count OR favourite count
+            // changes — both surface as "playlist state moved".
+            let favs_epoch = self.favorites.hashes.len() as u64;
+            let playlist_version = ((self.playlist.len() as u64) << 32) | favs_epoch;
+
             rs.status = remote::RemoteStatus {
                 state: match self.status.state {
                     PlayState::Playing => "playing",
@@ -4210,18 +4269,19 @@ impl App {
                 hvsc_sync_active: self.hvsc_sync.is_some(),
                 hvsc_sync_progress: self.hvsc_sync_progress.map(|(done, total)| [done, total]),
                 active_published_playlist,
+                playlist_version,
             };
 
             // Snapshot hvsc_root + published manifest for the library
             // browse endpoints on the HTTP thread.
             rs.hvsc_root = self.config.hvsc_root.clone().map(PathBuf::from);
             rs.published_manifest = self.published_playlists_browser.manifest().cloned();
+            rs.stream_enabled = self.config.http_stream_enabled;
 
-            // Rebuild playlist snapshot when entries OR favourites change.
-            // We stuff both into one epoch so the version check catches both.
-            let favs_epoch = self.favorites.hashes.len() as u64;
-            let version = ((self.playlist.len() as u64) << 32) | favs_epoch;
-            if rs.playlist_version != version {
+            // Rebuild playlist snapshot when entries OR favourites
+            // change. Same `playlist_version` we already computed above
+            // for `rs.status`.
+            if rs.playlist_version != playlist_version {
                 let fav_set = &self.favorites.hashes;
                 rs.playlist = self
                     .playlist
@@ -4242,7 +4302,7 @@ impl App {
                             .unwrap_or(false),
                     })
                     .collect();
-                rs.playlist_version = version;
+                rs.playlist_version = playlist_version;
             }
         }
     }

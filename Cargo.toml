@@ -61,6 +61,11 @@ walkdir = "2"
 # Remote control HTTP server
 tiny_http = "0.12"
 
+# MP3 encoder for browser audio streaming. mp3lame-sys bundles the LAME
+# C source and builds it via cc — no system libmp3lame needed on any
+# platform. Only the C toolchain that Phosphor already requires.
+mp3lame-encoder = "0.2.4"
+
 # Logging
 env_logger = "0.11"
 log = "0.4"
