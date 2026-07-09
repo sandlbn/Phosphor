@@ -11,6 +11,10 @@ A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hard
 Trailer by [@exploraart](https://www.youtube.com/@exploraart) — Adam Kazmierski.
 
 
+## Docs & website
+
+Full feature tour with screenshots, install guide and trailer: **<https://sandlbn.github.io/Phosphor/>**.
+
 ## Downloads
 
 Prebuilt binaries for macOS, Linux and Windows are available on the GitHub **Releases** page:
@@ -89,6 +93,18 @@ Phosphor includes a built-in web server for controlling playback from any device
 4. Hit 🔊 **Listen** to hear the live audio through the browser (reSID / SIDLite engines only — hardware playback paths can't be tapped)
 
 The web UI supports server-side search across large collections with paginated loading, auto-refreshes when the desktop side changes the playlist (Surprise Me, drag-add, favourites), and lets you **Load Liked** on-demand as a fresh playlist. Port is configurable (default 8364). The setting persists across restarts. A green **● Remote** pill in the bottom toolbar shows when the server is up and clicking it opens the URL.
+
+## Liked Tracks (♥)
+
+Hearting a tune with the ♥ button (or the `H` key) remembers it forever in `<config_dir>/favorites.json` alongside the file path, title, author, released date and MD5. The button in the search bar shows a live count.
+
+**Load all liked tracks as a playlist** — hit **❤️ Load** (right of the ♥ badge) or `POST /api/favorites/play` from the remote. Phosphor resolves each MD5 back to a file via a stored path → HVSC-md5 lookup fallback, replaces the current playlist with everything it can find, and reports any it couldn't. That resolution chain means:
+
+- Removing a hearted track from the current playlist doesn't lose it.
+- Moving your HVSC folder auto-heals cached paths on the next Load.
+- Legacy MD5-only rows (migrated from an older `favorites.txt`) get enriched with title / author / path the first time you play them.
+
+**Share / back up** via Settings → Library → **⬇ Export as M3U…** / **⬆ Import from M3U…**. The exported M3U opens in any SID player; importing merges into your collection without touching existing hearts.
 
 ## Development Requirements
 
