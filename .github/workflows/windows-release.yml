@@ -23,7 +23,7 @@ name: Windows Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['*']
   workflow_dispatch:
   # Build/package test on branches. Opening a PR that touches the Windows
   # packaging files runs the full build + installer, uploading the installer as
