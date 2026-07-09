@@ -284,6 +284,23 @@ pub enum Message {
     ToggleFavoritesFilter,
     FavoriteNowPlaying,
     ScrollToNowPlaying,
+    /// Load every hearted track as a fresh playlist. Resolves each MD5
+    /// via the stored path → HVSC-md5 lookup fallback; skips
+    /// unresolvable entries; heals stored paths on success.
+    LoadFavoritesPlaylist,
+    /// Re-evaluate every favourite's stored `path` — used when the
+    /// user changes the HVSC root. Blanks paths that no longer exist
+    /// or point under the previous root, so the next resolve()
+    /// rebuilds them under the new root.
+    RerootFavourites(Option<PathBuf>),
+    /// Show the "save as…" picker for a favourites-M3U export.
+    ExportFavouritesPick,
+    /// Actually write the M3U after the file picker returned a path.
+    ExportFavouritesTo(Option<PathBuf>),
+    /// Show the "open…" picker for a favourites-M3U import.
+    ImportFavouritesPick,
+    /// Read the M3U at this path and union-merge into favourites.
+    ImportFavouritesFrom(Option<PathBuf>),
 
     // File drag & drop
     FileDropped(PathBuf),
@@ -1253,11 +1270,46 @@ pub fn search_bar<'a>(
         search_row = search_row.push(tool_button("✕", Message::ClearSearch));
     }
 
+    // Small "Load all liked as playlist" button — the fix for the
+    // "delete a favourite from the playlist, then Play Liked can't
+    // find it" bug. Resolves stored paths → HVSC MD5 lookup, replaces
+    // the current playlist with everything that resolves. Only shown
+    // when the user has any liked tracks at all.
+    let load_liked_btn: Element<'a, Message> = if favorites_count > 0 {
+        let btn: Element<'a, Message> = button(
+            text("❤️ Load")
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.85, 0.62, 0.72)),
+        )
+        .on_press(Message::LoadFavoritesPlaylist)
+        .padding(Padding::from([4, 10]))
+        .style(|_t: &Theme, st| button::Style {
+            background: Some(iced::Background::Color(match st {
+                button::Status::Hovered => Color::from_rgb(0.25, 0.15, 0.18),
+                button::Status::Pressed => Color::from_rgb(0.18, 0.10, 0.13),
+                _ => Color::from_rgb(0.18, 0.11, 0.14),
+            })),
+            text_color: Color::from_rgb(0.85, 0.62, 0.72),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.45, 0.22, 0.28),
+            },
+            ..Default::default()
+        })
+        .into();
+        with_tip(btn, "Load every liked track as a fresh playlist (resolves paths from disk)")
+    } else {
+        Space::new().width(Length::Fixed(0.0)).into()
+    };
+
     container(
         row![
             search_row,
             Space::new().width(Length::Fixed(8.0)),
             fav_btn,
+            Space::new().width(Length::Fixed(4.0)),
+            load_liked_btn,
             Space::new().width(Length::Fixed(8.0)),
             text(count_text).size(font::sized(12.0)).color(count_color)
         ]
@@ -3530,6 +3582,26 @@ pub fn settings_panel<'a>(
         Color::from_rgb(0.5, 0.5, 0.6)
     };
 
+    // Liked tracks — share via M3U. The desktop 🔊/Library heart
+    // button + web UI let users curate; this pair round-trips that
+    // collection to a portable file every SID player understands.
+    let liked_section = column![
+        text("Liked tracks (❤ favourites):")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text("Export as M3U to back up or share with a friend. Import to merge someone else's favourites into yours (existing hearts are preserved).")
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        row![
+            tool_button("⬇ Export as M3U…", Message::ExportFavouritesPick),
+            Space::new().width(Length::Fixed(6.0)),
+            tool_button("⬆ Import from M3U…", Message::ImportFavouritesPick),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(6);
+
     let dl_section = column![
         text("HVSC Songlength database:")
             .size(font::sized(14.0))
@@ -3874,6 +3946,8 @@ pub fn settings_panel<'a>(
         }
         SettingsTab::Library => {
             tab_content = tab_content
+                .push(liked_section)
+                .push(rule::horizontal(1))
                 .push(hvsc_section)
                 .push(rule::horizontal(1))
                 .push(dl_section)

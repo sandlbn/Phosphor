@@ -42,6 +42,10 @@ pub enum RemoteCmd {
     // Library — HVSC browse
     HvscPlay(PathBuf),
     HvscAdd(PathBuf),
+    /// Load all liked tracks as the fresh playlist. Server-side calls
+    /// through the same `Message::LoadFavoritesPlaylist` handler the
+    /// desktop uses so the resolve/heal path is identical.
+    LoadFavoritesPlaylist,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -428,6 +432,14 @@ pub fn start_server(
                         } else {
                             respond_error(request, 400, "Missing index");
                         }
+                    }
+                    // Load all liked tracks as a fresh playlist. Fires
+                    // the same `Message::LoadFavoritesPlaylist` path
+                    // the desktop UI uses, so resolve/heal semantics
+                    // are identical.
+                    ("POST", "/api/favorites/play") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::LoadFavoritesPlaylist);
+                        respond_ok(request);
                     }
                     ("POST", "/api/shuffle") => {
                         let _ = cmd_tx.try_send(RemoteCmd::ToggleShuffle);
@@ -903,6 +915,7 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button onclick="cmd('pause')" title="Play/Pause" id="pp-btn">&#9208;</button>
   <button onclick="cmd('next')" title="Next">&#9197;</button>
   <button onclick="cmd('surprise')" title="Surprise me — random HVSC tune">&#127922;</button>
+  <button onclick="loadLiked()" title="Load my liked tracks as a fresh playlist">&#10084;&#65039;</button>
   <button onclick="toggleListen()" id="listen-btn" title="Listen in browser">&#128266;</button>
   <span id="stream-state" style="font-size:11px;color:#8090a0;margin-left:4px;">idle</span>
 </div>
@@ -978,6 +991,16 @@ let volDebounce=null;
 async function cmd(c){
   await fetch('/api/'+c,{method:'POST'});
   setTimeout(poll,150);
+}
+
+// Load every hearted track as a fresh playlist. Server resolves
+// each MD5 → path via the stored path or the HVSC songlength DB,
+// skipping any that can't be located. Playlist auto-refresh in
+// the UI is driven by the `playlist_version` polling.
+async function loadLiked(){
+  await fetch('/api/favorites/play',{method:'POST'});
+  setTimeout(poll,200);
+  setTimeout(()=>loadPlaylist(false),400);
 }
 
 // ── Server-side audio → browser <audio> ────────────────────────
