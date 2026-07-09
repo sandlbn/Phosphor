@@ -1121,15 +1121,14 @@ pub fn controls_bar<'a>(
     // instant it's stopped.
     if let Some(url) = http_remote_url.as_ref() {
         let url_owned = url.clone();
-        let url_label = url.clone();
+        // Compact pill on purpose — the URL used to be baked into the
+        // label but wrapped/clipped in narrower windows. Text is now
+        // just "● Remote"; the full URL still shows in the hover
+        // tooltip and the click still opens it.
         let dot_btn: Element<'a, Message> = button(
-            text(if compact {
-                "● Remote".to_string()
-            } else {
-                format!("● Remote · {url_label}")
-            })
-            .size(font::sized(if compact { 11.0 } else { 12.0 }))
-            .color(Color::from_rgb(0.55, 0.85, 0.65)),
+            text("● Remote")
+                .size(font::sized(if compact { 11.0 } else { 12.0 }))
+                .color(Color::from_rgb(0.55, 0.85, 0.65)),
         )
         .on_press(Message::OpenUrl(url_owned))
         .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
@@ -1150,7 +1149,7 @@ pub fn controls_bar<'a>(
         .into();
         bottom_row = bottom_row.push(with_tip(
             dot_btn,
-            "HTTP remote server is running — click to open it in your browser",
+            "HTTP remote server is running — click to open it in your browser (URL in Settings → Network)",
         ));
     }
     if let Some(info) = new_version {
