@@ -11,6 +11,10 @@ A SID music player for [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hard
 Trailer by [@exploraart](https://www.youtube.com/@exploraart) — Adam Kazmierski.
 
 
+## Docs & website
+
+Full feature tour with screenshots, install guide and trailer: **<https://sandlbn.github.io/Phosphor/>**.
+
 ## Downloads
 
 Prebuilt binaries for macOS, Linux and Windows are available on the GitHub **Releases** page:
@@ -25,12 +29,13 @@ https://github.com/sandlbn/Phosphor/releases
 - **🎲 Surprise me** — one-click random tune from your synced HVSC tree or from the currently-loaded playlist (source is configurable in Settings)
 - **USBSID-Pico device config** — built-in Device panel (🔧 button) for chip routing, clock rate, presets, and save-to-flash, all without leaving Phosphor
 - **HTTP remote control** — built-in web server for controlling playback from any browser on the network (phone, tablet, another PC)
+- **Browser audio streaming** — the same web UI can also **play** the current SID output as a live MP3 through the browser's `<audio>` element. Click 🔊 Listen and any device on the LAN — phone, laptop, another room's tablet — hears what the desktop is playing. Works with the reSID and SIDLite engines; the USB / U64 hardware paths are analog and can't be tapped
 - **HTTP proxy support** — single-field setting for `http://` / `https://` / `socks5://`, applied to all outbound requests
 - **Playlist management** — add files and folders, drag & drop, save/load M3U playlists; duplicate detection on import
 - **Session restore** — playlist automatically saved on exit and restored on next launch
 - **Sortable columns** — click any column header to sort by title, author, released, duration, type, or SID count
 - **Search & filter** — real-time search across title, author, released year, and file path
-- **Favorites** — heart any tune; filter playlist to favorites only
+- **Liked tracks** — ♥ any tune to remember it forever. Load your liked collection as a fresh playlist with one click; tracks resolve back to disk even if you removed them from the current playlist, moved your HVSC folder, or migrated from another machine. Share via M3U import / export
 - **Recently played** — persistent history of the last 100 unique tracks with human-readable timestamps
 - **HVSC Songlength DB** — automatic song-length lookup with configurable fallback duration
 - **HVSC STIL** — song info overlay (cover titles, original artists, composer comments) via the ⓘ button; downloaded or loaded from a local STIL.txt
@@ -85,8 +90,21 @@ Phosphor includes a built-in web server for controlling playback from any device
 1. Open Settings (⚙) → **Remote control (HTTP)** → click **Start remote server**
 2. Open the displayed URL (e.g. `http://192.168.1.42:8364`) on your phone or another computer
 3. Browse the playlist, search, play/pause/skip — all from the browser
+4. Hit 🔊 **Listen** to hear the live audio through the browser (reSID / SIDLite engines only — hardware playback paths can't be tapped)
 
-The web UI supports server-side search across large collections with paginated loading. Port is configurable (default 8364). The setting persists across restarts.
+The web UI supports server-side search across large collections with paginated loading, auto-refreshes when the desktop side changes the playlist (Surprise Me, drag-add, favourites), and lets you **Load Liked** on-demand as a fresh playlist. Port is configurable (default 8364). The setting persists across restarts. A green **● Remote** pill in the bottom toolbar shows when the server is up and clicking it opens the URL.
+
+## Liked Tracks (♥)
+
+Hearting a tune with the ♥ button (or the `H` key) remembers it forever in `<config_dir>/favorites.json` alongside the file path, title, author, released date and MD5. The button in the search bar shows a live count.
+
+**Load all liked tracks as a playlist** — hit **❤️ Load** (right of the ♥ badge) or `POST /api/favorites/play` from the remote. Phosphor resolves each MD5 back to a file via a stored path → HVSC-md5 lookup fallback, replaces the current playlist with everything it can find, and reports any it couldn't. That resolution chain means:
+
+- Removing a hearted track from the current playlist doesn't lose it.
+- Moving your HVSC folder auto-heals cached paths on the next Load.
+- Legacy MD5-only rows (migrated from an older `favorites.txt`) get enriched with title / author / path the first time you play them.
+
+**Share / back up** via Settings → Library → **⬇ Export as M3U…** / **⬆ Import from M3U…**. The exported M3U opens in any SID player; importing merges into your collection without touching existing hearts.
 
 ## Development Requirements
 
@@ -144,24 +162,16 @@ Most users should just grab the installer from the [Releases](https://github.com
 1. Install the WinUSB driver for your USBSID-Pico using [Zadig](https://zadig.akeo.ie/) (one-time; only needed for the USBSID-Pico hardware — software emulation and Ultimate 64 network playback work without it).
 2. Download and run **`Phosphor-<version>-windows-x86_64-setup.exe`**. It installs Phosphor with a Start-menu shortcut (and an optional desktop icon) and registers an uninstaller in Add/Remove Programs.
 
-#### Building the installer locally (unsigned / self-signed)
+#### Building the installer locally
 
-For development you can build the installer on your own machine. You need the Rust MSVC toolchain, [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`iscc.exe`), and the Windows SDK (`signtool.exe`):
+For development you can build the installer on your own machine. You need the Rust MSVC toolchain and [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`iscc.exe`):
 
 ```powershell
-# Validate the whole pipeline with a throwaway self-signed cert:
-make -f Makefile.windows windows_selfsign
-
-# Or a quick unsigned dev build:
-make -f Makefile.windows windows_installer   # unsigned unless WIN_CERT_* is set
+make -f Makefile.windows windows_installer   # exe + installer
 make -f Makefile.windows windows             # bare exe, no installer
 ```
 
-This produces `dist\Phosphor-<version>-windows-x86_64-setup.exe`. The script builds with a static CRT (see `.cargo/config.toml`) so the exe is self-contained, then builds the Inno Setup installer (`windows/phosphor.iss`). Passing a real certificate via `WIN_CERT_PFX` (+`WIN_CERT_PASSWORD`) or `WIN_CERT_THUMBPRINT` makes it sign with `signtool`; see the header comment in `windows/build_installer.ps1` for all options.
-
-#### Official signed releases (CI)
-
-Public releases are built and **signed by [SignPath.io](https://signpath.io)** (free code-signing for open source) via GitHub Actions — the private key never leaves SignPath, so there is no local certificate. Pushing a `v*` tag runs [`.github/workflows/windows-release.yml`](.github/workflows/windows-release.yml), which builds on a GitHub-hosted runner, submits `phosphor.exe` and the installer to SignPath for signing, and attaches the signed `Phosphor-<version>-windows-x86_64-setup.exe` to the GitHub Release. See the header comment in that workflow for the required `SIGNPATH_API_TOKEN` secret and `SIGNPATH_ORGANIZATION_ID` variable.
+This produces `dist\Phosphor-<version>-windows-x86_64-setup.exe`. The script builds with a static CRT (see `.cargo/config.toml`) so the exe is self-contained, then builds the Inno Setup installer (`windows/phosphor.iss`).
 
 ### Linux
 
