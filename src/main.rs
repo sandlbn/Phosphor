@@ -4378,7 +4378,13 @@ impl App {
                     }
                 },
                 remote::RemoteCmd::SetVolume(v) => {
-                    self.config.master_volume = v.clamp(0.0, 1.0);
+                    let clamped = v.clamp(0.0, 1.0);
+                    self.config.master_volume = clamped;
+                    // Push the new gain into the audio thread — WITHOUT
+                    // this call the cpal callback keeps the old value,
+                    // so config/UI/API status all show the new volume
+                    // but you hear no change.
+                    crate::audio_volume::set(clamped);
                     self.config.save();
                 }
 
