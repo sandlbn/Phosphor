@@ -132,6 +132,47 @@ pub struct SharedRemoteState {
 //  Server
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Attempt to bind. On Windows a `TcpListener` doesn't release its
+/// port immediately after `Server::unblock()` + `Arc<Server>` drop —
+/// Winsock's close path takes a beat, and a rapid Stop→Start from the
+/// Settings toggle otherwise fails with `Address already in use` and
+/// looks like the toggle is broken. Retry with backoff (~1.5 s total)
+/// covers every case I've reproduced. macOS + Linux release
+/// immediately so they get a single attempt with no wait.
+#[cfg(target_os = "windows")]
+fn try_bind(addr: &str) -> Result<tiny_http::Server, String> {
+    let mut delay = Duration::from_millis(100);
+    let mut last_err = String::new();
+    for attempt in 0..5u32 {
+        match tiny_http::Server::http(addr) {
+            Ok(s) => {
+                if attempt > 0 {
+                    eprintln!("[phosphor] Remote bound after {attempt} retry attempt(s)");
+                }
+                return Ok(s);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < 4 {
+                    eprintln!(
+                        "[phosphor] Port not yet released (attempt {}) — retrying in {} ms",
+                        attempt + 1,
+                        delay.as_millis(),
+                    );
+                    thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn try_bind(addr: &str) -> Result<tiny_http::Server, String> {
+    tiny_http::Server::http(addr).map_err(|e| e.to_string())
+}
+
 /// Spawn the HTTP server thread and return an `Arc<Server>` handle
 /// that lets the caller shut it down cleanly via `Server::unblock()`.
 ///
@@ -144,7 +185,7 @@ pub fn start_server(
     cmd_tx: Sender<RemoteCmd>,
 ) -> Option<Arc<tiny_http::Server>> {
     let addr = format!("0.0.0.0:{}", port);
-    let server = match tiny_http::Server::http(&addr) {
+    let server = match try_bind(&addr) {
         Ok(s) => {
             eprintln!("[phosphor] Remote control: http://localhost:{}", port);
             Arc::new(s)
