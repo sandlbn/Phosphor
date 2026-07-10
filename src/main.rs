@@ -3145,19 +3145,20 @@ impl App {
 
             Message::ToggleHttpRemote => {
                 if self.http_remote_running {
-                    // Actually shut the server down. `unblock()` makes
-                    // `incoming_requests()` return None, the loop exits,
-                    // the thread drops its Arc<Server>, our Arc is
-                    // dropped by `take()`, and the socket is freed. The
-                    // port is available for immediate re-bind — no app
-                    // restart needed.
+                    // Shut down: unblock (accept-thread wake), drop
+                    // our Arc explicitly (so only tiny_http's own
+                    // clone remains), let its async cleanup close
+                    // the listener. The `start_server` retry loop
+                    // on Windows covers the millisecond gap between
+                    // "we let go" and "the socket is actually gone".
                     if let Some(server) = self.http_server.take() {
                         server.unblock();
+                        drop(server);
                     }
                     self.http_remote_running = false;
                     self.config.http_remote_enabled = false;
                     self.config.save();
-                    eprintln!("[phosphor] Remote control disabled (port freed)");
+                    eprintln!("[phosphor] Remote control disabled (port released)");
                 } else {
                     self.http_server = remote::start_server(
                         self.config.http_remote_port,
