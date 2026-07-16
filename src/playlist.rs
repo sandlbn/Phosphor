@@ -277,6 +277,78 @@ impl Playlist {
         self.shuffle_order.clear();
     }
 
+    /// Reorder entries according to `perm`: after the call, the entry
+    /// that was at old position `perm[i]` is at new position `i`. If
+    /// `perm` isn't a valid permutation of `0..entries.len()` the
+    /// call is a no-op (defensive; caller is expected to hand us a
+    /// full permutation like the one `sort_indices` produces).
+    /// `self.current` follows the moved track; shuffle order rebuilds.
+    ///
+    /// Used by the web-remote's `PlaylistSort` handler — the desktop
+    /// header-click sort only reorders the view, but a remote user
+    /// expects the playlist itself to change so the sort survives
+    /// M3U export / share.
+    pub fn apply_permutation(&mut self, perm: &[usize]) {
+        let n = self.entries.len();
+        if perm.len() != n {
+            return;
+        }
+        // Validate perm covers every index exactly once.
+        let mut seen = vec![false; n];
+        for &i in perm {
+            if i >= n || seen[i] {
+                return;
+            }
+            seen[i] = true;
+        }
+        let mut old_to_new = vec![0usize; n];
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            old_to_new[old_i] = new_i;
+        }
+        let old = std::mem::take(&mut self.entries);
+        let mut reordered: Vec<PlaylistEntry> = Vec::with_capacity(n);
+        for &old_i in perm {
+            reordered.push(old[old_i].clone());
+        }
+        self.entries = reordered;
+        if let Some(ref mut cur) = self.current {
+            *cur = old_to_new[*cur];
+        }
+        self.rebuild_shuffle();
+    }
+
+    /// Move the entry at `from` to position `to`. Both indices are
+    /// clamped to `entries.len() - 1`. `self.current` follows the
+    /// track that was playing so playback isn't interrupted.
+    ///
+    /// Used by the web UI's drag-to-reorder + the desktop context
+    /// menu's Move up / Move down. Idempotent when `from == to`.
+    pub fn move_entry(&mut self, from: usize, to: usize) {
+        let n = self.entries.len();
+        if n == 0 {
+            return;
+        }
+        let from = from.min(n - 1);
+        let to = to.min(n - 1);
+        if from == to {
+            return;
+        }
+        let entry = self.entries.remove(from);
+        self.entries.insert(to, entry);
+        // Rewire `current` so the playhead follows the moved track,
+        // and adjust for anyone else that shifted around it.
+        if let Some(ref mut cur) = self.current {
+            if *cur == from {
+                *cur = to;
+            } else if from < *cur && to >= *cur {
+                *cur -= 1;
+            } else if from > *cur && to <= *cur {
+                *cur += 1;
+            }
+        }
+        self.rebuild_shuffle();
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -400,6 +472,42 @@ impl Playlist {
     /// Durations from #EXTINF and sub-tune selections from #PHOSPHOR
     /// are restored, avoiding a Songlength DB re-scan for known tunes.
     /// Returns the number of tracks successfully loaded.
+    /// Load M3U / PLS content directly from a string (no filesystem read).
+    ///
+    /// Used by the web UI's `POST /api/playlist/import` endpoint — the
+    /// browser sends the file body inline, we parse it here. `is_pls`
+    /// picks the PLS or the (default) M3U parser. `base_dir` resolves
+    /// any relative paths inside the file; absolute paths are the
+    /// expected shape from web imports.
+    pub fn load_playlist_content(&mut self, content: &str, base_dir: &Path, is_pls: bool) -> usize {
+        let mut loaded = 0;
+        if is_pls {
+            let paths = parse_pls(content, base_dir);
+            for p in &paths {
+                if p.is_dir() {
+                    loaded += self.add_directory(p);
+                } else if self.add_file(p).is_ok() {
+                    loaded += 1;
+                } else {
+                    eprintln!(
+                        "[phosphor] Playlist: skipping {} (not a valid SID)",
+                        p.display()
+                    );
+                }
+            }
+        } else {
+            let items = parse_m3u(content, base_dir);
+            for item in items {
+                if item.path.is_dir() {
+                    loaded += self.add_directory(&item.path);
+                } else if self.add_file(&item.path).is_ok() {
+                    loaded += 1;
+                }
+            }
+        }
+        loaded
+    }
+
     pub fn load_playlist_file(&mut self, path: &Path) -> Result<usize, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;

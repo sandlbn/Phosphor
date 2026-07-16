@@ -242,6 +242,20 @@ struct App {
     /// Ascending or descending sort direction.
     sort_direction: SortDirection,
 
+    /// Monotonic counter bumped whenever the playlist changes in a way
+    /// that would be *invisible* to the length/favourite-count formula
+    /// used in `playlist_version` — reorders, sorts, moves, drag-drop.
+    /// Mixed into the version so the web UI's auto-refresh triggers
+    /// on those cases too.
+    playlist_reorder_epoch: u32,
+    /// `(len << 32) | reorder_epoch` last time we wrote
+    /// session_playlist.m3u. Compared against the current key each
+    /// Tick so we auto-save the session whenever the playlist has
+    /// changed — protects phone users' edits from a desktop crash.
+    /// Initial value is deliberately `u64::MAX` so the first Tick
+    /// after startup doesn't trigger a spurious save.
+    last_saved_session_key: u64,
+
     /// Persistent application configuration (saved to disk on every change).
     config: Config,
     /// Whether the settings panel is currently visible.
@@ -589,6 +603,8 @@ impl App {
             filtered_indices,
             sort_column: SortColumn::Index,
             sort_direction: SortDirection::Ascending,
+            playlist_reorder_epoch: 0,
+            last_saved_session_key: u64::MAX,
             config,
             show_settings: false,
             settings_tab: ui::SettingsTab::General,
@@ -2034,6 +2050,18 @@ impl App {
                         }
                     }
                 }
+
+                // ── Auto-save session on any playlist mutation ─────────
+                // Cheapens the "phone user edits then desktop crashes"
+                // loss window: we still save on Drop, but Drop only
+                // fires on a graceful exit. Every Tick we check a
+                // (len << 32) | reorder_epoch key against the last
+                // value we saved with and write when it changed. Cost
+                // when unchanged: two u64 compares. Cost when saving:
+                // one small write (session_playlist.m3u is 4–20 KB
+                // for a typical curated list). Skips PublishedReadOnly
+                // mode so the user's own default is never clobbered.
+                self.maybe_save_session();
 
                 // ── Remote control ──────────────────────────────────────
                 if self.http_remote_running {
@@ -4357,6 +4385,31 @@ impl App {
     }
 
     /// Push current status + playlist snapshot to the remote HTTP server.
+    /// Write session_playlist.m3u if the playlist has changed since
+    /// the last save. Called from Tick. Guarded by `session_loaded`
+    /// (so a startup-in-progress empty playlist doesn't get flushed
+    /// over the on-disk file) and by `SessionMode::PublishedReadOnly`
+    /// (so the user's own default is preserved while a published
+    /// playlist is loaded).
+    ///
+    /// The key uses `(len << 32) | reorder_epoch` — the same signals
+    /// that already drive `playlist_version`. Any add / remove /
+    /// clear / import / reorder / sort bumps at least one of them.
+    fn maybe_save_session(&mut self) {
+        if !self.session_loaded {
+            return;
+        }
+        if matches!(self.session_mode, SessionMode::PublishedReadOnly { .. }) {
+            return;
+        }
+        let key = ((self.playlist.len() as u64) << 32) | (self.playlist_reorder_epoch as u64);
+        if key == self.last_saved_session_key {
+            return;
+        }
+        self.playlist.save_session();
+        self.last_saved_session_key = key;
+    }
+
     fn update_remote_state(&self) {
         if let Ok(mut rs) = self.remote_state.try_lock() {
             let info = self.status.track_info.as_ref();
@@ -4384,7 +4437,12 @@ impl App {
             // below). Bumped whenever entry count OR favourite count
             // changes — both surface as "playlist state moved".
             let favs_epoch = self.favorites.hashes.len() as u64;
-            let playlist_version = ((self.playlist.len() as u64) << 32) | favs_epoch;
+            // Fold in the reorder epoch — the web needs to auto-refresh
+            // when tracks are re-sorted or dragged even though neither
+            // playlist length nor favourite count changed.
+            let playlist_version = ((self.playlist.len() as u64) << 32)
+                | ((self.playlist_reorder_epoch as u64) << 16)
+                | (favs_epoch & 0xFFFF);
 
             rs.status = remote::RemoteStatus {
                 state: match self.status.state {
@@ -4424,12 +4482,31 @@ impl App {
                 hvsc_sync_progress: self.hvsc_sync_progress.map(|(done, total)| [done, total]),
                 active_published_playlist,
                 playlist_version,
+                skip_rsid: self.config.skip_rsid,
+                force_stereo_2sid: self.config.force_stereo_2sid,
+                surprise_source: self.config.surprise_source.clone(),
             };
 
             // Snapshot hvsc_root + published manifest for the library
             // browse endpoints on the HTTP thread.
             rs.hvsc_root = self.config.hvsc_root.clone().map(PathBuf::from);
             rs.published_manifest = self.published_playlists_browser.manifest().cloned();
+            // Snapshot recently-played so the web UI's Recent tab can
+            // render without touching the RecentlyPlayed DB directly.
+            rs.recently_played = self
+                .recently_played
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| remote::RemoteRecentEntry {
+                    title: e.title.clone(),
+                    author: e.author.clone(),
+                    released: e.released.clone(),
+                    played_at_relative: crate::recently_played::format_played_at(e.played_at),
+                    path: e.path.clone(),
+                    index: i,
+                })
+                .collect();
             rs.stream_enabled = self.config.http_stream_enabled;
 
             // Rebuild playlist snapshot when entries OR favourites
@@ -4454,6 +4531,7 @@ impl App {
                             .as_deref()
                             .map(|m| fav_set.contains(m))
                             .unwrap_or(false),
+                        path: e.path.clone(),
                     })
                     .collect();
                 rs.playlist_version = playlist_version;
@@ -4563,6 +4641,128 @@ impl App {
                 }
                 remote::RemoteCmd::HvscAdd(path) => {
                     self.direct_hvsc_action(path, /*play=*/ false);
+                }
+
+                // ── Playlist editing ─────────────────────────────────
+                remote::RemoteCmd::PlaylistRemove(idx) => {
+                    if idx < self.playlist.entries.len() {
+                        // Stop first if we're removing the currently
+                        // playing track, matching the desktop
+                        // context-menu Remove flow.
+                        if self.playlist.current == Some(idx) {
+                            let _ = self.cmd_tx.send(player::PlayerCmd::Stop);
+                        }
+                        self.playlist.remove(idx);
+                        self.selected = if self.playlist.is_empty() {
+                            None
+                        } else {
+                            Some(idx.min(self.playlist.len() - 1))
+                        };
+                        self.rebuild_filter();
+                    }
+                }
+                remote::RemoteCmd::PlaylistClear => {
+                    let _ = self.cmd_tx.send(player::PlayerCmd::Stop);
+                    self.playlist.clear();
+                    self.selected = None;
+                    self.rebuild_filter();
+                }
+                remote::RemoteCmd::PlaylistMove { from, to } => {
+                    self.playlist.move_entry(from, to);
+                    self.playlist_reorder_epoch = self.playlist_reorder_epoch.wrapping_add(1);
+                    self.rebuild_filter();
+                }
+                remote::RemoteCmd::PlaylistSort(col) => {
+                    // Web sort mutates `playlist.entries` physically.
+                    // The desktop `Message::SortBy` only reorders the
+                    // *view* (`filtered_indices`) and leaves the
+                    // underlying list untouched — that view isn't
+                    // visible over REST, so the browser would see no
+                    // change. Instead we compute a permutation the
+                    // same way `sort_indices` does and apply it in
+                    // place. `current` follows the moved track.
+                    let sc = match col.to_lowercase().as_str() {
+                        "index" | "#" => SortColumn::Index,
+                        "title" => SortColumn::Title,
+                        "author" => SortColumn::Author,
+                        "released" | "year" => SortColumn::Released,
+                        "duration" | "length" | "len" => SortColumn::Duration,
+                        "type" | "sidtype" | "rsid" => SortColumn::SidType,
+                        "sids" | "numsids" | "num_sids" => SortColumn::NumSids,
+                        _ => SortColumn::Index,
+                    };
+                    // Flip direction if it's the same column, matching
+                    // the desktop-header-click convention.
+                    if self.sort_column == sc {
+                        self.sort_direction = self.sort_direction.flip();
+                    } else {
+                        self.sort_column = sc;
+                        self.sort_direction = SortDirection::Ascending;
+                    }
+                    let n = self.playlist.entries.len();
+                    if n > 1 {
+                        let mut perm: Vec<usize> = (0..n).collect();
+                        sort_indices(
+                            &self.playlist,
+                            &mut perm,
+                            self.sort_column,
+                            self.sort_direction,
+                        );
+                        self.playlist.apply_permutation(&perm);
+                        self.playlist_reorder_epoch = self.playlist_reorder_epoch.wrapping_add(1);
+                    }
+                    self.rebuild_filter();
+                }
+                remote::RemoteCmd::PlaylistImport { m3u, is_pls } => {
+                    let base = self
+                        .config
+                        .last_playlist_dir
+                        .as_deref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let added = self.playlist.load_playlist_content(&m3u, &base, is_pls);
+                    if let Some(db) = self.songlength_db.as_ref() {
+                        db.apply_to_playlist(
+                            &mut self.playlist,
+                            self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                        );
+                    }
+                    self.rebuild_filter();
+                    eprintln!("[phosphor] Remote M3U import: {added} track(s) added");
+                }
+
+                remote::RemoteCmd::SubtuneNext => {
+                    tasks.push(Task::done(Message::NextSubtune));
+                }
+                remote::RemoteCmd::SubtunePrev => {
+                    tasks.push(Task::done(Message::PrevSubtune));
+                }
+                remote::RemoteCmd::HvscSyncStart => {
+                    tasks.push(Task::done(Message::HvscRsyncStart));
+                }
+                remote::RemoteCmd::HvscSyncCancel => {
+                    tasks.push(Task::done(Message::HvscRsyncCancel));
+                }
+                remote::RemoteCmd::ToggleSkipRsid => {
+                    tasks.push(Task::done(Message::ToggleSkipRsid));
+                }
+                remote::RemoteCmd::ToggleForceStereo2sid => {
+                    tasks.push(Task::done(Message::ToggleForceStereo2sid));
+                }
+                remote::RemoteCmd::SetSurpriseSource(src) => {
+                    tasks.push(Task::done(Message::SetSurpriseSource(src)));
+                }
+                remote::RemoteCmd::SetRepeatMode(mode) => {
+                    self.playlist.repeat = match mode.as_str() {
+                        "one" => playlist::RepeatMode::Single,
+                        "all" => playlist::RepeatMode::All,
+                        _ => playlist::RepeatMode::Off,
+                    };
+                }
+                remote::RemoteCmd::SetShuffle(on) => {
+                    if self.playlist.shuffle != on {
+                        self.playlist.toggle_shuffle();
+                    }
                 }
             }
         }

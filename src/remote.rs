@@ -4,6 +4,7 @@
 // Runs in a background thread — all communication with the iced App
 // goes through shared state (Arc<Mutex>) and a command channel.
 
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,6 +47,47 @@ pub enum RemoteCmd {
     /// through the same `Message::LoadFavoritesPlaylist` handler the
     /// desktop uses so the resolve/heal path is identical.
     LoadFavoritesPlaylist,
+    // ── Playlist editing ─────────────────────────────────────────
+    /// Remove the track at the given playlist index. Mirrors the
+    /// desktop's `ContextMenuRemove` handler.
+    PlaylistRemove(usize),
+    /// Clear the entire playlist. Mirrors `ClearPlaylist`.
+    PlaylistClear,
+    /// Move the track at `from` to position `to`. Web UI uses this
+    /// for drag-to-reorder and the up/down context-menu items.
+    /// Desktop's `MoveToTop` is a special case (to=0).
+    PlaylistMove {
+        from: usize,
+        to: usize,
+    },
+    /// Sort the playlist by the given column name. `col` matches the
+    /// desktop `SortColumn` labels: "title" | "author" | "released"
+    /// | "duration" | "type" | "sids".
+    PlaylistSort(String),
+    /// Import M3U/PLS content into the current playlist. Body is the
+    /// file text. `is_pls` is a hint (default false = m3u).
+    PlaylistImport {
+        m3u: String,
+        is_pls: bool,
+    },
+    // ── Subtune navigation ───────────────────────────────────────
+    SubtuneNext,
+    SubtunePrev,
+    // ── HVSC sync ─────────────────────────────────────────────────
+    HvscSyncStart,
+    HvscSyncCancel,
+    // ── Quick settings from the web ──────────────────────────────
+    /// Toggle `config.skip_rsid` — auto-skip RSID tunes.
+    ToggleSkipRsid,
+    /// Toggle `config.force_stereo_2sid` — mirror SID1 to both channels.
+    ToggleForceStereo2sid,
+    /// Set `config.surprise_source` — "hvsc" or "playlist".
+    SetSurpriseSource(String),
+    /// Direct-set repeat mode, bypassing the cycle order.
+    /// Accepted values: "off", "one", "all".
+    SetRepeatMode(String),
+    /// Direct-set shuffle, bypassing the toggle.
+    SetShuffle(bool),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +137,34 @@ pub struct RemoteStatus {
     /// itself. Without this the browser only knew about the playlist
     /// state it saw at page load.
     pub playlist_version: u64,
+    /// Live mirror of `config.skip_rsid` so the web UI can render its
+    /// state on the settings panel.
+    #[serde(default)]
+    pub skip_rsid: bool,
+    /// Live mirror of `config.force_stereo_2sid`.
+    #[serde(default)]
+    pub force_stereo_2sid: bool,
+    /// Live mirror of `config.surprise_source` — "hvsc" or "playlist".
+    #[serde(default)]
+    pub surprise_source: String,
+}
+
+/// A single row served by `GET /api/recent`. Mirrors `RecentEntry` but
+/// without the raw filesystem path leaking into JSON (skip-serialized).
+/// The web UI hits `POST /api/library/hvsc/play` with the same path to
+/// replay a track, so we keep it as a `String` server-side.
+#[derive(Clone, Serialize)]
+pub struct RemoteRecentEntry {
+    pub title: String,
+    pub author: String,
+    pub released: String,
+    /// Human-readable relative timestamp ("2 h ago", "just now").
+    pub played_at_relative: String,
+    #[serde(skip_serializing)]
+    pub path: PathBuf,
+    /// Zero-based index the browser sends back with the play command
+    /// so we don't need the path on the wire.
+    pub index: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -107,6 +177,14 @@ pub struct RemotePlaylistEntry {
     pub is_rsid: bool,
     /// True when this entry's md5 is in the favourites DB.
     pub is_favorite: bool,
+    /// Absolute file path on the server. Included so the M3U export
+    /// endpoint (`GET /api/playlist/export.m3u`) can produce a real
+    /// portable playlist — without paths the exported file couldn't
+    /// be replayed anywhere else. `#[serde(skip_serializing)]` keeps
+    /// paths off the JSON we send to the browser: a curious client
+    /// could otherwise read the server's filesystem layout.
+    #[serde(skip_serializing)]
+    pub path: PathBuf,
 }
 
 #[derive(Default)]
@@ -126,6 +204,9 @@ pub struct SharedRemoteState {
     /// encoder, so a user who never turns streaming on pays zero CPU
     /// for it regardless of what the web UI does.
     pub stream_enabled: bool,
+    /// Snapshot of the recently-played history, ordered newest-first.
+    /// Refreshed in `update_remote_state`; served over `GET /api/recent`.
+    pub recently_played: Vec<RemoteRecentEntry>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -443,6 +524,15 @@ pub fn start_server(
                     }
 
                     // ── API: set subtune ─────────────────────────────────
+                    // Absolute: `/api/subtune/{n}`  Relative: `next` / `prev`
+                    ("POST", "/api/subtune/next") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::SubtuneNext);
+                        respond_ok(request);
+                    }
+                    ("POST", "/api/subtune/prev") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::SubtunePrev);
+                        respond_ok(request);
+                    }
                     ("POST", p) if p.starts_with("/api/subtune/") => {
                         if let Some(n_str) = p.strip_prefix("/api/subtune/") {
                             if let Ok(n) = n_str.parse::<u16>() {
@@ -453,6 +543,99 @@ pub fn start_server(
                             }
                         } else {
                             respond_error(request, 400, "Missing subtune");
+                        }
+                    }
+
+                    // ── API: playlist editing ────────────────────────────
+                    ("POST", "/api/playlist/clear") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::PlaylistClear);
+                        respond_ok(request);
+                    }
+                    ("POST", p) if p.starts_with("/api/playlist/remove/") => {
+                        match p
+                            .strip_prefix("/api/playlist/remove/")
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            Some(idx) => {
+                                let _ = cmd_tx.try_send(RemoteCmd::PlaylistRemove(idx));
+                                respond_ok(request);
+                            }
+                            None => respond_error(request, 400, "Invalid index"),
+                        }
+                    }
+                    ("POST", "/api/playlist/move") => {
+                        // JSON body: {"from": <int>, "to": <int>}
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let parsed: Option<(usize, usize)> = (|| {
+                            let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+                            Some((
+                                v.get("from")?.as_u64()? as usize,
+                                v.get("to")?.as_u64()? as usize,
+                            ))
+                        })();
+                        match parsed {
+                            Some((from, to)) => {
+                                let _ = cmd_tx.try_send(RemoteCmd::PlaylistMove { from, to });
+                                respond_ok(request);
+                            }
+                            None => respond_error(request, 400, "Body must be {from, to}"),
+                        }
+                    }
+                    ("POST", p) if p.starts_with("/api/playlist/sort/") => {
+                        let col = p
+                            .strip_prefix("/api/playlist/sort/")
+                            .unwrap_or("")
+                            .to_string();
+                        if col.is_empty() {
+                            respond_error(request, 400, "Missing column");
+                        } else {
+                            let _ = cmd_tx.try_send(RemoteCmd::PlaylistSort(col));
+                            respond_ok(request);
+                        }
+                    }
+                    ("GET", "/api/playlist/export.m3u") => {
+                        let m3u = {
+                            let s = state.lock().unwrap();
+                            let mut out = String::from("#EXTM3U\n");
+                            for e in &s.playlist {
+                                let dur = e.duration.unwrap_or(0) as i64;
+                                let display = if !e.author.is_empty() {
+                                    format!("{} - {}", e.author, e.title)
+                                } else {
+                                    e.title.clone()
+                                };
+                                out.push_str(&format!("#EXTINF:{dur},{display}\n"));
+                                out.push_str(&format!("{}\n", e.path.display()));
+                            }
+                            out
+                        };
+                        let resp = tiny_http::Response::from_string(m3u)
+                            .with_header(
+                                "Content-Type: audio/x-mpegurl"
+                                    .parse::<tiny_http::Header>()
+                                    .unwrap(),
+                            )
+                            .with_header(
+                                "Content-Disposition: attachment; filename=\"phosphor-playlist.m3u\""
+                                    .parse::<tiny_http::Header>()
+                                    .unwrap(),
+                            );
+                        let _ = request.respond(resp);
+                    }
+                    ("POST", "/api/playlist/import") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        if body.is_empty() {
+                            respond_error(request, 400, "Empty body");
+                        } else {
+                            let is_pls = body.contains("[playlist]")
+                                || body.contains("File1=");
+                            let _ = cmd_tx.try_send(RemoteCmd::PlaylistImport {
+                                m3u: body,
+                                is_pls,
+                            });
+                            respond_ok(request);
                         }
                     }
 
@@ -554,6 +737,166 @@ pub fn start_server(
                     ("POST", "/api/library/playlists/restore") => {
                         let _ = cmd_tx.try_send(RemoteCmd::RestoreDefaultPlaylist);
                         respond_ok(request);
+                    }
+
+                    // ── API: playlist preview (published) ────────────────
+                    // Reads the cached M3U from disk and returns its
+                    // parsed track list so the web UI can render the
+                    // same accordion preview the desktop uses. Cache
+                    // files land under `<config>/published_playlists`
+                    // — we get the path via `state.published_manifest`
+                    // → filename lookup rather than trusting an
+                    // arbitrary user-supplied path.
+                    ("GET", p) if p.starts_with("/api/library/playlists/preview/") => {
+                        let file_raw = p
+                            .strip_prefix("/api/library/playlists/preview/")
+                            .unwrap_or("");
+                        let file = urldecode(file_raw);
+                        // Only allow files listed in the manifest —
+                        // this keeps the endpoint from doubling as a
+                        // "read any file in the cache dir" oracle.
+                        let known = state
+                            .lock()
+                            .unwrap()
+                            .published_manifest
+                            .as_ref()
+                            .map(|m| m.playlists.iter().any(|pl| pl.file == file))
+                            .unwrap_or(false);
+                        if !known {
+                            respond_error(request, 404, "Not in manifest");
+                        } else {
+                            match crate::published_playlists::cache_dir() {
+                                Some(dir) => {
+                                    let path = dir.join(&file);
+                                    match std::fs::read_to_string(&path) {
+                                        Ok(content) => {
+                                            let tracks =
+                                                crate::playlist::parse_m3u_preview(&content);
+                                            let json: Vec<serde_json::Value> = tracks
+                                                .iter()
+                                                .map(|t| {
+                                                    serde_json::json!({
+                                                        "title": t.title,
+                                                        "author": t.author,
+                                                        "duration_secs": t.duration_secs,
+                                                    })
+                                                })
+                                                .collect();
+                                            respond_json(
+                                                request,
+                                                &serde_json::to_string(&json).unwrap_or_default(),
+                                            );
+                                        }
+                                        Err(e) => respond_error(
+                                            request,
+                                            404,
+                                            &format!("Not cached: {e}"),
+                                        ),
+                                    }
+                                }
+                                None => respond_error(request, 500, "No cache dir"),
+                            }
+                        }
+                    }
+
+                    // ── API: quick settings ──────────────────────────────
+                    // Small toggles from the web UI's settings panel.
+                    // All map 1:1 to existing desktop Message handlers
+                    // so the config side-effects (save to disk,
+                    // apply-to-audio-thread, refresh dependent UI) are
+                    // identical.
+                    ("POST", "/api/settings/skip-rsid") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::ToggleSkipRsid);
+                        respond_ok(request);
+                    }
+                    ("POST", "/api/settings/force-stereo") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::ToggleForceStereo2sid);
+                        respond_ok(request);
+                    }
+                    ("POST", p) if p.starts_with("/api/settings/surprise-source/") => {
+                        let src = p
+                            .strip_prefix("/api/settings/surprise-source/")
+                            .unwrap_or("")
+                            .to_string();
+                        if src == "hvsc" || src == "playlist" {
+                            let _ = cmd_tx.try_send(RemoteCmd::SetSurpriseSource(src));
+                            respond_ok(request);
+                        } else {
+                            respond_error(request, 400, "hvsc or playlist");
+                        }
+                    }
+                    // Direct-set variants of shuffle / repeat so
+                    // scripts and quick-toggle buttons don't have to
+                    // guess the current state before flipping.
+                    ("POST", p) if p.starts_with("/api/repeat/") => {
+                        let m = p
+                            .strip_prefix("/api/repeat/")
+                            .unwrap_or("")
+                            .to_string();
+                        if matches!(m.as_str(), "off" | "one" | "all") {
+                            let _ = cmd_tx.try_send(RemoteCmd::SetRepeatMode(m));
+                            respond_ok(request);
+                        } else {
+                            respond_error(request, 400, "off | one | all");
+                        }
+                    }
+                    ("POST", p) if p.starts_with("/api/shuffle/") => {
+                        let v = p.strip_prefix("/api/shuffle/").unwrap_or("");
+                        match v {
+                            "on" | "true" | "1" => {
+                                let _ = cmd_tx.try_send(RemoteCmd::SetShuffle(true));
+                                respond_ok(request);
+                            }
+                            "off" | "false" | "0" => {
+                                let _ = cmd_tx.try_send(RemoteCmd::SetShuffle(false));
+                                respond_ok(request);
+                            }
+                            _ => respond_error(request, 400, "on | off"),
+                        }
+                    }
+
+                    // ── API: HVSC sync trigger ────────────────────────────
+                    // Kicks the same rsync the desktop's Settings →
+                    // Library → Sync button uses. Progress polls into
+                    // `status.hvsc_sync_active` / `hvsc_sync_progress`.
+                    ("POST", "/api/library/hvsc/sync/start") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::HvscSyncStart);
+                        respond_ok(request);
+                    }
+                    ("POST", "/api/library/hvsc/sync/cancel") => {
+                        let _ = cmd_tx.try_send(RemoteCmd::HvscSyncCancel);
+                        respond_ok(request);
+                    }
+
+                    // ── API: recently played ─────────────────────────────
+                    // Returns the last-N snapshot from the Recent DB,
+                    // newest first. Click on the web UI hits
+                    // `POST /api/recent/play/{idx}` which the server
+                    // resolves to a path and dispatches HvscPlay.
+                    ("GET", "/api/recent") => {
+                        let json = {
+                            let s = state.lock().unwrap();
+                            serde_json::to_string(&s.recently_played).unwrap_or_default()
+                        };
+                        respond_json(request, &json);
+                    }
+                    ("POST", p) if p.starts_with("/api/recent/play/") => {
+                        let idx = p
+                            .strip_prefix("/api/recent/play/")
+                            .and_then(|s| s.parse::<usize>().ok());
+                        let path = idx.and_then(|i| {
+                            state.lock().unwrap()
+                                .recently_played
+                                .get(i)
+                                .map(|e| e.path.clone())
+                        });
+                        match path {
+                            Some(p) => {
+                                let _ = cmd_tx.try_send(RemoteCmd::HvscPlay(p));
+                                respond_ok(request);
+                            }
+                            None => respond_error(request, 404, "Not in recent list"),
+                        }
                     }
 
                     // ── API: HVSC browse ─────────────────────────────────
@@ -928,6 +1271,158 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     color:#8090a0; border-radius:4px; cursor:pointer; font-size:11px; }
   .lib-cat button.on { background:#1c2e22; border-color:#3a7; color:#5cb870; }
   .lib-empty { padding:20px; text-align:center; color:#607080; font-size:12px; }
+  /* Quick-settings drawer */
+  .settings-panel { border-top:1px solid #2a2e36; border-bottom:1px solid #2a2e36;
+    background:#141821; padding:10px 14px; margin-top:8px;
+    display:flex; flex-direction:column; gap:8px; }
+  .settings-row { display:flex; align-items:center; justify-content:space-between;
+    gap:12px; }
+  .settings-lbl { color:#c8ccd0; font-size:13px; }
+  .settings-panel .tb-btn.on { background:#1c2e22; border-color:#3a7; color:#5cb870; }
+
+  /* Published-playlist preview accordion */
+  .pub-preview { background:#0d1218; border-bottom:1px solid #1a1e26;
+    padding:8px 10px; font-size:12px; }
+  .pub-preview-actions { display:flex; gap:6px; margin-bottom:6px; }
+  .pub-preview-body { max-height:220px; overflow-y:auto; }
+  .pub-preview-track { display:flex; gap:8px; padding:3px 0; color:#c8ccd0;
+    align-items:center; }
+  .pub-preview-idx { width:24px; text-align:right; color:#607080; flex-shrink:0; }
+  .pub-preview-dur { margin-left:auto; color:#607080; font-family:ui-monospace,monospace;
+    font-size:11px; flex-shrink:0; }
+
+  /* ── Playlist toolbar ─────────────────────────────────────────── */
+  .pl-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:6px;
+    padding:6px 16px 4px; }
+  .tb-btn { background:#1a1e26; border:1px solid #2a2e36; color:#c8ccd0;
+    padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;
+    text-decoration:none; display:inline-block; user-select:none; }
+  .tb-btn:hover { background:#22262f; border-color:#3a4048; color:#ffffff; }
+  .tb-btn.active { background:#2a1a20; border-color:#c05070; color:#ff8090; }
+  .tb-btn.danger { color:#ff8080; }
+  .tb-btn.danger:hover { background:#2a1a1a; border-color:#c05050; }
+  .tb-select { background:#1a1e26; border:1px solid #2a2e36; color:#c8ccd0;
+    padding:4px 8px; border-radius:4px; font-size:12px; cursor:pointer; }
+
+  /* ── Row hover-action group + drag handle ─────────────────────── */
+  .track { position:relative; }
+  .track.dragging { opacity:0.4; }
+  .track.drag-over { border-top:2px solid #5cb870; }
+  .track .actions { display:flex; align-items:center; gap:4px; opacity:0;
+    transition:opacity 0.12s; flex-shrink:0; }
+  .track:hover .actions { opacity:1; }
+  .track .actions button { background:none; border:none; color:#8090a0;
+    font-size:16px; padding:2px 6px; cursor:pointer; border-radius:3px; }
+  .track .actions button:hover { background:#2a2e36; color:#ffffff; }
+  /* On touch devices you can't hover — show actions dimmed by default. */
+  @media (hover: none) {
+    .track .actions { opacity:0.5; }
+  }
+
+  /* ── Right-click / long-press context menu ─────────────────────── */
+  #ctx-menu { position:fixed; z-index:1000; background:#1a1e26;
+    border:1px solid #2a2e36; border-radius:6px; padding:4px 0;
+    min-width:180px; box-shadow:0 6px 18px rgba(0,0,0,0.45); display:none; }
+  #ctx-menu .ctx-item { padding:8px 14px; font-size:13px; color:#c8ccd0;
+    cursor:pointer; user-select:none; display:flex; align-items:center; gap:8px; }
+  #ctx-menu .ctx-item:hover { background:#22262f; color:#ffffff; }
+  #ctx-menu .ctx-item.danger { color:#ff8080; }
+  #ctx-menu .ctx-item.danger:hover { background:#2a1a1a; }
+  #ctx-menu .ctx-sep { height:1px; background:#2a2e36; margin:4px 0; }
+
+  /* ── Toast stack (bottom-centre notifications) ─────────────────── */
+  #toast-stack { position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+    display:flex; flex-direction:column-reverse; gap:8px; z-index:900;
+    pointer-events:none; }
+  .toast { background:#1a2620; border:1px solid #3a5540; color:#c8e0d0;
+    padding:8px 14px; border-radius:6px; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,0.4);
+    animation:toast-in 0.18s ease-out; max-width:70vw; pointer-events:auto; }
+  .toast.danger { background:#261a1a; border-color:#553a3a; color:#e0c8c8; }
+  @keyframes toast-in {
+    from { transform:translateY(8px); opacity:0; }
+    to { transform:translateY(0); opacity:1; }
+  }
+
+  /* ── Subtune stepper ─────────────────────────────────────────── */
+  .subtune-stepper { display:inline-flex; align-items:center; gap:4px;
+    padding:2px 6px; background:#1a1e26; border:1px solid #2a2e36;
+    border-radius:4px; font-size:12px; color:#c8ccd0; user-select:none;
+    vertical-align:middle; }
+  .subtune-stepper button { background:none; border:none; color:#8090a0;
+    padding:2px 6px; cursor:pointer; font-size:11px; }
+  .subtune-stepper button:hover { color:#5cb870; }
+  #subtune-badge { font-family:ui-monospace,monospace; color:#e0e4e8;
+    min-width:34px; text-align:center; }
+
+  /* ── Track-row animations ────────────────────────────────────
+     Uses the built-in View Transitions API (Chrome/Edge) — see the
+     wrapper around renderList in JS. Browsers without support fall
+     back to the plain snap-render. Respects reduced-motion. */
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 220ms;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(root),
+    ::view-transition-new(root) { animation: none; }
+  }
+
+  /* ── Skeleton loading rows ───────────────────────────────────
+     Six ghost rows shown while /api/playlist is fetching. The
+     shimmer keyframes give the "still loading" cue without spinner
+     jitter — modern-player convention. */
+  .skeleton-row { display:flex; padding:8px 16px; border-bottom:1px solid #1a1e26;
+    align-items:center; gap:10px; }
+  .skeleton-bar { height:12px; border-radius:3px;
+    background:linear-gradient(90deg, #1a1e26 0%, #22262f 40%, #1a1e26 80%);
+    background-size:200% 100%; animation:shimmer 1.3s linear infinite; }
+  .skeleton-idx { width:30px; height:11px; }
+  .skeleton-title { flex:1; height:12px; }
+  .skeleton-dur { width:40px; height:11px; }
+  @keyframes shimmer {
+    from { background-position:200% 0; }
+    to   { background-position:-200% 0; }
+  }
+
+  /* ── Friendly empty state ────────────────────────────────────
+     Shown when the playlist has zero tracks. Presents the three
+     ways to fill it (Load Liked / Library / Import) so the user
+     isn't staring at a blank list. */
+  .pl-empty { padding:30px 20px; text-align:center; color:#8090a0; font-size:14px; }
+  .pl-empty .em-hint { margin-bottom:14px; color:#c8ccd0; font-size:15px; }
+  .pl-empty .em-actions { display:flex; flex-wrap:wrap; justify-content:center; gap:8px; }
+  .pl-empty .em-actions button { background:#1a1e26; border:1px solid #2a2e36;
+    color:#c8ccd0; padding:8px 14px; border-radius:6px; cursor:pointer; font-size:13px; }
+  .pl-empty .em-actions button:hover { background:#22262f; border-color:#3a7; color:#5cb870; }
+
+  /* ── Mobile "Now Playing" bar ─────────────────────────────────
+     On narrow viewports the header/now-playing region scrolls off
+     when you dig into the playlist. This bar sticks to the bottom
+     of the viewport with the essentials — enough to control
+     playback without scrolling back up. Desktop keeps the roomier
+     top-of-page player. */
+  #np-mobile { display:none; }
+  @media (max-width: 640px) {
+    /* Push the playlist above the bar so the bottom rows aren't
+       hidden under it. Height matches the bar (~64 px + safe-area). */
+    body { padding-bottom: calc(70px + env(safe-area-inset-bottom)); }
+    #np-mobile { display:flex; position:fixed; left:0; right:0; bottom:0;
+      z-index:800; background:#0d1218; border-top:1px solid #1a2028;
+      padding:8px 12px calc(8px + env(safe-area-inset-bottom));
+      align-items:center; gap:10px;
+      box-shadow:0 -6px 18px rgba(0,0,0,0.4); }
+    #np-mobile .npm-info { flex:1; min-width:0; }
+    #np-mobile .npm-title { font-size:13px; color:#e0e4e8;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #np-mobile .npm-author { font-size:11px; color:#8090a0;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #np-mobile button { background:none; border:none; color:#c8ccd0;
+      font-size:20px; padding:4px 8px; cursor:pointer; }
+    #np-mobile .npm-prog { position:absolute; top:0; left:0; height:2px;
+      background:#5cb870; transition:width 0.4s linear; }
+    /* Move the toast stack up so it doesn't hide behind the bar. */
+    #toast-stack { bottom: calc(80px + env(safe-area-inset-bottom)); }
+  }
 </style>
 </head>
 <body>
@@ -955,6 +1450,11 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button onclick="cmd('stop')" title="Stop">&#9209;</button>
   <button onclick="cmd('pause')" title="Play/Pause" id="pp-btn">&#9208;</button>
   <button onclick="cmd('next')" title="Next">&#9197;</button>
+  <span id="subtune-stepper" class="subtune-stepper" style="display:none;">
+    <button onclick="cmd('subtune/prev')" title="Previous subtune">&#9664;</button>
+    <span id="subtune-badge">1/1</span>
+    <button onclick="cmd('subtune/next')" title="Next subtune">&#9654;</button>
+  </span>
   <button onclick="cmd('surprise')" title="Surprise me — random HVSC tune">&#127922;</button>
   <button onclick="loadLiked()" title="Load my liked tracks as a fresh playlist">&#10084;&#65039;</button>
   <button onclick="toggleListen()" id="listen-btn" title="Listen in browser">&#128266;</button>
@@ -992,16 +1492,60 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     style="background:none;border:1px solid #2a2e36;color:#8090a0;padding:4px 8px;border-radius:4px;cursor:pointer;">&#8634; Off</button>
 </div>
 
-<button class="lib-toggle" onclick="toggleLibrary()" id="lib-toggle-btn">&#128218; Library</button>
+<div style="display:flex;gap:6px;justify-content:center;margin-top:8px;">
+  <button class="lib-toggle" onclick="toggleLibrary()" id="lib-toggle-btn">&#128218; Library</button>
+  <button class="lib-toggle" onclick="toggleSettings()" id="settings-toggle-btn">&#9881; Settings</button>
+</div>
+
+<!-- Quick settings drawer. Mirrors the desktop Settings → General
+     tab's toggles so a phone user can flip Skip RSID / Force stereo /
+     Surprise source without walking to the desk. -->
+<div class="settings-panel" id="settings-panel" style="display:none;">
+  <div class="settings-row">
+    <label class="settings-lbl">Skip RSID tunes</label>
+    <button class="tb-btn" id="set-skip-rsid" onclick="postSettings('skip-rsid')">—</button>
+  </div>
+  <div class="settings-row">
+    <label class="settings-lbl">Force stereo (2SID mirror)</label>
+    <button class="tb-btn" id="set-force-stereo" onclick="postSettings('force-stereo')">—</button>
+  </div>
+  <div class="settings-row">
+    <label class="settings-lbl">🎲 Surprise source</label>
+    <div style="display:flex;gap:4px;">
+      <button class="tb-btn" id="set-surp-hvsc" onclick="setSurpriseSource('hvsc')">HVSC</button>
+      <button class="tb-btn" id="set-surp-pl" onclick="setSurpriseSource('playlist')">Playlist</button>
+    </div>
+  </div>
+  <div class="settings-row">
+    <label class="settings-lbl">🔁 Repeat</label>
+    <div style="display:flex;gap:4px;">
+      <button class="tb-btn" data-rep="off" onclick="setRepeat('off')">Off</button>
+      <button class="tb-btn" data-rep="one" onclick="setRepeat('one')">One</button>
+      <button class="tb-btn" data-rep="all" onclick="setRepeat('all')">All</button>
+    </div>
+  </div>
+  <div class="settings-row">
+    <label class="settings-lbl">🔀 Shuffle</label>
+    <div style="display:flex;gap:4px;">
+      <button class="tb-btn" data-shuf="on" onclick="setShuffle(true)">On</button>
+      <button class="tb-btn" data-shuf="off" onclick="setShuffle(false)">Off</button>
+    </div>
+  </div>
+</div>
 
 <div class="lib" id="lib" style="display:none;">
   <div class="lib-tabs">
     <div class="lib-tab active" id="lt-pl" onclick="showLibTab('pl')">&#128203; Playlists</div>
     <div class="lib-tab" id="lt-hv" onclick="showLibTab('hv')">&#128194; HVSC</div>
+    <div class="lib-tab" id="lt-rc" onclick="showLibTab('rc')">&#128276; Recent</div>
   </div>
 
   <div id="lib-pl">
     <div class="lib-list" id="lib-pl-list"></div>
+  </div>
+
+  <div id="lib-rc" style="display:none;">
+    <div class="lib-list" id="lib-rc-list"></div>
   </div>
 
   <div id="lib-hv" style="display:none;">
@@ -1011,13 +1555,71 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
       <button data-cat="games" onclick="setHvscCat('games')">Games</button>
     </div>
     <div id="lib-hv-crumb" class="lib-back" onclick="hvBack()" style="display:none;">&#8592; Back to authors</div>
+    <div id="hv-sync-row" style="display:flex;gap:6px;align-items:center;padding:6px 0;font-size:12px;color:#8090a0;">
+      <button class="tb-btn" id="hv-sync-btn" onclick="toggleHvscSync()">&#8595; Sync HVSC</button>
+      <span id="hv-sync-status"></span>
+    </div>
     <div class="lib-list" id="lib-hv-list"></div>
   </div>
 </div>
 
 <div class="search"><input id="q" placeholder="Search playlist..." oninput="onSearch()"></div>
+
+<!-- Playlist toolbar. Sits between the search box and the playlist so
+     every actionable operation on the current playlist has one home.
+     Modern-player convention: manage/edit affordances above the list;
+     row-level actions inline on hover / long-press. -->
+<div class="pl-toolbar" id="pl-toolbar">
+  <button class="tb-btn" onclick="pickImportM3U()" title="Import an M3U file into the current playlist">
+    &#8593; Import M3U
+  </button>
+  <a class="tb-btn" href="/api/playlist/export.m3u" download="playlist.m3u" title="Download the current playlist as an M3U file">
+    &#8595; Save
+  </a>
+  <button class="tb-btn" onclick="clearPlaylist()" title="Remove every track from the playlist">
+    &#128465; Clear
+  </button>
+  <button class="tb-btn" id="fav-only-chip" onclick="toggleFavOnly()" title="Show only hearted tracks">
+    &#9825; Favourites only
+  </button>
+  <select class="tb-select" id="sort-select" onchange="sortPlaylist(this.value)" title="Reorder the playlist by a column">
+    <option value="">Sort by…</option>
+    <option value="title">Title</option>
+    <option value="author">Author</option>
+    <option value="released">Released</option>
+    <option value="duration">Duration</option>
+    <option value="type">Type</option>
+    <option value="sids">SID count</option>
+    <option value="index">Original order</option>
+  </select>
+  <input id="import-m3u-input" type="file" accept=".m3u,.m3u8,.pls" style="display:none;" onchange="onImportM3U(event)">
+</div>
+
 <div id="pl-info" style="padding:2px 16px;font-size:11px;color:#506070;"></div>
 <div class="playlist" id="pl"></div>
+<div id="np-mobile">
+  <div class="npm-prog" id="npm-prog"></div>
+  <div class="npm-info">
+    <div class="npm-title" id="npm-title">—</div>
+    <div class="npm-author" id="npm-author"></div>
+  </div>
+  <button onclick="cmd('prev')" title="Previous">&#9198;</button>
+  <button onclick="cmd('pause')" title="Play/Pause" id="npm-pp">&#9208;</button>
+  <button onclick="cmd('next')" title="Next">&#9197;</button>
+</div>
+
+<div id="toast-stack"></div>
+<div id="ctx-menu" onclick="event.stopPropagation()">
+  <div class="ctx-item" onclick="ctxAction('play')"><span>&#9654;</span> Play now</div>
+  <div class="ctx-item" onclick="ctxAction('fav')"><span>&#9829;</span> <span id="ctx-fav-label">Toggle favourite</span></div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" onclick="ctxAction('top')"><span>&#8593;</span> Move to top</div>
+  <div class="ctx-item" onclick="ctxAction('up')"><span>&#8593;</span> Move up</div>
+  <div class="ctx-item" onclick="ctxAction('down')"><span>&#8595;</span> Move down</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" onclick="ctxAction('copy')"><span>&#128203;</span> Copy title</div>
+  <div class="ctx-item danger" onclick="ctxAction('remove')"><span>&#128465;</span> Remove from playlist</div>
+</div>
 
 <script>
 let entries=[], status={}, curIdx=null, total=0, loading=false, searchTimer=null;
@@ -1118,11 +1720,48 @@ function toggleListen(){
 
 function setupMediaSession(){
   if(!('mediaSession' in navigator)) return;
-  navigator.mediaSession.setActionHandler('play',   ()=>cmd('play'));
+  navigator.mediaSession.setActionHandler('play',   ()=>cmd('pause'));
   navigator.mediaSession.setActionHandler('pause',  ()=>cmd('pause'));
   navigator.mediaSession.setActionHandler('previoustrack', ()=>cmd('prev'));
   navigator.mediaSession.setActionHandler('nexttrack',     ()=>cmd('next'));
   navigator.mediaSession.setActionHandler('stop', ()=>cmd('stop'));
+}
+
+// Push current-track metadata + timeline into the OS media session
+// on every poll — that's what makes lock-screen media widgets show
+// title/author + progress. Only actually pokes the API when
+// something changed, to avoid churning the OS side every second.
+let _mediaLastKey='';
+function updateMediaSession(){
+  if(!('mediaSession' in navigator)) return;
+  const title=(status.title||'—');
+  const author=(status.author||'');
+  const key=title+'||'+author+'||'+status.state;
+  if(key!==_mediaLastKey){
+    _mediaLastKey=key;
+    try{
+      navigator.mediaSession.metadata=new MediaMetadata({
+        title: title,
+        artist: author,
+        album: (status.released||''),
+      });
+    }catch(_){}
+    navigator.mediaSession.playbackState=
+      status.state==='playing' ? 'playing'
+      : status.state==='paused' ? 'paused'
+      : 'none';
+  }
+  // Position state — allow the OS to render its progress bar. Wrap
+  // in try/catch because Firefox throws on invalid combinations.
+  if(navigator.mediaSession.setPositionState && status.duration_secs){
+    try{
+      navigator.mediaSession.setPositionState({
+        duration: status.duration_secs,
+        position: Math.min(status.elapsed_secs||0, status.duration_secs),
+        playbackRate: 1.0,
+      });
+    }catch(_){}
+  }
 }
 
 async function pollStreamStatus(){
@@ -1162,7 +1801,7 @@ async function toggleFavCurrent(){
 }
 
 async function toggleFav(idx,ev){
-  ev.stopPropagation();
+  if(ev) ev.stopPropagation();
   await fetch('/api/favorite/'+idx,{method:'POST'});
   setTimeout(()=>loadPlaylist(false),150);
 }
@@ -1201,10 +1840,124 @@ function toggleLibrary(){
 function showLibTab(which){
   document.getElementById('lt-pl').classList.toggle('active',which==='pl');
   document.getElementById('lt-hv').classList.toggle('active',which==='hv');
+  document.getElementById('lt-rc').classList.toggle('active',which==='rc');
   document.getElementById('lib-pl').style.display=which==='pl'?'block':'none';
   document.getElementById('lib-hv').style.display=which==='hv'?'block':'none';
+  document.getElementById('lib-rc').style.display=which==='rc'?'block':'none';
   if(which==='hv'&&!hvscAuthor){loadHvscAuthors();}
+  if(which==='rc'){loadRecentlyPlayed();}
 }
+
+// ── Settings drawer ─────────────────────────────────────────────
+function toggleSettings(){
+  const p=document.getElementById('settings-panel');
+  if(!p) return;
+  p.style.display=p.style.display==='flex'?'none':'flex';
+}
+async function postSettings(kind){
+  const url=kind==='skip-rsid'?'/api/settings/skip-rsid'
+    :kind==='force-stereo'?'/api/settings/force-stereo':null;
+  if(!url) return;
+  const r=await fetch(url,{method:'POST'});
+  if(r.ok){ setTimeout(poll,120); }
+}
+async function setSurpriseSource(src){
+  const r=await fetch('/api/settings/surprise-source/'+src,{method:'POST'});
+  if(r.ok){ toast('Surprise source: '+src); setTimeout(poll,120); }
+}
+async function setRepeat(m){
+  const r=await fetch('/api/repeat/'+m,{method:'POST'});
+  if(r.ok){ toast('Repeat: '+m); setTimeout(poll,120); }
+}
+async function setShuffle(on){
+  const r=await fetch('/api/shuffle/'+(on?'on':'off'),{method:'POST'});
+  if(r.ok){ toast('Shuffle: '+(on?'on':'off')); setTimeout(poll,120); }
+}
+
+// Reflect current settings state on the drawer. Called from poll().
+function updateSettingsDrawer(){
+  const s=status||{};
+  const skip=document.getElementById('set-skip-rsid');
+  if(skip){
+    skip.textContent=s.skip_rsid?'On':'Off';
+    skip.classList.toggle('on',!!s.skip_rsid);
+  }
+  const fs=document.getElementById('set-force-stereo');
+  if(fs){
+    fs.textContent=s.force_stereo_2sid?'On':'Off';
+    fs.classList.toggle('on',!!s.force_stereo_2sid);
+  }
+  const surp=s.surprise_source||'hvsc';
+  const surpH=document.getElementById('set-surp-hvsc');
+  const surpP=document.getElementById('set-surp-pl');
+  if(surpH) surpH.classList.toggle('on',surp==='hvsc');
+  if(surpP) surpP.classList.toggle('on',surp==='playlist');
+  document.querySelectorAll('[data-rep]').forEach(b=>{
+    b.classList.toggle('on', b.getAttribute('data-rep')===(s.repeat||'off'));
+  });
+  document.querySelectorAll('[data-shuf]').forEach(b=>{
+    const want=(b.getAttribute('data-shuf')==='on');
+    b.classList.toggle('on', !!s.shuffle===want);
+  });
+}
+
+async function toggleHvscSync(){
+  const active=!!(status && status.hvsc_sync_active);
+  const url=active?'/api/library/hvsc/sync/cancel':'/api/library/hvsc/sync/start';
+  const r=await fetch(url,{method:'POST'});
+  if(r.ok){ toast(active?'Sync cancelled':'HVSC sync started'); setTimeout(poll,150); }
+}
+
+// Reflect the current sync state on the HVSC tab. Called from poll().
+function updateHvscSync(){
+  const btn=document.getElementById('hv-sync-btn');
+  const stat=document.getElementById('hv-sync-status');
+  if(!btn||!stat) return;
+  const active=!!(status && status.hvsc_sync_active);
+  btn.innerHTML=active?'✕ Cancel sync':'↓ Sync HVSC';
+  btn.classList.toggle('danger',active);
+  const p=status && status.hvsc_sync_progress;
+  if(active && p && p.length===2 && p[1]>0){
+    const pct=Math.round(100*p[0]/p[1]);
+    stat.textContent='syncing… '+p[0]+'/'+p[1]+' ('+pct+'%)';
+  } else if(active){
+    stat.textContent='syncing…';
+  } else {
+    stat.textContent='';
+  }
+}
+
+async function loadRecentlyPlayed(){
+  const el=document.getElementById('lib-rc-list');
+  el.innerHTML='<div class="lib-empty">Loading…</div>';
+  try{
+    const r=await fetch('/api/recent');
+    const list=await r.json();
+    if(!list||list.length===0){
+      el.innerHTML='<div class="lib-empty">Nothing played yet.</div>';
+      return;
+    }
+    el.innerHTML=list.map(e=>
+      '<div class="lib-row" onclick="playRecent('+e.index+')">'+
+      '<div class="lib-name">'+esc(e.title||'')+
+        (e.author?' <span style="color:#607080;">— '+esc(e.author)+'</span>':'')+
+      '</div>'+
+      '<div class="lib-meta">'+esc(e.played_at_relative||'')+'</div>'+
+      '</div>').join('');
+  }catch(e){
+    el.innerHTML='<div class="lib-empty">Failed to load history.</div>';
+  }
+}
+async function playRecent(idx){
+  const r=await fetch('/api/recent/play/'+idx,{method:'POST'});
+  if(r.ok){ toast('Playing from history'); setTimeout(poll,200); }
+  else { toast('Track not found','danger'); }
+}
+
+// Which published playlist is currently expanded to preview, and a
+// cache of its parsed track list so re-opening is instant.
+let expandedPub=null;
+const pubPreviewCache={};
 
 async function loadLibPlaylists(){
   const el=document.getElementById('lib-pl-list');
@@ -1216,17 +1969,84 @@ async function loadLibPlaylists(){
       el.innerHTML='<div class="lib-empty">No playlists synced yet.<br>Open Phosphor → Library → Playlists → Sync.</div>';
       return;
     }
+    // Each row shows the playlist header. Clicking the row expands
+    // an inline preview; the ▶ Load button loads the whole thing.
     el.innerHTML=list.map(p=>{
       const name=esc(p.name||p.file);
       const desc=p.description?'<div style="font-size:11px;color:#607080;margin-top:2px;">'+esc(p.description)+'</div>':'';
       const tracks=p.tracks?p.tracks+' tracks':'';
-      return '<div class="lib-row" onclick="loadPub(\''+esc(p.file)+'\')">'+
-        '<div><div class="lib-name">'+name+'</div>'+desc+'</div>'+
-        '<span class="lib-meta">'+tracks+'</span></div>';
+      const file=esc(p.file);
+      return '<div class="pub-item" data-file="'+file+'">'+
+        '<div class="lib-row" onclick="togglePub(\''+file+'\')">'+
+          '<div><div class="lib-name">'+name+'</div>'+desc+'</div>'+
+          '<span class="lib-meta">'+tracks+'</span>'+
+        '</div>'+
+        '<div class="pub-preview" id="pub-prev-'+file+'" style="display:none;">'+
+          '<div class="pub-preview-actions">'+
+            '<button class="tb-btn" onclick="loadPub(\''+file+'\')">▶ Load this playlist</button>'+
+          '</div>'+
+          '<div class="pub-preview-body" id="pub-prev-body-'+file+'">'+
+            '<div class="lib-empty">Loading…</div>'+
+          '</div>'+
+        '</div>'+
+      '</div>';
     }).join('');
   }catch(e){
     el.innerHTML='<div class="lib-empty">Failed to load: '+esc(e.message||'error')+'</div>';
   }
+}
+
+async function togglePub(file){
+  // Collapse the currently expanded row first (only one open at a
+  // time — matches the desktop's accordion behaviour).
+  if(expandedPub && expandedPub!==file){
+    const prev=document.getElementById('pub-prev-'+expandedPub);
+    if(prev) prev.style.display='none';
+  }
+  const el=document.getElementById('pub-prev-'+file);
+  if(!el) return;
+  if(el.style.display==='block'){
+    el.style.display='none';
+    expandedPub=null;
+    return;
+  }
+  el.style.display='block';
+  expandedPub=file;
+  // Cached? Skip the fetch.
+  if(pubPreviewCache[file]){
+    renderPubPreview(file, pubPreviewCache[file]);
+    return;
+  }
+  try{
+    const r=await fetch('/api/library/playlists/preview/'+encodeURIComponent(file));
+    if(!r.ok){
+      document.getElementById('pub-prev-body-'+file).innerHTML=
+        '<div class="lib-empty">Preview not available (not yet downloaded — Load it once, then preview).</div>';
+      return;
+    }
+    const tracks=await r.json();
+    pubPreviewCache[file]=tracks;
+    renderPubPreview(file, tracks);
+  }catch(e){
+    document.getElementById('pub-prev-body-'+file).innerHTML=
+      '<div class="lib-empty">Preview failed.</div>';
+  }
+}
+
+function renderPubPreview(file, tracks){
+  const body=document.getElementById('pub-prev-body-'+file);
+  if(!body) return;
+  if(!tracks || tracks.length===0){
+    body.innerHTML='<div class="lib-empty">This playlist is empty.</div>';
+    return;
+  }
+  body.innerHTML=tracks.map((t,i)=>{
+    const dur=t.duration_secs?fmtTime(t.duration_secs):'';
+    const author=t.author?' <span style="color:#607080;">— '+esc(t.author)+'</span>':'';
+    return '<div class="pub-preview-track"><span class="pub-preview-idx">'+
+      (i+1)+'.</span> <span>'+esc(t.title||'')+author+'</span>'+
+      '<span class="pub-preview-dur">'+dur+'</span></div>';
+  }).join('');
 }
 
 async function loadPub(file){
@@ -1343,6 +2163,34 @@ async function poll(){
     document.getElementById('prog').style.width=pct+'%';
     document.getElementById('pp-btn').innerHTML=
       status.state==='playing'?'\u23F8':'\u25B6';
+    // Subtune stepper: only show when the current tune has >1 song.
+    const stepper=document.getElementById('subtune-stepper');
+    if(stepper){
+      const songs=status.songs||0;
+      const cur=status.current_song||0;
+      if(songs>1){
+        stepper.style.display='inline-flex';
+        document.getElementById('subtune-badge').textContent=cur+'/'+songs;
+      } else {
+        stepper.style.display='none';
+      }
+    }
+    // Mobile Now Playing bar mirrors the top-of-page player.
+    const npmTitle=document.getElementById('npm-title');
+    if(npmTitle){
+      npmTitle.textContent=status.title||'\u2014';
+      document.getElementById('npm-author').textContent=status.author||'';
+      document.getElementById('npm-pp').innerHTML=
+        status.state==='playing'?'\u23F8':'\u25B6';
+      document.getElementById('npm-prog').style.width=
+        ((status.duration_secs&&status.duration_secs>0)?
+          Math.min(100,(status.elapsed_secs/status.duration_secs)*100):0)+'%';
+    }
+    // OS media session \u2014 title, author, position. Lock-screen +
+    // notification-shade controls "just work" once these are set.
+    updateMediaSession();
+    updateHvscSync();
+    updateSettingsDrawer();
     if(status.current_index!==curIdx){curIdx=status.current_index;highlightCurrent();}
     // Auto-refresh playlist when the desktop side changes it
     // (Surprise Me, drag-add, folder import, favourite toggle).
@@ -1351,7 +2199,13 @@ async function poll(){
         lastPlaylistVersion=status.playlist_version;
       } else if(status.playlist_version!==lastPlaylistVersion){
         lastPlaylistVersion=status.playlist_version;
-        loadPlaylist(false);
+        // Server changed the playlist — animate the incoming diff.
+        // The View Transitions wrapper morphs old→new rows.
+        if(document.startViewTransition){
+          document.startViewTransition(()=>loadPlaylist(false));
+        } else {
+          loadPlaylist(false);
+        }
       }
     }
     // Heart button (♥/♡) reflects current-track favourite state
@@ -1414,6 +2268,20 @@ async function loadPlaylist(append){
   loading=true;
   const q=encodeURIComponent(document.getElementById('q').value);
   const offset=append?entries.length:0;
+  // First-load skeleton so the browser has something to render
+  // while the JSON is in flight. Only on fresh loads (not append)
+  // and only when we don't already have entries to show.
+  if(!append && entries.length===0){
+    const el=document.getElementById('pl');
+    if(el){
+      el.innerHTML=Array.from({length:6}).map(()=>
+        '<div class="skeleton-row">'+
+        '<div class="skeleton-bar skeleton-idx"></div>'+
+        '<div class="skeleton-bar skeleton-title"></div>'+
+        '<div class="skeleton-bar skeleton-dur"></div>'+
+        '</div>').join('');
+    }
+  }
   try{
     const r=await fetch('/api/playlist?q='+q+'&offset='+offset+'&limit=100');
     const data=await r.json();
@@ -1430,31 +2298,70 @@ function onSearch(){
   searchTimer=setTimeout(()=>loadPlaylist(false),200);
 }
 
+// State for the favourites-only chip. Purely client-side — the
+// server already sends `is_favorite` per entry so no round-trip.
+let favOnly=false;
+
 function renderList(totalAll){
   const el=document.getElementById('pl');
   const info=document.getElementById('pl-info');
   const q=document.getElementById('q').value;
-  if(q){info.textContent=total+' matches (showing '+entries.length+') of '+totalAll+' total';}
+  const visible = favOnly ? entries.filter(t=>t.is_favorite) : entries;
+  if(q){info.textContent=total+' matches (showing '+visible.length+') of '+totalAll+' total';}
+  else if(favOnly){info.textContent='♥ '+visible.length+' liked / '+entries.length+' loaded';}
   else{info.textContent=entries.length+' of '+total+' tracks';}
-  el.innerHTML=entries.map(t=>{
+  // Friendly empty state: don't just show a blank list, give the
+  // user the three ways to fill it (matches the modern-player
+  // convention for "no results" pages).
+  if(visible.length===0 && !loading){
+    if(favOnly){
+      el.innerHTML='<div class="pl-empty">'+
+        '<div class="em-hint">No favourites in the current playlist.</div>'+
+        '<div class="em-actions">'+
+        '<button onclick="toggleFavOnly()">Show all tracks</button>'+
+        '<button onclick="loadLiked()">❤️ Load Liked as playlist</button>'+
+        '</div></div>';
+    } else if(q){
+      el.innerHTML='<div class="pl-empty">'+
+        '<div class="em-hint">No tracks match "'+esc(q)+'".</div>'+
+        '<div class="em-actions">'+
+        '<button onclick="clearSearch()">Clear search</button>'+
+        '</div></div>';
+    } else {
+      el.innerHTML='<div class="pl-empty">'+
+        '<div class="em-hint">Your playlist is empty.</div>'+
+        '<div class="em-actions">'+
+        '<button onclick="loadLiked()">❤️ Load Liked</button>'+
+        '<button onclick="toggleLibrary()">📚 Open Library</button>'+
+        '<button onclick="pickImportM3U()">↑ Import M3U</button>'+
+        '</div></div>';
+    }
+    return;
+  }
+  el.innerHTML=visible.map(t=>{
     const active=t.index===curIdx?'active':'';
     const dur=t.duration?fmtTime(t.duration):'';
     const favClass=t.is_favorite?'heart on':'heart';
     const favGlyph=t.is_favorite?'♥':'♡';
-    return '<div class="track '+active+'" onclick="cmd(\'play/'+t.index+'\')">'+
+    return '<div class="track '+active+'" data-idx="'+t.index+'" draggable="true">'+
       '<span class="idx">'+(t.index+1)+'</span>'+
       '<div class="info"><div class="t-title">'+esc(t.title)+'</div>'+
       '<div class="t-author">'+esc(t.author)+'</div></div>'+
       '<span class="dur">'+dur+'</span>'+
-      '<button class="'+favClass+'" onclick="toggleFav('+t.index+',event)">'+favGlyph+'</button>'+
+      '<button class="'+favClass+'" data-role="fav" title="Toggle favourite">'+favGlyph+'</button>'+
+      '<div class="actions">'+
+      '<button data-role="menu" title="More actions">\u22ee</button>'+
+      '</div>'+
       '</div>';
   }).join('');
-  // Show "load more" if there are more results
-  if(entries.length<total){
-    el.innerHTML+='<div class="track" onclick="loadPlaylist(true)" '+
+  // Show "load more" only when we're not filtering client-side \u2014
+  // server pagination is over the full set, not the filtered subset.
+  if(!favOnly && entries.length<total){
+    el.innerHTML+='<div class="track" data-role="loadmore" '+
       'style="justify-content:center;color:#5cb870;font-size:13px;">'+
       '\u25bc Load more ('+entries.length+'/'+total+')</div>';
   }
+  wirePlaylistEvents();
 }
 
 function highlightCurrent(){
@@ -1466,12 +2373,270 @@ function highlightCurrent(){
   if(active)active.scrollIntoView({block:'nearest',behavior:'smooth'});
 }
 
+// ── Row event wiring, run after every renderList() ──────────────
+// One place for click / right-click / long-press / drag on rows —
+// keeps the render function pure HTML and centralises the state
+// (dragFromIdx) here so a mid-drag re-render can't stale it.
+let dragFromIdx=null;
+function wirePlaylistEvents(){
+  const rows=document.querySelectorAll('#pl .track');
+  rows.forEach(row=>{
+    if(row.getAttribute('data-role')==='loadmore'){
+      row.addEventListener('click',()=>loadPlaylist(true));
+      return;
+    }
+    const idx=parseInt(row.getAttribute('data-idx'));
+    if(isNaN(idx)) return;
+    row.addEventListener('click',(e)=>{
+      if(e.target.closest('button')) return;
+      playIdx(idx);
+    });
+    row.querySelector('[data-role=fav]')?.addEventListener('click',(e)=>{
+      e.stopPropagation();
+      toggleFav(idx);
+    });
+    row.querySelector('[data-role=menu]')?.addEventListener('click',(e)=>{
+      e.stopPropagation();
+      const r=row.getBoundingClientRect();
+      openCtxMenu(idx, r.right-8, r.top+r.height);
+    });
+    row.addEventListener('contextmenu',(e)=>{
+      e.preventDefault();
+      openCtxMenu(idx, e.clientX, e.clientY);
+    });
+    // Touch long-press = context menu. 500 ms is the community
+    // norm — long enough to disambiguate from a tap, short enough
+    // to feel responsive.
+    let pressT=null;
+    row.addEventListener('touchstart',(e)=>{
+      pressT=setTimeout(()=>{
+        const t=e.touches[0];
+        openCtxMenu(idx, t.clientX, t.clientY);
+      }, 500);
+    },{passive:true});
+    row.addEventListener('touchend',()=>{ if(pressT){clearTimeout(pressT);pressT=null;} });
+    row.addEventListener('touchmove',()=>{ if(pressT){clearTimeout(pressT);pressT=null;} });
+    // HTML5 desktop drag. Touch reorder uses the ctx menu's up/down
+    // items (drag-on-touch conflicts with scroll — worth a
+    // dedicated follow-up).
+    row.addEventListener('dragstart',(e)=>{
+      dragFromIdx=idx;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed='move';
+      // Firefox refuses to start a drag without a payload.
+      e.dataTransfer.setData('text/plain', String(idx));
+    });
+    row.addEventListener('dragend',()=>{
+      row.classList.remove('dragging');
+      document.querySelectorAll('.drag-over').forEach(x=>x.classList.remove('drag-over'));
+      dragFromIdx=null;
+    });
+    row.addEventListener('dragover',(e)=>{
+      if(dragFromIdx===null||dragFromIdx===idx) return;
+      e.preventDefault();
+      row.classList.add('drag-over');
+    });
+    row.addEventListener('dragleave',()=>row.classList.remove('drag-over'));
+    row.addEventListener('drop',(e)=>{
+      e.preventDefault();
+      row.classList.remove('drag-over');
+      if(dragFromIdx===null||dragFromIdx===idx) return;
+      movePlaylist(dragFromIdx, idx);
+    });
+  });
+}
+
+// ── Toolbar actions ──────────────────────────────────────────────
+function pickImportM3U(){ document.getElementById('import-m3u-input').click(); }
+async function onImportM3U(ev){
+  const file=ev.target.files&&ev.target.files[0];
+  if(!file){ ev.target.value=''; return; }
+  try{
+    const text=await file.text();
+    const r=await fetch('/api/playlist/import',{method:'POST',body:text});
+    if(r.ok){ toast('Imported "'+file.name+'"'); setTimeout(()=>loadPlaylist(false),300); }
+    else { toast('Import failed: '+r.status,'danger'); }
+  }catch(e){ console.error(e); toast('Import error','danger'); }
+  ev.target.value='';
+}
+async function clearPlaylist(){
+  if(!confirm('Clear the entire playlist? Liked tracks (❤) are kept.')) return;
+  const r=await fetch('/api/playlist/clear',{method:'POST'});
+  if(r.ok){ toast('Playlist cleared'); setTimeout(()=>loadPlaylist(false),200); }
+}
+// Small wrapper — if the browser supports View Transitions the
+// snapshot morphs from old to new state; otherwise it's a direct
+// call.  Used by any client-side mutation that changes what the
+// playlist renders (fav-only toggle, drag reorder, sort, etc).
+function animate(mut){
+  if(document.startViewTransition){
+    document.startViewTransition(mut);
+  } else {
+    mut();
+  }
+}
+function toggleFavOnly(){
+  favOnly=!favOnly;
+  const chip=document.getElementById('fav-only-chip');
+  chip.classList.toggle('active',favOnly);
+  chip.innerHTML=(favOnly?'♥':'♡')+' Favourites only';
+  animate(()=>renderList(total));
+}
+async function sortPlaylist(col){
+  if(!col) return;
+  const sel=document.getElementById('sort-select');
+  const r=await fetch('/api/playlist/sort/'+encodeURIComponent(col),{method:'POST'});
+  if(r.ok){ toast('Sorted by '+col); setTimeout(()=>loadPlaylist(false),200); }
+  sel.value='';
+}
+async function removeIdx(idx){
+  const r=await fetch('/api/playlist/remove/'+idx,{method:'POST'});
+  if(r.ok){ toast('Removed'); setTimeout(()=>loadPlaylist(false),150); }
+}
+async function movePlaylist(from,to){
+  // Optimistic: reorder locally first. Server's playlist_version
+  // bump triggers a canonical re-fetch, so any drift self-heals.
+  const iFrom=entries.findIndex(e=>e.index===from);
+  const iTo=entries.findIndex(e=>e.index===to);
+  if(iFrom>=0 && iTo>=0){
+    const [moved]=entries.splice(iFrom,1);
+    entries.splice(iTo,0,moved);
+    animate(()=>renderList(total));
+  }
+  const r=await fetch('/api/playlist/move',{method:'POST',body:JSON.stringify({from,to})});
+  if(!r.ok){ toast('Move failed — reverting','danger'); loadPlaylist(false); }
+}
+async function playIdx(idx){
+  await fetch('/api/play/'+idx,{method:'POST'});
+  setTimeout(poll,150);
+}
+function clearSearch(){
+  const q=document.getElementById('q');
+  if(q){ q.value=''; onSearch(); }
+}
+
+// ── Context menu ─────────────────────────────────────────────────
+let ctxIdx=null;
+function openCtxMenu(idx,x,y){
+  ctxIdx=idx;
+  const m=document.getElementById('ctx-menu');
+  const t=entries.find(e=>e.index===idx);
+  document.getElementById('ctx-fav-label').textContent=
+    (t&&t.is_favorite)?'Remove favourite':'Add favourite';
+  m.style.display='block';
+  const rect=m.getBoundingClientRect();
+  const w=rect.width||220, h=rect.height||300;
+  m.style.left=Math.min(x, window.innerWidth - w - 8)+'px';
+  m.style.top=Math.min(y, window.innerHeight - h - 8)+'px';
+}
+function closeCtxMenu(){
+  document.getElementById('ctx-menu').style.display='none';
+  ctxIdx=null;
+}
+document.addEventListener('click',(e)=>{
+  if(!e.target.closest('#ctx-menu')) closeCtxMenu();
+});
+document.addEventListener('scroll',closeCtxMenu,true);
+async function ctxAction(kind){
+  const idx=ctxIdx;
+  closeCtxMenu();
+  if(idx===null||idx===undefined) return;
+  switch(kind){
+    case 'play':   playIdx(idx); break;
+    case 'fav':    toggleFav(idx); break;
+    case 'top':    if(idx>0){ movePlaylist(idx, 0); toast('Moved to top'); } break;
+    case 'up':     if(idx>0) movePlaylist(idx, idx-1); break;
+    case 'down':   if(idx<total-1) movePlaylist(idx, idx+1); break;
+    case 'copy':   {
+      const t=entries.find(e=>e.index===idx);
+      if(t){
+        const s=(t.author?t.author+' — ':'')+t.title;
+        try{ await navigator.clipboard.writeText(s); toast('Copied "'+s+'"'); }
+        catch(_){ toast('Copy blocked by browser','danger'); }
+      }
+      break;
+    }
+    case 'remove': removeIdx(idx); break;
+  }
+}
+
+// ── Toast notifications ──────────────────────────────────────────
+function toast(msg,kind){
+  const stack=document.getElementById('toast-stack');
+  if(!stack) return;
+  const t=document.createElement('div');
+  t.className='toast'+(kind==='danger'?' danger':'');
+  t.textContent=msg;
+  stack.appendChild(t);
+  setTimeout(()=>{ t.style.transition='opacity 0.2s'; t.style.opacity='0';
+    setTimeout(()=>t.remove(),220); }, 2200);
+}
+
 // Auto-load more when scrolling near bottom
 document.getElementById('pl').addEventListener('scroll',function(){
   if(this.scrollTop+this.clientHeight>=this.scrollHeight-50){
     if(entries.length<total)loadPlaylist(true);
   }
 });
+
+// ── Global keyboard shortcuts ──────────────────────────────────
+// Mirror the desktop bindings so the same muscle memory works when
+// the web UI is on the same machine's browser. Skipped while typing
+// in the search box (so `/`, `Space`, `Escape` etc. behave
+// naturally there).
+document.addEventListener('keydown',(e)=>{
+  const t=e.target;
+  if(t && (t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){
+    // Escape blurs the search field — same as desktop.
+    if(e.key==='Escape' && t.tagName==='INPUT'){ t.blur(); }
+    return;
+  }
+  if(e.metaKey||e.ctrlKey||e.altKey) return;
+  switch(e.key){
+    case ' ':      e.preventDefault(); cmd('pause'); break;
+    case 'ArrowRight': e.preventDefault(); cmd('next'); break;
+    case 'ArrowLeft':  e.preventDefault(); cmd('prev'); break;
+    case 'f':
+    case 'F':      e.preventDefault(); toggleFavCurrent(); break;
+    case 'h':
+    case 'H':      e.preventDefault(); toggleFavCurrent(); break;
+    case '/':      e.preventDefault(); document.getElementById('q')?.focus(); break;
+    case 's':
+    case 'S':      e.preventDefault(); cmd('surprise'); break;
+    case 'l':
+    case 'L':      e.preventDefault(); toggleLibrary(); break;
+    case 'r':
+    case 'R':      e.preventDefault(); cmd('shuffle'); break;
+    case '?':      e.preventDefault(); showHelpOverlay(); break;
+  }
+});
+
+// Minimal in-browser help overlay listing the bindings above. Built
+// once, toggled on demand. Dismissed by any click.
+function showHelpOverlay(){
+  let ov=document.getElementById('help-overlay');
+  if(!ov){
+    ov=document.createElement('div');
+    ov.id='help-overlay';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1100;'+
+      'display:flex;align-items:center;justify-content:center;font-size:13px;';
+    ov.innerHTML='<div style="background:#1a1e26;border:1px solid #2a2e36;'+
+      'border-radius:8px;padding:20px 26px;max-width:340px;color:#c8ccd0;">'+
+      '<div style="font-size:15px;color:#5cb870;margin-bottom:10px;">Keyboard shortcuts</div>'+
+      '<div style="display:grid;grid-template-columns:80px 1fr;gap:6px 12px;">'+
+      '<code>Space</code><span>Play / Pause</span>'+
+      '<code>← / →</code><span>Previous / Next track</span>'+
+      '<code>F or H</code><span>Toggle favourite</span>'+
+      '<code>S</code><span>Surprise Me</span>'+
+      '<code>R</code><span>Toggle shuffle</span>'+
+      '<code>L</code><span>Toggle Library</span>'+
+      '<code>/</code><span>Focus search</span>'+
+      '<code>?</code><span>This help</span>'+
+      '</div><div style="margin-top:12px;color:#8090a0;">Click anywhere to close.</div></div>';
+    ov.addEventListener('click',()=>ov.remove());
+    document.body.appendChild(ov);
+  }
+}
 
 setInterval(poll,1000);
 poll();

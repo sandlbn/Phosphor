@@ -85,14 +85,22 @@ Selectable in Settings (⚙):
 
 ## HTTP Remote Control
 
-Phosphor includes a built-in web server for controlling playback from any device on the same network.
+Phosphor includes a built-in web server for controlling playback from any device on the same network. The browser UI is a near-complete replacement for the desktop for anything a "phone on the couch" user needs.
 
 1. Open Settings (⚙) → **Remote control (HTTP)** → click **Start remote server**
 2. Open the displayed URL (e.g. `http://192.168.1.42:8364`) on your phone or another computer
 3. Browse the playlist, search, play/pause/skip — all from the browser
-4. Hit 🔊 **Listen** to hear the live audio through the browser (reSID / SIDLite engines only — hardware playback paths can't be tapped)
+4. Hit 🔊 **Listen** to stream the live audio through the browser (reSID / SIDLite engines only — hardware playback paths can't be tapped)
 
-The web UI supports server-side search across large collections with paginated loading, auto-refreshes when the desktop side changes the playlist (Surprise Me, drag-add, favourites), and lets you **Load Liked** on-demand as a fresh playlist. Port is configurable (default 8364). The setting persists across restarts. A green **● Remote** pill in the bottom toolbar shows when the server is up and clicking it opens the URL.
+**Playlist management** — right-click / long-press a row for a context menu (Play now, Toggle favourite, Move to top / up / down, Copy title, Remove). Desktop users can drag rows to reorder. The toolbar adds Import M3U / Save as M3U / Clear / Favourites-only chip / Sort dropdown, and every action pops a small toast confirmation.
+
+**Library discovery** — Published Playlists (with inline preview accordion — click any playlist to see its track list before loading), HVSC browser (Musicians / Demos / Games), Recently Played history, plus one-click **HVSC sync** trigger with live progress.
+
+**Modern-player polish** — persistent Now Playing bar on phones so the transport controls stay reachable when you scroll deep in the playlist, iOS lock-screen + Android notification-shade media controls with title / author / progress (via the Media Session API), subtune stepper `1/N ◀ ▶` when a tune has multiple songs, keyboard shortcuts mirroring the desktop (`Space`, `← / →`, `F` / `H` favourite, `S` surprise, `R` shuffle, `L` library, `/` search focus, `?` help), skeleton loading rows during first fetch, friendly empty-state panels, smooth CSS view-transition animations for reorder / remove / import in Chromium browsers.
+
+**Quick settings** — the ⚙ Settings drawer in the browser flips Skip RSID / Force stereo / Surprise Me source / Repeat mode / Shuffle without walking to the desk.
+
+The web UI auto-refreshes whenever the desktop side changes the playlist (Surprise Me, drag-add, favourites toggle, sort, reorder). Port is configurable (default 8364). The setting persists across restarts. A green **● Remote** pill in the desktop's bottom toolbar shows when the server is up and clicking it opens the URL.
 
 ## Liked Tracks (♥)
 
