@@ -122,8 +122,8 @@ Features that go beyond a basic player: full sub-tune navigation, multi-SID (1/2
 
   <div class="feature">
     <div class="icon">🌐</div>
-    <h3>HTTP remote control</h3>
-    <p>Built-in web server controls playback from any browser on the network - phone, tablet, another PC.</p>
+    <h3>Full-featured web remote</h3>
+    <p>Built-in web server delivers a near-complete remote to any browser on your LAN: playlist editing (drag-reorder, sort, M3U import/export, right-click context menu), Library browse (HVSC, Published, Recent), Media Session for lock-screen controls, keyboard shortcuts, quick-settings drawer, mobile Now Playing bar. Optional 🔊 Listen streams live MP3 back through the browser.</p>
   </div>
 
   <div class="feature">

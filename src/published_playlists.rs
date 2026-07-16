@@ -13,6 +13,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use reqwest::Client;
+
+/// Cache directory for downloaded published playlists + the last-seen
+/// manifest. Public so callers outside main.rs (e.g. the HTTP remote's
+/// preview endpoint) can look up cached M3U files without duplicating
+/// the fallback logic.
+pub fn cache_dir() -> Option<PathBuf> {
+    crate::config::config_dir().map(|d| d.join("published_playlists"))
+}
 use serde::{Deserialize, Serialize};
 
 const RAW_BASE_URL: &str = "https://raw.githubusercontent.com/sandlbn/Phosphor/main/playlists";
