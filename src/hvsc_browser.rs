@@ -440,18 +440,43 @@ impl HvscBrowser {
         // universe, zero disk I/O.
         if self.flat_index_loaded && !self.flat_index.is_empty() {
             use rand::Rng;
+            crate::dlog!(
+                "random_hvsc_path: warm flat_index, n={}",
+                self.flat_index.len()
+            );
             let i = rand::thread_rng().gen_range(0..self.flat_index.len());
             return Some(self.flat_index[i].path.clone());
         }
-        let root = self.root.as_ref()?;
+        let Some(root) = self.root.as_ref() else {
+            crate::dlog!("random_hvsc_path: no HVSC root set (tree not synced/configured) -> None");
+            return None;
+        };
         let category_dir = root.join(self.category.dir_name());
+        // Log the target BEFORE the is_dir() stat — on a dead network drive or
+        // an offline OneDrive placeholder even this stat can block, so if it
+        // hangs here this is the last line in the log.
+        crate::dlog!(
+            "random_hvsc_path: cold path, checking is_dir on {}",
+            category_dir.display()
+        );
         if !category_dir.is_dir() {
+            crate::dlog!(
+                "random_hvsc_path: category dir missing / not a directory (tree not synced?) -> None"
+            );
             return None;
         }
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let mut chosen: Option<PathBuf> = None;
         let mut seen: u64 = 0;
+        // This synchronous walk runs on the UI thread — if it stalls (large
+        // tree, network/OneDrive placeholders, followed reparse points), the
+        // next line is the *last* thing in the log, pinpointing the freeze.
+        crate::dlog!(
+            "random_hvsc_path: COLD WalkDir starting over {} (follow_links=true)",
+            category_dir.display()
+        );
+        let t0 = std::time::Instant::now();
         for dirent in WalkDir::new(&category_dir)
             .follow_links(true)
             .into_iter()
@@ -466,6 +491,10 @@ impl HvscBrowser {
                 chosen = Some(p.to_path_buf());
             }
         }
+        crate::dlog!(
+            "random_hvsc_path: walk done, seen={seen}, elapsed={}ms",
+            t0.elapsed().as_millis()
+        );
         chosen
     }
 

@@ -6,6 +6,7 @@ mod audio_stream;
 mod audio_volume;
 mod c64_emu;
 mod config;
+mod debug_log;
 mod device_config;
 mod favorites;
 mod heard_db;
@@ -2474,12 +2475,25 @@ impl App {
                 // Works whether the enriched flat index is loaded or
                 // not — falls back to a fresh reservoir-sampling walk
                 // so hitting Surprise on a cold cache is instant.
+                crate::dlog!("HvscBrowserSurpriseMe: entry, calling random_hvsc_path");
+                let t_pick = std::time::Instant::now();
                 let picked = self.hvsc_browser.random_hvsc_path();
+                crate::dlog!(
+                    "HvscBrowserSurpriseMe: random_hvsc_path returned {} in {}ms",
+                    if picked.is_some() { "Some" } else { "None" },
+                    t_pick.elapsed().as_millis()
+                );
                 if picked.is_none() {
-                    eprintln!("[surprise] No tunes in current HVSC category — is the tree synced?");
+                    crate::dlog!("[surprise] No tunes in current HVSC category — is the tree synced?");
                 } else if let Some(pick_path) = picked {
+                    let t_read = std::time::Instant::now();
                     let entry = match playlist::PlaylistEntry::from_path(&pick_path) {
                         Ok(mut e) => {
+                            crate::dlog!(
+                                "HvscBrowserSurpriseMe: from_path OK in {}ms ({})",
+                                t_read.elapsed().as_millis(),
+                                pick_path.display()
+                            );
                             if let Some(db) = self.songlength_db.as_ref() {
                                 let song0 = e.selected_song.saturating_sub(1) as usize;
                                 if let Some(m) = &e.md5 {
@@ -2491,14 +2505,19 @@ impl App {
                             e
                         }
                         Err(err) => {
-                            eprintln!("[surprise] {}: {}", pick_path.display(), err);
+                            crate::dlog!(
+                                "[surprise] from_path FAILED after {}ms: {}: {}",
+                                t_read.elapsed().as_millis(),
+                                pick_path.display(),
+                                err
+                            );
                             return Task::none();
                         }
                     };
                     {
                         let path = entry.path.clone();
                         let song = entry.selected_song.max(1);
-                        eprintln!("[surprise] picked {}", path.display());
+                        crate::dlog!("[surprise] picked {}", path.display());
                         self.playlist.add_entries(vec![entry]);
                         if let Some(db) = self.songlength_db.as_ref() {
                             db.apply_to_playlist(
@@ -2525,6 +2544,7 @@ impl App {
                             },
                             restart_usb_on_load: self.config.restart_usb_on_load,
                         });
+                        crate::dlog!("HvscBrowserSurpriseMe: PlayerCmd::Play sent, closing browser");
                         self.show_hvsc_browser = false;
                     }
                 }
@@ -2537,13 +2557,27 @@ impl App {
             Message::SurpriseMe => {
                 let want_playlist = self.config.surprise_source == "playlist";
                 let has_playlist = !self.playlist.entries.is_empty();
+                crate::dlog!(
+                    "SurpriseMe: source={}, playlist_len={}, want_playlist={}, has_playlist={}",
+                    self.config.surprise_source,
+                    self.playlist.entries.len(),
+                    want_playlist,
+                    has_playlist
+                );
                 if want_playlist && has_playlist {
                     use rand::Rng;
                     let n = self.playlist.entries.len();
                     let idx = rand::thread_rng().gen_range(0..n);
                     self.selected = Some(idx);
+                    crate::dlog!("SurpriseMe: playlist pick idx={idx}/{n}, calling play_track");
+                    let t0 = std::time::Instant::now();
                     self.play_track(idx);
+                    crate::dlog!(
+                        "SurpriseMe: play_track returned, elapsed={}ms",
+                        t0.elapsed().as_millis()
+                    );
                 } else {
+                    crate::dlog!("SurpriseMe: falling back to HVSC path");
                     return iced::Task::done(Message::HvscBrowserSurpriseMe);
                 }
             }
@@ -5461,12 +5495,15 @@ fn main() -> iced::Result {
         // is itself not unwind-safe and can double-panic in a Cocoa block context.
         if let Some(loc) = info.location() {
             eprintln!("panic at {}:{}: {}", loc.file(), loc.line(), msg);
+            crate::debug_log::log(format_args!("PANIC at {}:{}: {}", loc.file(), loc.line(), msg));
         } else {
             eprintln!("panic: {}", msg);
+            crate::debug_log::log(format_args!("PANIC: {}", msg));
         }
     }));
 
     env_logger::init();
+    debug_log::init();
 
     // Diagnostic subcommand: walk a directory of .sid files, call the
     // regular `PlaylistEntry::from_path` on each (the same function
