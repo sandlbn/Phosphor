@@ -139,7 +139,7 @@ impl StilEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The parsed STIL database, indexed two ways for flexible lookup.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct StilDb {
     /// Primary index: lowercase HVSC-relative path → entry.
     by_path: HashMap<String, StilEntry>,

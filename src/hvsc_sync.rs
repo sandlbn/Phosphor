@@ -116,10 +116,17 @@ impl HvscSyncHandle {
 
 impl Drop for HvscSyncHandle {
     fn drop(&mut self) {
+        // Request cancellation, then DETACH the worker — do NOT join here.
+        // The worker only checks `cancel` between requests, so an in-flight
+        // `reqwest` (timeouts up to 180 s) would otherwise block whoever drops
+        // this handle. On app close the App is dropped on the main thread, so a
+        // blocking join would hang the whole app when the network is down.
+        // Detaching is safe: the worker only writes files to disk and a partial
+        // download is re-fetched on the next sync; on process exit the OS reaps
+        // the thread.
         self.cancel.store(true, Ordering::SeqCst);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        // Drop the JoinHandle without joining -> the thread is detached.
+        drop(self.join.take());
     }
 }
 

@@ -887,7 +887,7 @@ impl App {
                 if let Some(cm) = self.context_menu.take() {
                     let idx = cm.track_idx;
                     if self.playlist.current == Some(idx) {
-                        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                        self.send_cmd(PlayerCmd::Stop);
                     }
                     self.playlist.remove(idx);
                     self.selected = if self.playlist.is_empty() {
@@ -962,7 +962,7 @@ impl App {
                         self.play_track(i);
                     }
                 } else {
-                    let _ = self.cmd_tx.send(PlayerCmd::TogglePause);
+                    self.send_cmd(PlayerCmd::TogglePause);
                     // User-initiated pause/resume — drop the debounce so the
                     // first auto-advance after resume isn't gated by a stale
                     // timestamp from before pause.
@@ -972,7 +972,7 @@ impl App {
 
             Message::Stop => {
                 self.context_menu = None;
-                let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                self.send_cmd(PlayerCmd::Stop);
                 self.visualizer.reset();
                 self.tracker_history.reset();
                 self.tracker_view.reset();
@@ -1002,7 +1002,7 @@ impl App {
                 if let Some(ref info) = self.status.track_info {
                     let next = (info.current_song + 1).min(info.songs);
                     if next != info.current_song {
-                        let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next));
+                        self.send_cmd(PlayerCmd::SetSubtune(next));
                         self.clear_advance_status();
                         self.update_entry_subtune(next);
                     }
@@ -1013,7 +1013,7 @@ impl App {
                 if let Some(ref info) = self.status.track_info {
                     let prev = info.current_song.saturating_sub(1).max(1);
                     if prev != info.current_song {
-                        let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(prev));
+                        self.send_cmd(PlayerCmd::SetSubtune(prev));
                         self.clear_advance_status();
                         self.update_entry_subtune(prev);
                     }
@@ -1049,7 +1049,7 @@ impl App {
 
             Message::ClearPlaylist => {
                 self.context_menu = None;
-                let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                self.send_cmd(PlayerCmd::Stop);
                 self.playlist.clear();
                 self.selected = None;
                 self.visualizer.reset();
@@ -1060,7 +1060,7 @@ impl App {
                 self.context_menu = None;
                 if let Some(idx) = self.selected {
                     if self.playlist.current == Some(idx) {
-                        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                        self.send_cmd(PlayerCmd::Stop);
                     }
                     self.playlist.remove(idx);
                     self.selected = if self.playlist.is_empty() {
@@ -1493,7 +1493,7 @@ impl App {
                     self.show_hvsc_browser = false;
                     // Auto-load on open.
                     self.device_cfg_status = "Reading device…".into();
-                    let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                    self.send_cmd(player::PlayerCmd::DeviceConfig(
                         player::DeviceConfigCmd::Refresh,
                     ));
                 }
@@ -1501,49 +1501,49 @@ impl App {
 
             Message::DeviceConfigRefresh => {
                 self.device_cfg_status = "Reading device…".into();
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::Refresh,
                 ));
             }
 
             Message::DeviceConfigApplyPreset(p) => {
                 self.device_cfg_status = format!("Applying preset: {}…", p.label());
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::ApplyPreset(p),
                 ));
             }
 
             Message::DeviceConfigSetClock(rate) => {
                 self.device_cfg_status = format!("Setting clock: {}…", rate.label());
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::SetClock(rate),
                 ));
             }
 
             Message::DeviceConfigEdit(edit) => {
                 self.device_cfg_status = "Updating…".into();
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::Edit(edit),
                 ));
             }
 
             Message::DeviceConfigSave => {
                 self.device_cfg_status = "Saving to flash…".into();
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::Save,
                 ));
             }
 
             Message::DeviceConfigReset => {
                 self.device_cfg_status = "Resetting to factory defaults…".into();
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::Reset,
                 ));
             }
 
             Message::DeviceConfigAutoDetect => {
                 self.device_cfg_status = "Auto-detecting (≈3 s)…".into();
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::AutoDetect,
                 ));
             }
@@ -1567,7 +1567,7 @@ impl App {
                     C::MidiResetState => "Resetting MIDI state".into(),
                     other => format!("Sending {other:?}…"),
                 };
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(cmd));
+                self.send_cmd(player::PlayerCmd::DeviceConfig(cmd));
             }
 
             Message::DeviceConfigResult(result) => match result {
@@ -1604,7 +1604,7 @@ impl App {
                     }
                     self.config.macos_usb_mode = mode.clone();
                     self.config.save();
-                    let _ = self.cmd_tx.send(PlayerCmd::SetMacosUsbMode(mode));
+                    self.send_cmd(PlayerCmd::SetMacosUsbMode(mode));
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -1862,7 +1862,7 @@ impl App {
                 // Persist any healed paths written back by `resolve()`.
                 self.favorites.save();
                 let total = resolved.len();
-                let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                self.send_cmd(PlayerCmd::Stop);
                 self.playlist.clear();
                 self.playlist.add_entries(resolved);
                 if let Some(db) = self.songlength_db.as_ref() {
@@ -1985,7 +1985,7 @@ impl App {
                         eprintln!("[sleep] timer expired — stopping playback");
                         self.sleep_deadline = None;
                         self.sleep_selected_mins = None;
-                        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                        self.send_cmd(PlayerCmd::Stop);
                     }
                 }
 
@@ -2401,7 +2401,7 @@ impl App {
                         let _ = vi;
                         self.selected = Some(abs_i);
                     }
-                    let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                    self.send_cmd(player::PlayerCmd::Play {
                         path,
                         song,
                         force_stereo: self.config.force_stereo_2sid
@@ -2452,7 +2452,7 @@ impl App {
                     if let Some(abs_i) = self.playlist.entries.iter().position(|e| e.path == path) {
                         self.selected = Some(abs_i);
                     }
-                    let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                    self.send_cmd(player::PlayerCmd::Play {
                         path,
                         song,
                         force_stereo: self.config.force_stereo_2sid
@@ -2471,83 +2471,78 @@ impl App {
 
             // ── HVSC: 🎲 Surprise me ───────────────────────────────────────
             Message::HvscBrowserSurpriseMe => {
-                // Pick a random SID/MUS path from the current category.
-                // Works whether the enriched flat index is loaded or
-                // not — falls back to a fresh reservoir-sampling walk
-                // so hitting Surprise on a cold cache is instant.
-                crate::dlog!("HvscBrowserSurpriseMe: entry, calling random_hvsc_path");
-                let t_pick = std::time::Instant::now();
-                let picked = self.hvsc_browser.random_hvsc_path();
-                crate::dlog!(
-                    "HvscBrowserSurpriseMe: random_hvsc_path returned {} in {}ms",
-                    if picked.is_some() { "Some" } else { "None" },
-                    t_pick.elapsed().as_millis()
-                );
-                if picked.is_none() {
-                    crate::dlog!("[surprise] No tunes in current HVSC category — is the tree synced?");
-                } else if let Some(pick_path) = picked {
-                    let t_read = std::time::Instant::now();
-                    let entry = match playlist::PlaylistEntry::from_path(&pick_path) {
-                        Ok(mut e) => {
-                            crate::dlog!(
-                                "HvscBrowserSurpriseMe: from_path OK in {}ms ({})",
-                                t_read.elapsed().as_millis(),
-                                pick_path.display()
-                            );
-                            if let Some(db) = self.songlength_db.as_ref() {
-                                let song0 = e.selected_song.saturating_sub(1) as usize;
-                                if let Some(m) = &e.md5 {
-                                    if let Some(secs) = db.lookup(m, song0) {
-                                        e.duration_secs = Some(secs);
-                                    }
-                                }
-                            }
-                            e
+                crate::dlog!("HvscBrowserSurpriseMe: entry");
+                // Warm enriched index: sample in-memory, zero disk I/O — safe
+                // to do on the UI thread. Reading the one picked file's header
+                // is a single small read on the already-synced local tree.
+                if let Some(path) = self.hvsc_browser.random_hvsc_warm() {
+                    let entry = playlist::PlaylistEntry::from_path(&path).ok();
+                    return Task::done(Message::SurprisePicked(entry));
+                }
+                // Cold cache: the directory walk (and the header read) can block
+                // for a long time when the HVSC root lives on a network/mapped
+                // drive or an offline OneDrive placeholder — so run it on a
+                // worker thread via Task::perform and never on the UI thread.
+                if let Some((root, category)) = self.hvsc_browser.surprise_cold_target() {
+                    crate::dlog!("HvscBrowserSurpriseMe: dispatching cold walk off the UI thread");
+                    return Task::perform(
+                        async move {
+                            hvsc_browser::random_hvsc_path_walk(root, category)
+                                .and_then(|p| playlist::PlaylistEntry::from_path(&p).ok())
+                        },
+                        Message::SurprisePicked,
+                    );
+                }
+                crate::dlog!("[surprise] No HVSC root set — nothing to pick");
+            }
+
+            // Result of a Surprise pick (warm index or off-thread cold walk):
+            // enrich with songlength, queue it, and play. `None` means the
+            // category was empty / unreachable or the header read failed.
+            Message::SurprisePicked(picked) => {
+                let Some(mut entry) = picked else {
+                    crate::dlog!(
+                        "[surprise] no tune picked (empty/offline category or read failed)"
+                    );
+                    return Task::none();
+                };
+                if let Some(db) = self.songlength_db.as_ref() {
+                    let song0 = entry.selected_song.saturating_sub(1) as usize;
+                    if let Some(m) = &entry.md5 {
+                        if let Some(secs) = db.lookup(m, song0) {
+                            entry.duration_secs = Some(secs);
                         }
-                        Err(err) => {
-                            crate::dlog!(
-                                "[surprise] from_path FAILED after {}ms: {}: {}",
-                                t_read.elapsed().as_millis(),
-                                pick_path.display(),
-                                err
-                            );
-                            return Task::none();
-                        }
-                    };
-                    {
-                        let path = entry.path.clone();
-                        let song = entry.selected_song.max(1);
-                        crate::dlog!("[surprise] picked {}", path.display());
-                        self.playlist.add_entries(vec![entry]);
-                        if let Some(db) = self.songlength_db.as_ref() {
-                            db.apply_to_playlist(
-                                &mut self.playlist,
-                                self.config.hvsc_root.as_deref().map(std::path::Path::new),
-                            );
-                        }
-                        self.rebuild_filter();
-                        if let Some(abs_i) =
-                            self.playlist.entries.iter().position(|e| e.path == path)
-                        {
-                            self.selected = Some(abs_i);
-                        }
-                        let _ = self.cmd_tx.send(player::PlayerCmd::Play {
-                            path,
-                            song,
-                            force_stereo: self.config.force_stereo_2sid
-                                || std::env::args().any(|a| a == "--stereo"),
-                            sid4_addr: parse_sid4_from_args(),
-                            audio_port: if self.config.u64_audio_enabled {
-                                Some(self.config.u64_audio_port)
-                            } else {
-                                None
-                            },
-                            restart_usb_on_load: self.config.restart_usb_on_load,
-                        });
-                        crate::dlog!("HvscBrowserSurpriseMe: PlayerCmd::Play sent, closing browser");
-                        self.show_hvsc_browser = false;
                     }
                 }
+                let path = entry.path.clone();
+                let song = entry.selected_song.max(1);
+                crate::dlog!("[surprise] picked {}", path.display());
+                self.playlist.add_entries(vec![entry]);
+                if let Some(db) = self.songlength_db.as_ref() {
+                    db.apply_to_playlist(
+                        &mut self.playlist,
+                        self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                    );
+                }
+                self.rebuild_filter();
+                if let Some(abs_i) = self.playlist.entries.iter().position(|e| e.path == path) {
+                    self.selected = Some(abs_i);
+                }
+                self.send_cmd(player::PlayerCmd::Play {
+                    path,
+                    song,
+                    force_stereo: self.config.force_stereo_2sid
+                        || std::env::args().any(|a| a == "--stereo"),
+                    sid4_addr: parse_sid4_from_args(),
+                    audio_port: if self.config.u64_audio_enabled {
+                        Some(self.config.u64_audio_port)
+                    } else {
+                        None
+                    },
+                    restart_usb_on_load: self.config.restart_usb_on_load,
+                });
+                crate::dlog!("SurprisePicked: PlayerCmd::Play sent, closing browser");
+                self.show_hvsc_browser = false;
             }
 
             // ── 🎲 Surprise Me (mini + big player button) ──────────────────
@@ -2745,7 +2740,7 @@ impl App {
                             {
                                 self.selected = Some(abs_i);
                             }
-                            let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                            self.send_cmd(player::PlayerCmd::Play {
                                 path,
                                 song: resolved_song,
                                 force_stereo: self.config.force_stereo_2sid
@@ -3081,6 +3076,74 @@ impl App {
                         "[phosphor] HVSC root changed — cleared cached paths on \
                          {touched} favourite(s)"
                     );
+                }
+                // Immediately load STIL + Songlengths from the new root's
+                // DOCUMENTS/ so metadata is available right away — OFF the UI
+                // thread, since the files may live on cloud/network storage.
+                if let Some(root_str) = self.config.hvsc_root.clone() {
+                    return Task::perform(load_hvsc_metadata(PathBuf::from(root_str)), |m| {
+                        Message::HvscMetadataLoaded(Box::new(m))
+                    });
+                }
+            }
+
+            Message::BrowseHvscRoot => {
+                // Seed the dialog at the current root (or the platform default)
+                // so the user starts near where their library lives.
+                let start_dir = self
+                    .config
+                    .hvsc_root
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        hvsc_sync::default_hvsc_root().map(|p| p.to_string_lossy().into_owned())
+                    });
+                return Task::perform(pick_hvsc_folder(start_dir), Message::HvscRootPicked);
+            }
+
+            Message::HvscRootPicked(Some(path)) => {
+                // Route through SetHvscRoot so the picked folder gets the same
+                // treatment as a typed-then-submitted path (save, STIL refresh,
+                // favourite re-root; the browser re-syncs its root on open).
+                return Task::done(Message::SetHvscRoot(path.to_string_lossy().into_owned()));
+            }
+            Message::HvscRootPicked(None) => {}
+
+            Message::UpdateMetadata => {
+                // One button to refresh both databases. Both downloads are
+                // async (Task::perform with timeouts) — never block the UI.
+                self.stil_status = "Updating…".to_string();
+                self.download_status = "Updating…".to_string();
+                return Task::batch([
+                    Task::done(Message::DownloadSonglength),
+                    Task::done(Message::DownloadStil),
+                ]);
+            }
+
+            Message::HvscMetadataLoaded(meta) => {
+                let meta = *meta;
+                let mut loaded_any = false;
+                if let (Some(db), Some(path)) = (meta.songlength, meta.songlength_path) {
+                    self.config.remember_songlength_path(&path);
+                    let count = db.entries.len();
+                    db.apply_to_playlist(
+                        &mut self.playlist,
+                        self.config.hvsc_root.as_deref().map(std::path::Path::new),
+                    );
+                    self.songlength_db = Some(db);
+                    self.download_status = format!("Loaded {count} songlength entries from HVSC");
+                    loaded_any = true;
+                }
+                if let (Some(db), Some(path)) = (meta.stil, meta.stil_path) {
+                    self.config.remember_stil_path(&path);
+                    self.stil_status = format!("Loaded {} STIL entries from HVSC", db.count);
+                    self.stil_db = Some(db);
+                    self.refresh_stil_entry();
+                    self.refresh_hvsc_status();
+                    loaded_any = true;
+                }
+                if loaded_any {
+                    self.config.save();
                 }
             }
 
@@ -3775,6 +3838,19 @@ impl App {
         self.silence_frames = 0;
     }
 
+    /// Queue a command to the player thread **without ever blocking the UI
+    /// event loop**. The command channel is `bounded(64)` and only fills when
+    /// the player thread is stalled (e.g. a slow/unreachable device); in that
+    /// case we drop the command (logged) rather than freeze the whole app —
+    /// the UI's blocking `send` was the last thing that could hang it. In
+    /// normal operation the channel is never full, so this behaves exactly
+    /// like a blocking send, with no dropped commands.
+    fn send_cmd(&self, cmd: player::PlayerCmd) {
+        if let Err(e) = self.cmd_tx.try_send(cmd) {
+            crate::dlog!("send_cmd DROPPED (player thread stalled?): {e:?}");
+        }
+    }
+
     fn play_track(&mut self, idx: usize) {
         if let Some(entry) = self.playlist.entries.get(idx) {
             if self.config.skip_rsid && entry.is_rsid {
@@ -3784,10 +3860,10 @@ impl App {
                     if next_idx != idx {
                         self.play_track(next_idx);
                     } else {
-                        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                        self.send_cmd(PlayerCmd::Stop);
                     }
                 } else {
-                    let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                    self.send_cmd(PlayerCmd::Stop);
                 }
                 return;
             }
@@ -3836,7 +3912,7 @@ impl App {
             } else {
                 None
             };
-            let _ = self.cmd_tx.send(PlayerCmd::Play {
+            self.send_cmd(PlayerCmd::Play {
                 path: play_path,
                 song: play_song,
                 force_stereo,
@@ -3854,7 +3930,7 @@ impl App {
             // the engine label suffix in track_info_bar.
             if self.config.output_engine == "usb" && !self.usb_info_fetched {
                 self.usb_info_fetched = true;
-                let _ = self.cmd_tx.send(player::PlayerCmd::DeviceConfig(
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
                     player::DeviceConfigCmd::Refresh,
                 ));
             }
@@ -4351,7 +4427,7 @@ impl App {
                                         None
                                     }
                                 });
-                            let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(next_song));
+                            self.send_cmd(PlayerCmd::SetSubtune(next_song));
                             self.clear_advance_status();
                             if let Some(e) = self.playlist.entries.get_mut(cur_idx) {
                                 e.selected_song = next_song;
@@ -4378,7 +4454,7 @@ impl App {
                             if let Some(idx) = self.playlist.next() {
                                 self.play_track(idx);
                             } else {
-                                let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                                self.send_cmd(PlayerCmd::Stop);
                             }
                         }
                     }
@@ -4588,10 +4664,10 @@ impl App {
                     self.play_track(idx);
                 }
                 remote::RemoteCmd::Stop => {
-                    let _ = self.cmd_tx.send(PlayerCmd::Stop);
+                    self.send_cmd(PlayerCmd::Stop);
                 }
                 remote::RemoteCmd::TogglePause => {
-                    let _ = self.cmd_tx.send(PlayerCmd::TogglePause);
+                    self.send_cmd(PlayerCmd::TogglePause);
                 }
                 remote::RemoteCmd::NextTrack => {
                     if let Some(cur) = self.playlist.current {
@@ -4608,7 +4684,7 @@ impl App {
                     }
                 }
                 remote::RemoteCmd::SetSubtune(n) => {
-                    let _ = self.cmd_tx.send(PlayerCmd::SetSubtune(n));
+                    self.send_cmd(PlayerCmd::SetSubtune(n));
                     self.clear_advance_status();
                 }
 
@@ -4684,7 +4760,7 @@ impl App {
                         // playing track, matching the desktop
                         // context-menu Remove flow.
                         if self.playlist.current == Some(idx) {
-                            let _ = self.cmd_tx.send(player::PlayerCmd::Stop);
+                            self.send_cmd(player::PlayerCmd::Stop);
                         }
                         self.playlist.remove(idx);
                         self.selected = if self.playlist.is_empty() {
@@ -4696,7 +4772,7 @@ impl App {
                     }
                 }
                 remote::RemoteCmd::PlaylistClear => {
-                    let _ = self.cmd_tx.send(player::PlayerCmd::Stop);
+                    self.send_cmd(player::PlayerCmd::Stop);
                     self.playlist.clear();
                     self.selected = None;
                     self.rebuild_filter();
@@ -4837,7 +4913,7 @@ impl App {
         {
             self.selected = Some(abs_i);
             if play {
-                let _ = self.cmd_tx.send(player::PlayerCmd::Play {
+                self.send_cmd(player::PlayerCmd::Play {
                     path: entry_path,
                     song,
                     force_stereo: self.config.force_stereo_2sid
@@ -5145,9 +5221,9 @@ impl Drop for App {
             }
         }
         self.heard_db.save();
-        let _ = self.cmd_tx.send(PlayerCmd::Stop);
+        self.send_cmd(PlayerCmd::Stop);
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = self.cmd_tx.send(PlayerCmd::Quit);
+        self.send_cmd(PlayerCmd::Quit);
     }
 }
 
@@ -5180,6 +5256,57 @@ async fn pick_folder(start_dir: Option<String>) -> Option<PathBuf> {
         }
     }
     d.pick_folder().await.map(|h| h.path().to_path_buf())
+}
+
+/// Native folder picker for the HVSC root (the local C64Music library).
+async fn pick_hvsc_folder(start_dir: Option<String>) -> Option<PathBuf> {
+    let mut d =
+        rfd::AsyncFileDialog::new().set_title("Select your HVSC root folder (e.g. C64Music)");
+    if let Some(ref dir) = start_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            d = d.set_directory(&p);
+        }
+    }
+    d.pick_folder().await.map(|h| h.path().to_path_buf())
+}
+
+/// STIL + Songlength databases parsed off the UI thread from
+/// `<hvsc_root>/DOCUMENTS/`, delivered via `Message::HvscMetadataLoaded`.
+#[derive(Debug, Clone)]
+pub struct HvscMetaLoad {
+    stil: Option<stil::StilDb>,
+    stil_path: Option<PathBuf>,
+    songlength: Option<playlist::SonglengthDb>,
+    songlength_path: Option<PathBuf>,
+}
+
+/// Load STIL.txt + Songlengths.md5 from `<root>/DOCUMENTS/` **off the UI
+/// thread**. Runs inside `Task::perform`, so these (potentially slow,
+/// cloud/network-backed) file reads never block the UI event loop — the same
+/// reason the Surprise directory walk was moved off-thread. Missing files just
+/// yield `None` (the loaders return `Err`).
+async fn load_hvsc_metadata(root: PathBuf) -> HvscMetaLoad {
+    let docs = root.join("DOCUMENTS");
+
+    let sl_path = docs.join("Songlengths.md5");
+    let (songlength, songlength_path) = match playlist::SonglengthDb::load(&sl_path) {
+        Ok(db) => (Some(db), Some(sl_path)),
+        Err(_) => (None, None),
+    };
+
+    let stil_path = docs.join("STIL.txt");
+    let (stil, stil_path_out) = match stil::StilDb::load(&stil_path) {
+        Ok(db) => (Some(db), Some(stil_path)),
+        Err(_) => (None, None),
+    };
+
+    HvscMetaLoad {
+        stil,
+        stil_path: stil_path_out,
+        songlength,
+        songlength_path,
+    }
 }
 
 async fn pick_stil_file() -> Option<PathBuf> {
@@ -5495,7 +5622,12 @@ fn main() -> iced::Result {
         // is itself not unwind-safe and can double-panic in a Cocoa block context.
         if let Some(loc) = info.location() {
             eprintln!("panic at {}:{}: {}", loc.file(), loc.line(), msg);
-            crate::debug_log::log(format_args!("PANIC at {}:{}: {}", loc.file(), loc.line(), msg));
+            crate::debug_log::log(format_args!(
+                "PANIC at {}:{}: {}",
+                loc.file(),
+                loc.line(),
+                msg
+            ));
         } else {
             eprintln!("panic: {}", msg);
             crate::debug_log::log(format_args!("PANIC: {}", msg));
