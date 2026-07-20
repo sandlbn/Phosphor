@@ -414,6 +414,58 @@ pub fn build_flat_index_worker(
     out
 }
 
+/// Pick a random SID/MUS path under `<root>/<category>/` with reservoir
+/// sampling (O(1) memory, one pass). This is the cold path for 🎲 Surprise
+/// Me and **must be run off the UI thread** — the `is_dir` stat and
+/// `WalkDir` perform filesystem I/O that blocks for a long time when the
+/// HVSC root lives on a network/mapped drive or an offline OneDrive
+/// placeholder. Meant to run inside `iced::Task::perform`, mirroring
+/// [`build_flat_index_worker`].
+pub fn random_hvsc_path_walk(root: PathBuf, category: HvscCategory) -> Option<PathBuf> {
+    use rand::Rng;
+    let category_dir = root.join(category.dir_name());
+    // Log the target BEFORE the is_dir() stat — on a dead network drive or an
+    // offline OneDrive placeholder even this stat can block; if it hangs here
+    // this is the last line in the log (now on a worker thread, not the UI).
+    crate::dlog!(
+        "random_hvsc_path_walk: checking is_dir on {}",
+        category_dir.display()
+    );
+    if !category_dir.is_dir() {
+        crate::dlog!(
+            "random_hvsc_path_walk: category dir missing / not a directory (tree not synced?) -> None"
+        );
+        return None;
+    }
+    let mut rng = rand::thread_rng();
+    let mut chosen: Option<PathBuf> = None;
+    let mut seen: u64 = 0;
+    crate::dlog!(
+        "random_hvsc_path_walk: COLD WalkDir starting over {} (follow_links=true)",
+        category_dir.display()
+    );
+    let t0 = std::time::Instant::now();
+    for dirent in WalkDir::new(&category_dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let p = dirent.path();
+        if !p.is_file() || !is_sid_or_mus(p) {
+            continue;
+        }
+        seen += 1;
+        if chosen.is_none() || rng.gen_range(0..seen) == 0 {
+            chosen = Some(p.to_path_buf());
+        }
+    }
+    crate::dlog!(
+        "random_hvsc_path_walk: walk done, seen={seen}, elapsed={}ms",
+        t0.elapsed().as_millis()
+    );
+    chosen
+}
+
 impl HvscBrowser {
     /// Lazy-load a single `PlaylistEntry` for a flat-index hit (used when
     /// the user clicks Play/Add on a global search result). Applies the
@@ -429,44 +481,36 @@ impl HvscBrowser {
         Some(apply_songlength(entry, songlength))
     }
 
-    /// Pick a random SID/MUS path from the current category. Used by the
-    /// 🎲 Surprise Me button — independent of whether the enriched flat
-    /// index is loaded, so hitting Surprise on a cold cache doesn't
-    /// block on the 5-10 s index build. Cost: a fresh WalkDir (~100 ms
-    /// on SSD for a typical category). Uses reservoir sampling so
-    /// memory stays O(1) and files aren't loaded twice.
-    pub fn random_hvsc_path(&self) -> Option<PathBuf> {
-        // If the enriched index is already there, sample from it — same
-        // universe, zero disk I/O.
+    /// Fast path for 🎲 Surprise Me: if the enriched flat index is already
+    /// in memory, sample from it with zero disk I/O. Returns `None` when the
+    /// index isn't warm — the caller must then run [`random_hvsc_path_walk`]
+    /// on a background thread (see [`surprise_cold_target`]), because the
+    /// cold `WalkDir` can block for a long time on a network/cloud-backed
+    /// HVSC root and must never run on the UI thread.
+    ///
+    /// [`surprise_cold_target`]: HvscBrowser::surprise_cold_target
+    pub fn random_hvsc_warm(&self) -> Option<PathBuf> {
         if self.flat_index_loaded && !self.flat_index.is_empty() {
             use rand::Rng;
+            crate::dlog!("random_hvsc_warm: flat_index n={}", self.flat_index.len());
             let i = rand::thread_rng().gen_range(0..self.flat_index.len());
             return Some(self.flat_index[i].path.clone());
         }
-        let root = self.root.as_ref()?;
-        let category_dir = root.join(self.category.dir_name());
-        if !category_dir.is_dir() {
-            return None;
-        }
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let mut chosen: Option<PathBuf> = None;
-        let mut seen: u64 = 0;
-        for dirent in WalkDir::new(&category_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let p = dirent.path();
-            if !p.is_file() || !is_sid_or_mus(p) {
-                continue;
-            }
-            seen += 1;
-            if chosen.is_none() || rng.gen_range(0..seen) == 0 {
-                chosen = Some(p.to_path_buf());
+        None
+    }
+
+    /// Owned `(root, category)` for an off-thread Surprise pick, or `None`
+    /// when no HVSC root is configured. Cheap to clone; hand the result to
+    /// [`random_hvsc_path_walk`] inside a `Task::perform` so the blocking
+    /// walk stays off the UI thread.
+    pub fn surprise_cold_target(&self) -> Option<(PathBuf, HvscCategory)> {
+        match self.root.as_ref() {
+            Some(root) => Some((root.clone(), self.category)),
+            None => {
+                crate::dlog!("surprise_cold_target: no HVSC root set (tree not synced) -> None");
+                None
             }
         }
-        chosen
     }
 
     /// True when no `hvsc_root` is configured — the UI shows the empty

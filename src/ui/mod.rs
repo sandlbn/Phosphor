@@ -354,8 +354,14 @@ pub enum Message {
     /// Add a tune from the flat search index to the playlist.
     HvscBrowserAddFlat(usize),
     /// 🎲 Surprise Me — pick a random tune from the current HVSC category
-    /// and play it. Builds the flat index lazily on first click.
+    /// and play it. The cold-cache directory walk runs off the UI thread
+    /// (it can block on a network/cloud-backed HVSC root); its result comes
+    /// back as `SurprisePicked`.
     HvscBrowserSurpriseMe,
+    /// Result of a Surprise pick — the chosen tune (already header-parsed),
+    /// or `None` if the category was empty/unreachable. Handled by queueing
+    /// and playing it.
+    SurprisePicked(Option<crate::playlist::PlaylistEntry>),
     /// 🎲 Surprise Me (mini / big player button) — dispatches based on
     /// `Config::surprise_source`: `"hvsc"` walks the HVSC library,
     /// `"playlist"` picks a random entry from the loaded playlist.
@@ -435,6 +441,15 @@ pub enum Message {
     StilFileChosen(Option<std::path::PathBuf>),
     HvscRootChanged(String),
     SetHvscRoot(String),
+    /// Open a native folder picker to choose the HVSC root directory.
+    BrowseHvscRoot,
+    /// Result of the HVSC-root folder picker (`None` if cancelled).
+    HvscRootPicked(Option<std::path::PathBuf>),
+    /// Download/refresh both the Songlength DB and STIL.txt from the HVSC base.
+    UpdateMetadata,
+    /// STIL + Songlength databases parsed off the UI thread from
+    /// `<hvsc_root>/DOCUMENTS/` after the root changed — ready to install.
+    HvscMetadataLoaded(Box<crate::HvscMetaLoad>),
 
     // HVSC rsync (pulls the full tune tree)
     HvscRsyncUrlChanged(String),
@@ -3605,17 +3620,13 @@ pub fn settings_panel<'a>(
     .spacing(6);
 
     let dl_section = column![
-        text("HVSC Songlength database:")
+        text("HVSC metadata — Songlengths + STIL:")
             .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
-        text("Fetched from <HVSC base>/DOCUMENTS/Songlengths.md5 — set the HVSC URL above.")
+        text("Downloaded together from <HVSC base>/DOCUMENTS/ (set the HVSC URL above). Also loaded automatically when you set the HVSC root folder below.")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.55, 0.57, 0.62)),
-        tool_button(
-            "⬇ Download / Refresh Songlength.md5",
-            Message::DownloadSonglength
-        ),
-        tool_button("📂 Load Songlength.md5 from file…", Message::LoadSonglength),
+        tool_button("⬇ Update STIL + Songlengths", Message::UpdateMetadata),
         text(download_status)
             .size(font::sized(12.0))
             .color(dl_color),
@@ -3632,40 +3643,37 @@ pub fn settings_panel<'a>(
     };
 
     let stil_section = column![
-        text("HVSC STIL.txt (song info & comments):")
-            .size(font::sized(14.0))
-            .color(Color::from_rgb(0.75, 0.77, 0.82)),
-        text("Fetched from <HVSC base>/DOCUMENTS/STIL.txt — set the HVSC URL above.")
+        text("HVSC root directory — your local C64Music library, used by the Library browser, 🎲 Surprise Me, and metadata lookup:")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.55, 0.57, 0.62)),
-        tool_button("⬇ Download / Refresh STIL.txt", Message::DownloadStil),
-        tool_button("📂 Load STIL.txt from file…", Message::LoadStil),
-        text("HVSC root directory (optional — improves lookup accuracy):")
-            .size(font::sized(11.0))
-            .color(Color::from_rgb(0.55, 0.57, 0.62)),
-        text_input(
-            "e.g. /home/user/C64Music",
-            config.hvsc_root.as_deref().unwrap_or(""),
-        )
-        .on_input(Message::HvscRootChanged)
-        .on_submit(Message::SetHvscRoot(
-            config.hvsc_root.clone().unwrap_or_default(),
-        ))
-        .size(font::sized(12.0))
-        .padding(Padding::from([6, 10]))
-        .width(Length::Fill)
-        .style(|_theme: &Theme, _st| text_input::Style {
-            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
-            border: iced::Border {
-                radius: 3.0.into(),
-                width: 1.0,
-                color: Color::from_rgb(0.25, 0.27, 0.30),
-            },
-            icon: Color::from_rgb(0.5, 0.5, 0.6),
-            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
-            value: Color::from_rgb(0.85, 0.87, 0.9),
-            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
-        }),
+        row![
+            text_input(
+                "e.g. /home/user/C64Music",
+                config.hvsc_root.as_deref().unwrap_or(""),
+            )
+            .on_input(Message::HvscRootChanged)
+            .on_submit(Message::SetHvscRoot(
+                config.hvsc_root.clone().unwrap_or_default(),
+            ))
+            .size(font::sized(12.0))
+            .padding(Padding::from([6, 10]))
+            .width(Length::Fill)
+            .style(|_theme: &Theme, _st| text_input::Style {
+                background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30),
+                },
+                icon: Color::from_rgb(0.5, 0.5, 0.6),
+                placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+                value: Color::from_rgb(0.85, 0.87, 0.9),
+                selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+            }),
+            tool_button("📂 Browse…", Message::BrowseHvscRoot),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center),
         text(stil_status).size(font::sized(12.0)).color(stil_color),
     ]
     .spacing(6);
