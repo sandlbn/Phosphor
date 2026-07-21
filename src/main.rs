@@ -4617,6 +4617,26 @@ impl App {
                     index: i,
                 })
                 .collect();
+            // Liked collection snapshot for the web UI's ❤ Liked tab.
+            // Same shape as recently_played — the tab renders a list
+            // and each row plays via `POST /api/favorites/play/{idx}`.
+            rs.liked = self
+                .favorites
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| remote::RemoteFavouriteEntry {
+                    title: e.title.clone(),
+                    author: e.author.clone(),
+                    released: e.released.clone(),
+                    duration_secs: self
+                        .songlength_db
+                        .as_ref()
+                        .and_then(|db| db.lookup(&e.md5, 0)),
+                    path: e.path.clone(),
+                    index: i,
+                })
+                .collect();
             rs.stream_enabled = self.config.http_stream_enabled;
 
             // Rebuild playlist snapshot when entries OR favourites

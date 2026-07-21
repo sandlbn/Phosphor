@@ -1228,13 +1228,14 @@ pub fn search_bar<'a>(
     } else {
         Color::from_rgb(0.5, 0.5, 0.6)
     };
-    let fav_label = if favorites_only {
-        format!("♥ {favorites_count}")
-    } else {
-        format!("♡ {favorites_count}")
-    };
+    // Filter chip label — no heart glyph on this one. Its job is
+    // "filter this view to only your liked tracks", which is a
+    // filter verb, not a like verb. Uses a filter/lines icon and
+    // spells out the intent so the neighbouring "Play liked"
+    // button can't be confused with it.
+    let fav_label = format!("☰ {favorites_count} Liked only");
 
-    let fav_btn = button(text(fav_label).size(font::sized(12.0)))
+    let fav_btn_raw: Element<'a, Message> = button(text(fav_label).size(font::sized(12.0)))
         .on_press(Message::ToggleFavoritesFilter)
         .padding(Padding::from([4, 10]))
         .style(move |_theme: &Theme, st| {
@@ -1269,7 +1270,12 @@ pub fn search_bar<'a>(
                 },
                 ..Default::default()
             }
-        });
+        })
+        .into();
+    let fav_btn = with_tip(
+        fav_btn_raw,
+        "Filter this playlist to show only your liked tracks (click again to show all)",
+    );
 
     let mut search_row = row![
         text("🔍 ")
@@ -1290,8 +1296,11 @@ pub fn search_bar<'a>(
     // the current playlist with everything that resolves. Only shown
     // when the user has any liked tracks at all.
     let load_liked_btn: Element<'a, Message> = if favorites_count > 0 {
+        // "▶ Play liked" — play glyph, no heart. Reads clearly as
+        // "play the liked collection" now that its neighbour is a
+        // filter chip (no heart there either).
         let btn: Element<'a, Message> = button(
-            text("❤️ Load")
+            text("▶ Play liked")
                 .size(font::sized(12.0))
                 .color(Color::from_rgb(0.85, 0.62, 0.72)),
         )
@@ -1314,18 +1323,23 @@ pub fn search_bar<'a>(
         .into();
         with_tip(
             btn,
-            "Load every liked track as a fresh playlist (resolves paths from disk)",
+            "Replace the current playlist with every liked track (resolves paths from disk; unresolvable rows are reported)",
         )
     } else {
         Space::new().width(Length::Fixed(0.0)).into()
     };
 
+    // `fav_btn` (the client-side "Liked only" filter) is intentionally
+    // NOT pushed here — it was crowding the search bar with a second
+    // heart-adjacent control right next to ▶ Play liked. The message
+    // (`ToggleFavoritesFilter`) + backing state (`favorites_only`,
+    // `rebuild_filter()`) stay wired so bringing the chip back later
+    // is a one-liner. Silence the unused-var warning explicitly.
+    let _ = fav_btn;
     container(
         row![
             search_row,
             Space::new().width(Length::Fixed(8.0)),
-            fav_btn,
-            Space::new().width(Length::Fixed(4.0)),
             load_liked_btn,
             Space::new().width(Length::Fixed(8.0)),
             text(count_text).size(font::sized(12.0)).color(count_color)
