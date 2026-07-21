@@ -5686,8 +5686,103 @@ fn main() -> iced::Result {
         iced::window::icon::from_rgba(img.into_raw(), w, h).expect("Failed to create icon")
     };
 
+    // Bundle the icon glyphs into the binary so the UI symbols/emoji render
+    // identically on every platform. Windows (Segoe UI Symbol/Emoji) and macOS
+    // (Apple Color Emoji) ship these glyphs system-wide, but a bare Linux
+    // desktop (e.g. KDE Plasma, or a non-Flatpak host without the Noto symbol
+    // fonts) may have no font covering them, which left our icons rendering as
+    // tofu boxes. All three fonts are derived from SIL Open Font License Noto
+    // fonts (see assets/fonts/OFL.txt):
+    //   NotoEmoji-Regular      — monochrome emoji (🎲 🔊 📚 🌐 🔇 …)
+    //   NotoSansSymbols2       — geometric shapes, dingbats (▶ ■ ♥ ✓ ✕ …)
+    //   NotoSansMath           — arrows & misc technical (↑ ↓ ↺ ↻ ⟳ ⧉ …)
+    // The two symbol fonts carry "Emoji" in their PostScript name (patched via
+    // fontTools) so cosmic-text 0.15's `Attrs::matches()` unconditionally keeps
+    // them in the fallback set on every platform.
+    const ICON_FONT_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf");
+    const ICON_FONT_SYMBOLS2: &[u8] =
+        include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf");
+    const ICON_FONT_MATH: &[u8] = include_bytes!("../assets/fonts/NotoSansMath-Regular.ttf");
+
+    // Load the icon fonts directly into iced's global font database, up front,
+    // rather than relying solely on `.font(...)` in the application builder.
+    // This guarantees they are present in the shared cosmic-text FontSystem
+    // regardless of renderer/compositor init ordering, which is what makes the
+    // icons appear on hosts that lack matching system fonts.
+    {
+        use std::borrow::Cow;
+        let fs_lock = iced::advanced::graphics::text::font_system();
+        if let Ok(mut fs) = fs_lock.write() {
+            fs.load_font(Cow::Borrowed(ICON_FONT_EMOJI));
+            fs.load_font(Cow::Borrowed(ICON_FONT_SYMBOLS2));
+            fs.load_font(Cow::Borrowed(ICON_FONT_MATH));
+
+            // THE actual Linux fix. On a typical Plasma/GNOME host the system
+            // ships "Noto Color Emoji" (a COLRv1 colour font) but NOT the Noto
+            // symbol fonts. cosmic-text/swash cannot rasterise COLRv1, so when
+            // that font shadows ours in the fallback chain the glyph is *found*
+            // (glyph_id != 0, so it's not tofu) yet paints nothing — the icon
+            // silently vanishes. Worse, Noto Color Emoji also claims the
+            // emoji-presentation symbols (♥ ⚠ ⬆ ⬇ …), so those disappear too.
+            // This is exactly why icons showed under Flatpak (different font
+            // set) but not on the bare host, and why merely *loading* our fonts
+            // didn't help: the broken system font wins the fallback race.
+            //
+            // Dropping the colour-emoji faces forces fallback to our bundled
+            // monochrome NotoEmoji, which every backend can rasterise. Scoped
+            // to Linux so Windows (Segoe UI Emoji) and macOS (Apple Color Emoji)
+            // keep their working colour emoji untouched.
+            #[cfg(target_os = "linux")]
+            let removed_color_emoji = {
+                let raw = fs.raw();
+                let ids: Vec<_> = raw
+                    .db()
+                    .faces()
+                    .filter(|f| {
+                        f.families
+                            .iter()
+                            .any(|(name, _)| name.contains("Color Emoji"))
+                    })
+                    .map(|f| f.id)
+                    .collect();
+                let n = ids.len();
+                for id in ids {
+                    raw.db_mut().remove_face(id);
+                }
+                n
+            };
+
+            // Opt-in runtime diagnostic: `PHOSPHOR_FONT_DEBUG=1 phosphor` prints
+            // whether the icon fonts actually made it into the live font db, so
+            // we can tell "fonts not loaded" apart from "fonts loaded but not
+            // rendered" without guessing.
+            if std::env::var_os("PHOSPHOR_FONT_DEBUG").is_some() {
+                let db = fs.raw().db();
+                let total = db.len();
+                for want in [
+                    "Noto Emoji",
+                    "Phosphor Symbols2 Emoji",
+                    "Phosphor Math Emoji",
+                ] {
+                    let present = db
+                        .faces()
+                        .any(|f| f.families.iter().any(|(name, _)| name == want));
+                    eprintln!("[phosphor font-debug] family {want:?} loaded = {present}");
+                }
+                eprintln!("[phosphor font-debug] total faces in db = {total}");
+                #[cfg(target_os = "linux")]
+                eprintln!(
+                    "[phosphor font-debug] removed {removed_color_emoji} colour-emoji face(s)"
+                );
+            }
+        }
+    }
+
     iced::application(App::boot, App::update, App::view)
         .title(|_: &App| format!("Phosphor v{}", env!("CARGO_PKG_VERSION")))
+        .font(ICON_FONT_EMOJI)
+        .font(ICON_FONT_SYMBOLS2)
+        .font(ICON_FONT_MATH)
         .subscription(App::subscription)
         .theme(App::theme)
         .window_size((

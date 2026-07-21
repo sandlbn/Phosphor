@@ -616,7 +616,7 @@ pub fn track_info_bar<'a>(
             text_color: Color::WHITE,
             ..Default::default()
         });
-        let info_btn = button(text("ⓘ").size(font::sized(15.0)).color(if has_stil_info {
+        let info_btn = button(text("ℹ").size(font::sized(15.0)).color(if has_stil_info {
             Color::from_rgb(0.45, 0.75, 1.0)
         } else {
             Color::from_rgb(0.30, 0.30, 0.40)
@@ -1606,7 +1606,7 @@ pub fn context_menu_overlay<'a>(
             item("▶   Play", Message::ContextMenuPlay),
             item("⤒   Move to top", Message::ContextMenuMoveToTop),
             item(fav_label, Message::ContextMenuToggleFavorite),
-            item("⎘   Copy title", Message::ContextMenuCopyTitle),
+            item("⧉   Copy title", Message::ContextMenuCopyTitle),
             item("✕   Remove from playlist", Message::ContextMenuRemove),
         ]
         .spacing(0)
@@ -4078,7 +4078,7 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
     use iced::widget::scrollable;
 
     let header = row![
-        text(format!("ⓘ  Song Info  (subtune {})", subtune))
+        text(format!("ℹ  Song Info  (subtune {})", subtune))
             .size(font::sized(13.0))
             .color(Color::from_rgb(0.45, 0.75, 1.0))
             .width(Length::Fill),
