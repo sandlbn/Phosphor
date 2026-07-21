@@ -102,6 +102,9 @@ assets = [
   ["README.md", "usr/share/doc/phosphor/README.md", "644"],
   ["LICENSE", "usr/share/doc/phosphor/LICENSE", "644"],
 
+  # SIL OFL text for the Noto icon fonts embedded in the binary (assets/fonts/)
+  ["assets/fonts/OFL.txt", "usr/share/doc/phosphor/OFL-Noto.txt", "644"],
+
   # udev rules (recommended if you need non-root USB access)
   ["packaging/99-usbsid-pico.rules", "etc/udev/rules.d/99-usbsid-pico.rules", "644"],
 
