@@ -167,6 +167,22 @@ pub struct RemoteRecentEntry {
     pub index: usize,
 }
 
+/// A single row served by `GET /api/favorites`. Same shape as the
+/// Recent snapshot — title + author + duration + a per-row index
+/// the browser sends back to `POST /api/favorites/play/{idx}`.
+/// Path stays server-side (skip-serialized) so we don't leak the
+/// filesystem layout to a curious client.
+#[derive(Clone, Serialize)]
+pub struct RemoteFavouriteEntry {
+    pub title: String,
+    pub author: String,
+    pub released: String,
+    pub duration_secs: Option<u32>,
+    #[serde(skip_serializing)]
+    pub path: Option<PathBuf>,
+    pub index: usize,
+}
+
 #[derive(Clone, Serialize)]
 pub struct RemotePlaylistEntry {
     pub index: usize,
@@ -207,6 +223,9 @@ pub struct SharedRemoteState {
     /// Snapshot of the recently-played history, ordered newest-first.
     /// Refreshed in `update_remote_state`; served over `GET /api/recent`.
     pub recently_played: Vec<RemoteRecentEntry>,
+    /// Snapshot of the persisted Liked collection, newest-first (same
+    /// order as `FavoritesDb::entries`). Served over `GET /api/favorites`.
+    pub liked: Vec<RemoteFavouriteEntry>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -899,6 +918,43 @@ pub fn start_server(
                         }
                     }
 
+                    // ── API: Liked collection ────────────────────────────
+                    // GET returns the current Liked snapshot. POST plays
+                    // just that row (falls back to `HvscPlay(path)`
+                    // machinery). Play-all uses the existing
+                    // `/api/favorites/play` LoadFavoritesPlaylist path.
+                    ("GET", "/api/favorites") => {
+                        let json = {
+                            let s = state.lock().unwrap();
+                            serde_json::to_string(&s.liked).unwrap_or_default()
+                        };
+                        respond_json(request, &json);
+                    }
+                    ("POST", p) if p.starts_with("/api/favorites/play/") => {
+                        let idx = p
+                            .strip_prefix("/api/favorites/play/")
+                            .and_then(|s| s.parse::<usize>().ok());
+                        let path = idx.and_then(|i| {
+                            state
+                                .lock()
+                                .unwrap()
+                                .liked
+                                .get(i)
+                                .and_then(|e| e.path.clone())
+                        });
+                        match path {
+                            Some(p) => {
+                                let _ = cmd_tx.try_send(RemoteCmd::HvscPlay(p));
+                                respond_ok(request);
+                            }
+                            None => respond_error(
+                                request,
+                                404,
+                                "Unresolvable — try Load All so the fallback chain heals paths",
+                            ),
+                        }
+                    }
+
                     // ── API: HVSC browse ─────────────────────────────────
                     ("GET", p) if p.starts_with("/api/library/hvsc/authors") => {
                         let query_str = p.split('?').nth(1).unwrap_or("");
@@ -1235,7 +1291,20 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   .heart { background:none; border:none; color:#607080; font-size:22px; cursor:pointer;
     padding:0 8px; vertical-align:middle; }
   .heart.on { color:#ff5f7a; }
-  .track .heart { font-size:16px; padding:2px 8px; }
+  /* Row-level heart: quiet by default so idle rows aren't
+     heart-noisy. Filled state stays visible (that's the "already
+     liked" indicator); empty state hides until hover. Matches
+     Apple Music / Tidal row conventions. */
+  .track .heart { font-size:16px; padding:2px 6px;
+    background:none; border:none; color:#607080; cursor:pointer;
+    opacity:0; transition:opacity 0.12s; }
+  .track:hover .heart { opacity:1; }
+  .track .heart.on { opacity:1; color:#ff5f7a; }
+  @media (hover: none) {
+    /* Touch: unhoverable — show the heart at half opacity when
+       not liked so the affordance is discoverable. */
+    .track .heart { opacity:0.5; }
+  }
   .extras { display:flex; align-items:center; justify-content:center; gap:14px;
     padding:8px 16px; font-size:12px; color:#8090a0; flex-wrap:wrap; }
   .extras select, .extras input[type="range"] { background:#1a1e26; color:#c8ccd0;
@@ -1279,6 +1348,14 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     gap:12px; }
   .settings-lbl { color:#c8ccd0; font-size:13px; }
   .settings-panel .tb-btn.on { background:#1c2e22; border-color:#3a7; color:#5cb870; }
+
+  /* Liked-tab header (count + Play all) */
+  .lib-header { padding:6px 0 8px; border-bottom:1px solid #1a1e26; margin-bottom:6px; }
+  .lib-header-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .lib-header-title { font-size:13px; color:#c8ccd0; }
+  .lk-row-play { background:none; border:1px solid #2a2e36; color:#8090a0;
+    padding:2px 8px; border-radius:4px; cursor:pointer; font-size:12px; }
+  .lk-row-play:hover { color:#5cb870; border-color:#3a7; }
 
   /* Published-playlist preview accordion */
   .pub-preview { background:#0d1218; border-bottom:1px solid #1a1e26;
@@ -1437,7 +1514,7 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
 <div class="now-playing" id="np">
   <div class="np-title">
     <span id="np-title">—</span>
-    <button class="heart" id="np-heart" onclick="toggleFavCurrent()" title="Favourite">&#9825;</button>
+    <button class="heart" id="np-heart" onclick="toggleFavCurrent()" title="Add to Liked">&#9825;</button>
   </div>
   <div class="np-author" id="np-author"></div>
   <div class="np-info" id="np-info"></div>
@@ -1456,7 +1533,6 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     <button onclick="cmd('subtune/next')" title="Next subtune">&#9654;</button>
   </span>
   <button onclick="cmd('surprise')" title="Surprise me — random HVSC tune">&#127922;</button>
-  <button onclick="loadLiked()" title="Load my liked tracks as a fresh playlist">&#10084;&#65039;</button>
   <button onclick="toggleListen()" id="listen-btn" title="Listen in browser">&#128266;</button>
   <span id="stream-state" style="font-size:11px;color:#8090a0;margin-left:4px;">idle</span>
 </div>
@@ -1473,8 +1549,8 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
 <audio id="stream-audio"></audio>
 
 <div class="extras">
-  <label>&#128554;
-    <select id="sleep" onchange="setSleep(this.value)">
+  <label title="Sleep timer — Phosphor stops playback after the chosen delay">&#128554;
+    <select id="sleep" onchange="setSleep(this.value)" title="Sleep timer">
       <option value="0">Off</option>
       <option value="15">15 min</option>
       <option value="30">30 min</option>
@@ -1482,53 +1558,64 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     </select>
     <span class="sleep-countdown" id="sleep-cd"></span>
   </label>
-  <label>&#128266;
+  <label title="Master volume — applies to every playback engine (USB / SIDLite / reSID / U64)">&#128266;
     <input type="range" id="vol" min="0" max="100" step="1" value="100"
-      oninput="setVolume(this.value)">
+      oninput="setVolume(this.value)" title="Master volume 0–100%">
   </label>
-  <button onclick="cmd('shuffle')" id="shuf-btn" title="Shuffle"
+  <button onclick="cmd('shuffle')" id="shuf-btn" title="Shuffle — random-order playback of the current playlist"
     style="background:none;border:1px solid #2a2e36;color:#8090a0;padding:4px 8px;border-radius:4px;cursor:pointer;">&#128256;</button>
-  <button onclick="cmd('repeat')" id="rep-btn" title="Repeat"
+  <button onclick="cmd('repeat')" id="rep-btn" title="Repeat — cycle through Off → All → One"
     style="background:none;border:1px solid #2a2e36;color:#8090a0;padding:4px 8px;border-radius:4px;cursor:pointer;">&#8634; Off</button>
 </div>
 
 <div style="display:flex;gap:6px;justify-content:center;margin-top:8px;">
-  <button class="lib-toggle" onclick="toggleLibrary()" id="lib-toggle-btn">&#128218; Library</button>
-  <button class="lib-toggle" onclick="toggleSettings()" id="settings-toggle-btn">&#9881; Settings</button>
+  <button class="lib-toggle" onclick="toggleLibrary()" id="lib-toggle-btn"
+    title="Open the Library panel — Playlists, Liked, HVSC browser, Recent history">&#128218; Library</button>
+  <button class="lib-toggle" onclick="toggleSettings()" id="settings-toggle-btn"
+    title="Quick settings — Skip RSID, Force stereo, Surprise source, Repeat, Shuffle">&#9881; Settings</button>
 </div>
 
 <!-- Quick settings drawer. Mirrors the desktop Settings → General
      tab's toggles so a phone user can flip Skip RSID / Force stereo /
      Surprise source without walking to the desk. -->
 <div class="settings-panel" id="settings-panel" style="display:none;">
-  <div class="settings-row">
+  <div class="settings-row" title="RSID tunes need a real C64 to run correctly. When enabled, Phosphor auto-skips them and moves to the next PSID.">
     <label class="settings-lbl">Skip RSID tunes</label>
-    <button class="tb-btn" id="set-skip-rsid" onclick="postSettings('skip-rsid')">—</button>
+    <button class="tb-btn" id="set-skip-rsid" onclick="postSettings('skip-rsid')"
+      title="Toggle: auto-skip RSID tracks">—</button>
   </div>
-  <div class="settings-row">
+  <div class="settings-row" title="Mirrors SID1 writes onto SID2's register bank so mono tunes still hit both audio channels.">
     <label class="settings-lbl">Force stereo (2SID mirror)</label>
-    <button class="tb-btn" id="set-force-stereo" onclick="postSettings('force-stereo')">—</button>
+    <button class="tb-btn" id="set-force-stereo" onclick="postSettings('force-stereo')"
+      title="Toggle: mirror SID1 → both channels">—</button>
   </div>
-  <div class="settings-row">
+  <div class="settings-row" title="What the 🎲 Surprise button picks from — the whole HVSC tree or just the tracks in your current playlist.">
     <label class="settings-lbl">🎲 Surprise source</label>
     <div style="display:flex;gap:4px;">
-      <button class="tb-btn" id="set-surp-hvsc" onclick="setSurpriseSource('hvsc')">HVSC</button>
-      <button class="tb-btn" id="set-surp-pl" onclick="setSurpriseSource('playlist')">Playlist</button>
+      <button class="tb-btn" id="set-surp-hvsc" onclick="setSurpriseSource('hvsc')"
+        title="Surprise picks a random tune from the entire HVSC library">HVSC</button>
+      <button class="tb-btn" id="set-surp-pl" onclick="setSurpriseSource('playlist')"
+        title="Surprise picks a random tune from the currently-loaded playlist">Playlist</button>
     </div>
   </div>
-  <div class="settings-row">
+  <div class="settings-row" title="Repeat mode — Off plays the queue once, One loops the current tune, All loops the whole playlist.">
     <label class="settings-lbl">🔁 Repeat</label>
     <div style="display:flex;gap:4px;">
-      <button class="tb-btn" data-rep="off" onclick="setRepeat('off')">Off</button>
-      <button class="tb-btn" data-rep="one" onclick="setRepeat('one')">One</button>
-      <button class="tb-btn" data-rep="all" onclick="setRepeat('all')">All</button>
+      <button class="tb-btn" data-rep="off" onclick="setRepeat('off')"
+        title="Play the queue once then stop">Off</button>
+      <button class="tb-btn" data-rep="one" onclick="setRepeat('one')"
+        title="Loop the current tune forever">One</button>
+      <button class="tb-btn" data-rep="all" onclick="setRepeat('all')"
+        title="Loop the whole playlist">All</button>
     </div>
   </div>
-  <div class="settings-row">
+  <div class="settings-row" title="Shuffle plays tracks in a random order without repeats until every tune has been played once.">
     <label class="settings-lbl">🔀 Shuffle</label>
     <div style="display:flex;gap:4px;">
-      <button class="tb-btn" data-shuf="on" onclick="setShuffle(true)">On</button>
-      <button class="tb-btn" data-shuf="off" onclick="setShuffle(false)">Off</button>
+      <button class="tb-btn" data-shuf="on" onclick="setShuffle(true)"
+        title="Enable shuffle">On</button>
+      <button class="tb-btn" data-shuf="off" onclick="setShuffle(false)"
+        title="Disable shuffle (play in queue order)">Off</button>
     </div>
   </div>
 </div>
@@ -1536,12 +1623,18 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
 <div class="lib" id="lib" style="display:none;">
   <div class="lib-tabs">
     <div class="lib-tab active" id="lt-pl" onclick="showLibTab('pl')">&#128203; Playlists</div>
+    <div class="lib-tab" id="lt-lk" onclick="showLibTab('lk')">&#10084; Liked</div>
     <div class="lib-tab" id="lt-hv" onclick="showLibTab('hv')">&#128194; HVSC</div>
     <div class="lib-tab" id="lt-rc" onclick="showLibTab('rc')">&#128276; Recent</div>
   </div>
 
   <div id="lib-pl">
     <div class="lib-list" id="lib-pl-list"></div>
+  </div>
+
+  <div id="lib-lk" style="display:none;">
+    <div class="lib-header" id="lib-lk-header"></div>
+    <div class="lib-list" id="lib-lk-list"></div>
   </div>
 
   <div id="lib-rc" style="display:none;">
@@ -1556,7 +1649,8 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     </div>
     <div id="lib-hv-crumb" class="lib-back" onclick="hvBack()" style="display:none;">&#8592; Back to authors</div>
     <div id="hv-sync-row" style="display:flex;gap:6px;align-items:center;padding:6px 0;font-size:12px;color:#8090a0;">
-      <button class="tb-btn" id="hv-sync-btn" onclick="toggleHvscSync()">&#8595; Sync HVSC</button>
+      <button class="tb-btn" id="hv-sync-btn" onclick="toggleHvscSync()"
+        title="Trigger an rsync of the High Voltage SID Collection from hvsc.brona.dk">&#8595; Sync HVSC</button>
       <span id="hv-sync-status"></span>
     </div>
     <div class="lib-list" id="lib-hv-list"></div>
@@ -1579,8 +1673,8 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
   <button class="tb-btn" onclick="clearPlaylist()" title="Remove every track from the playlist">
     &#128465; Clear
   </button>
-  <button class="tb-btn" id="fav-only-chip" onclick="toggleFavOnly()" title="Show only hearted tracks">
-    &#9825; Favourites only
+  <button class="tb-btn" id="fav-only-chip" onclick="toggleFavOnly()" title="Show only your liked tracks in this playlist">
+    &#9776; Liked only
   </button>
   <select class="tb-select" id="sort-select" onchange="sortPlaylist(this.value)" title="Reorder the playlist by a column">
     <option value="">Sort by…</option>
@@ -1603,15 +1697,15 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     <div class="npm-title" id="npm-title">—</div>
     <div class="npm-author" id="npm-author"></div>
   </div>
-  <button onclick="cmd('prev')" title="Previous">&#9198;</button>
-  <button onclick="cmd('pause')" title="Play/Pause" id="npm-pp">&#9208;</button>
-  <button onclick="cmd('next')" title="Next">&#9197;</button>
+  <button onclick="cmd('prev')" title="Previous track">&#9198;</button>
+  <button onclick="cmd('pause')" title="Play / Pause" id="npm-pp">&#9208;</button>
+  <button onclick="cmd('next')" title="Next track">&#9197;</button>
 </div>
 
 <div id="toast-stack"></div>
 <div id="ctx-menu" onclick="event.stopPropagation()">
   <div class="ctx-item" onclick="ctxAction('play')"><span>&#9654;</span> Play now</div>
-  <div class="ctx-item" onclick="ctxAction('fav')"><span>&#9829;</span> <span id="ctx-fav-label">Toggle favourite</span></div>
+  <div class="ctx-item" onclick="ctxAction('fav')"><span>&#9829;</span> <span id="ctx-fav-label">Toggle Liked</span></div>
   <div class="ctx-sep"></div>
   <div class="ctx-item" onclick="ctxAction('top')"><span>&#8593;</span> Move to top</div>
   <div class="ctx-item" onclick="ctxAction('up')"><span>&#8593;</span> Move up</div>
@@ -1636,15 +1730,11 @@ async function cmd(c){
   setTimeout(poll,150);
 }
 
-// Load every hearted track as a fresh playlist. Server resolves
-// each MD5 → path via the stored path or the HVSC songlength DB,
-// skipping any that can't be located. Playlist auto-refresh in
-// the UI is driven by the `playlist_version` polling.
-async function loadLiked(){
-  await fetch('/api/favorites/play',{method:'POST'});
-  setTimeout(poll,200);
-  setTimeout(()=>loadPlaylist(false),400);
-}
+// (Legacy `loadLiked` transport-row helper removed — the
+// "Load liked as playlist" verb now lives inside the Library panel's
+// ❤ Liked tab as `playAllLiked()`, matching Spotify's convention
+// that the Liked collection is a destination, not a transport
+// control.)
 
 // ── Server-side audio → browser <audio> ────────────────────────
 // The 🔊 button toggles a hidden <audio> element that streams MP3
@@ -1839,13 +1929,79 @@ function toggleLibrary(){
 
 function showLibTab(which){
   document.getElementById('lt-pl').classList.toggle('active',which==='pl');
+  document.getElementById('lt-lk').classList.toggle('active',which==='lk');
   document.getElementById('lt-hv').classList.toggle('active',which==='hv');
   document.getElementById('lt-rc').classList.toggle('active',which==='rc');
   document.getElementById('lib-pl').style.display=which==='pl'?'block':'none';
+  document.getElementById('lib-lk').style.display=which==='lk'?'block':'none';
   document.getElementById('lib-hv').style.display=which==='hv'?'block':'none';
   document.getElementById('lib-rc').style.display=which==='rc'?'block':'none';
   if(which==='hv'&&!hvscAuthor){loadHvscAuthors();}
   if(which==='rc'){loadRecentlyPlayed();}
+  if(which==='lk'){loadLiked();}
+}
+
+// ── Liked collection tab ──────────────────────────────────────
+// The primary "Liked destination" — modeled on Spotify's Liked
+// Songs. Header shows total + Play-all; each row plays that one
+// track and can unlike from here without leaving the tab.
+async function loadLiked(){
+  const hdr=document.getElementById('lib-lk-header');
+  const list=document.getElementById('lib-lk-list');
+  list.innerHTML='<div class="lib-empty">Loading…</div>';
+  hdr.innerHTML='';
+  try{
+    const r=await fetch('/api/favorites');
+    const rows=await r.json();
+    if(!rows||rows.length===0){
+      hdr.innerHTML='';
+      list.innerHTML='<div class="lib-empty">Nothing liked yet. Tap ♥ next to any track to add it here.</div>';
+      return;
+    }
+    hdr.innerHTML='<div class="lib-header-row">'+
+      '<div class="lib-header-title">'+rows.length+' liked track'+(rows.length===1?'':'s')+'</div>'+
+      '<button class="tb-btn" onclick="playAllLiked()">▶ Play all liked</button>'+
+      '</div>';
+    list.innerHTML=rows.map(t=>{
+      const dur=t.duration_secs?fmtTime(t.duration_secs):'';
+      const author=t.author?' <span style="color:#607080;">— '+esc(t.author)+'</span>':'';
+      return '<div class="lib-row" data-lk-idx="'+t.index+'">'+
+        '<div class="lib-name">'+esc(t.title||'(untitled)')+author+'</div>'+
+        '<span class="lib-meta">'+dur+'</span>'+
+        '<button class="lk-row-play" data-lk-play="'+t.index+'" title="Play this track">▶</button>'+
+        '</div>';
+    }).join('');
+    // Wire click delegation for row + play button.
+    list.querySelectorAll('[data-lk-idx]').forEach(row=>{
+      const idx=parseInt(row.getAttribute('data-lk-idx'));
+      row.addEventListener('click',(e)=>{
+        if(e.target.closest('button')) return;
+        playLikedRow(idx);
+      });
+    });
+    list.querySelectorAll('[data-lk-play]').forEach(btn=>{
+      const idx=parseInt(btn.getAttribute('data-lk-play'));
+      btn.addEventListener('click',(e)=>{ e.stopPropagation(); playLikedRow(idx); });
+    });
+  }catch(e){
+    list.innerHTML='<div class="lib-empty">Failed to load Liked collection.</div>';
+  }
+}
+async function playAllLiked(){
+  const r=await fetch('/api/favorites/play',{method:'POST'});
+  if(r.ok){ toast('Loaded all liked'); toggleLibrary(); setTimeout(poll,200); }
+}
+async function playLikedRow(idx){
+  const r=await fetch('/api/favorites/play/'+idx,{method:'POST'});
+  if(r.ok){ toast('Playing from Liked'); setTimeout(poll,200); }
+  else { toast('Track not resolvable — try Play all liked','danger'); }
+}
+// Convenience: open the Library panel focused on the Liked tab
+// (used by the empty-state button in the playlist view).
+function openLikedTab(){
+  const lib=document.getElementById('lib');
+  if(lib && lib.style.display==='none') toggleLibrary();
+  showLibTab('lk');
 }
 
 // ── Settings drawer ─────────────────────────────────────────────
@@ -2115,7 +2271,7 @@ async function loadHvscTunes(author){
       return '<div class="lib-row" onclick="playHvsc(\''+p+'\')">'+
         '<div><div class="lib-name">'+esc(t.title)+'</div>'+
         '<div style="font-size:11px;color:#607080;">'+meta+'</div></div>'+
-        '<button onclick="addHvsc(\''+p+'\',event)" style="background:none;border:1px solid #2a2e36;color:#5cb870;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;">+</button>'+
+        '<button onclick="addHvsc(\''+p+'\',event)" title="Add this tune to the current playlist without playing" style="background:none;border:1px solid #2a2e36;color:#5cb870;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;">+</button>'+
         '</div>';
     }).join('');
   }catch(e){
@@ -2208,11 +2364,12 @@ async function poll(){
         }
       }
     }
-    // Heart button (♥/♡) reflects current-track favourite state
+    // Now-playing heart reflects current-track Liked state.
     const heart=document.getElementById('np-heart');
     if(heart){
       heart.innerHTML=status.is_favorite?'♥':'♡';
       heart.classList.toggle('on',!!status.is_favorite);
+      heart.title=status.is_favorite?'Remove from Liked':'Add to Liked';
     }
     // Shuffle + repeat toggle button state
     const shufBtn=document.getElementById('shuf-btn');
@@ -2316,10 +2473,10 @@ function renderList(totalAll){
   if(visible.length===0 && !loading){
     if(favOnly){
       el.innerHTML='<div class="pl-empty">'+
-        '<div class="em-hint">No favourites in the current playlist.</div>'+
+        '<div class="em-hint">No liked tracks in this playlist.</div>'+
         '<div class="em-actions">'+
         '<button onclick="toggleFavOnly()">Show all tracks</button>'+
-        '<button onclick="loadLiked()">❤️ Load Liked as playlist</button>'+
+        '<button onclick="openLikedTab()">❤ Open Liked collection</button>'+
         '</div></div>';
     } else if(q){
       el.innerHTML='<div class="pl-empty">'+
@@ -2331,7 +2488,7 @@ function renderList(totalAll){
       el.innerHTML='<div class="pl-empty">'+
         '<div class="em-hint">Your playlist is empty.</div>'+
         '<div class="em-actions">'+
-        '<button onclick="loadLiked()">❤️ Load Liked</button>'+
+        '<button onclick="openLikedTab()">❤ Open Liked collection</button>'+
         '<button onclick="toggleLibrary()">📚 Open Library</button>'+
         '<button onclick="pickImportM3U()">↑ Import M3U</button>'+
         '</div></div>';
@@ -2348,8 +2505,13 @@ function renderList(totalAll){
       '<div class="info"><div class="t-title">'+esc(t.title)+'</div>'+
       '<div class="t-author">'+esc(t.author)+'</div></div>'+
       '<span class="dur">'+dur+'</span>'+
-      '<button class="'+favClass+'" data-role="fav" title="Toggle favourite">'+favGlyph+'</button>'+
+      // Row-level heart lives INSIDE the hover-actions cluster so it
+      // no longer pollutes idle rows. A filled \u2665 shows even at rest
+      // if the track is already liked (that's the "state indicator"
+      // \u2014 quiet but present, matches Apple Music's style).
       '<div class="actions">'+
+      '<button class="'+favClass+'" data-role="fav" title="'+
+        (t.is_favorite?'Remove from Liked':'Add to Liked')+'">'+favGlyph+'</button>'+
       '<button data-role="menu" title="More actions">\u22ee</button>'+
       '</div>'+
       '</div>';
@@ -2479,7 +2641,10 @@ function toggleFavOnly(){
   favOnly=!favOnly;
   const chip=document.getElementById('fav-only-chip');
   chip.classList.toggle('active',favOnly);
-  chip.innerHTML=(favOnly?'♥':'♡')+' Favourites only';
+  // Same filter icon in both states — no heart glyph on this chip
+  // any more (chip is a filter, not a like action). Active state
+  // colour is what tells the user it's engaged.
+  chip.innerHTML='☰ Liked only';
   animate(()=>renderList(total));
 }
 async function sortPlaylist(col){
@@ -2522,7 +2687,7 @@ function openCtxMenu(idx,x,y){
   const m=document.getElementById('ctx-menu');
   const t=entries.find(e=>e.index===idx);
   document.getElementById('ctx-fav-label').textContent=
-    (t&&t.is_favorite)?'Remove favourite':'Add favourite';
+    (t&&t.is_favorite)?'Remove from Liked':'Add to Liked';
   m.style.display='block';
   const rect=m.getBoundingClientRect();
   const w=rect.width||220, h=rect.height||300;
@@ -2626,7 +2791,7 @@ function showHelpOverlay(){
       '<div style="display:grid;grid-template-columns:80px 1fr;gap:6px 12px;">'+
       '<code>Space</code><span>Play / Pause</span>'+
       '<code>← / →</code><span>Previous / Next track</span>'+
-      '<code>F or H</code><span>Toggle favourite</span>'+
+      '<code>F or H</code><span>Toggle Liked</span>'+
       '<code>S</code><span>Surprise Me</span>'+
       '<code>R</code><span>Toggle shuffle</span>'+
       '<code>L</code><span>Toggle Library</span>'+
