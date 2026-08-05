@@ -3204,6 +3204,73 @@ impl App {
                 // No-op — actual drain happens in poll_status() each Tick.
             }
 
+            Message::HvscZipUrlChanged(url) => {
+                let trimmed = url.trim();
+                self.config.hvsc_zip_url = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                self.config.save();
+            }
+
+            Message::HvscZipSyncStart => {
+                if self.hvsc_sync.is_some() {
+                    // Another sync (rsync or zip) is already running — ignore.
+                } else {
+                    // Same "user override wins, else derive from mirror
+                    // host + known version" resolution the UI uses.
+                    let url = self
+                        .config
+                        .hvsc_zip_url
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            hvsc_sync::default_hvsc_zip_url(
+                                &self.config.hvsc_rsync_url,
+                                self.config.hvsc_known_version.as_deref(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    if url.trim().is_empty() {
+                        self.hvsc_sync_status =
+                            "No archive URL set and none could be derived from your \
+                             HVSC mirror — paste one under Fast first-time sync."
+                                .to_string();
+                        return Task::none();
+                    }
+                    let dest = match self
+                        .config
+                        .hvsc_root
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from)
+                        .or_else(hvsc_sync::default_hvsc_root)
+                    {
+                        Some(p) => p,
+                        None => {
+                            self.hvsc_sync_status =
+                                "Cannot determine destination — set HVSC root manually."
+                                    .to_string();
+                            return Task::none();
+                        }
+                    };
+                    match hvsc_sync::HvscSyncHandle::start_from_zip(&url, &dest) {
+                        Ok(handle) => {
+                            self.config.hvsc_root =
+                                Some(dest.to_string_lossy().into_owned());
+                            self.config.save();
+                            self.hvsc_sync = Some(handle);
+                            self.hvsc_sync_status = "Starting zip download…".to_string();
+                            self.hvsc_sync_progress = None;
+                        }
+                        Err(e) => {
+                            self.hvsc_sync_status = format!("Error: {e}");
+                        }
+                    }
+                }
+            }
+
             Message::DownloadStil => {
                 self.stil_status = "Downloading…".to_string();
                 let url = self.config.hvsc_rsync_url.clone();
