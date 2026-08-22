@@ -1334,9 +1334,11 @@ fn strip_c64music_prefix(p: &Path) -> Option<PathBuf> {
 ///
 /// Known-good pattern (2020+): brona.dk publishes
 /// `https://hvsc.brona.dk/HVSC/HVSC_<N>-all-of-them.7z` for every
-/// release. Version defaults to `LATEST_KNOWN_HVSC_VERSION` if the
-/// version-check hasn't run yet on this install; on failure the friendly
-/// error tells the user to bump the number.
+/// release, and the STIL version in the tree matches that `<N>`.
+///
+/// `known_version` comes from `stil::check_hvsc_update` at startup, which is
+/// what keeps this URL current; the constant below is only reached before
+/// that answers or when the mirror is unreachable.
 pub fn default_hvsc_zip_url(rsync_url: &str, known_version: Option<&str>) -> Option<String> {
     let host = url::Url::parse(rsync_url.trim())
         .ok()
@@ -1353,9 +1355,10 @@ pub fn default_hvsc_zip_url(rsync_url: &str, known_version: Option<&str>) -> Opt
     }
 }
 
-/// Fallback when we haven't yet asked the mirror what version it's on.
-/// Bump when a new HVSC release ships; older installs will still self-
-/// update via the version-check on next launch.
+/// Last-resort fallback only — a successful version check takes precedence.
+/// HVSC ships ~every six months, so this drifts twice a year. Verified
+/// 2026-08-22: #85 current, #86 not yet published. Bumping is optional; an
+/// online install discovers the real number.
 const LATEST_KNOWN_HVSC_VERSION: u32 = 85;
 
 /// Platform-appropriate default destination if `hvsc_root` is unset.

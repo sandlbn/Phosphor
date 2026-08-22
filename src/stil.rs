@@ -512,6 +512,44 @@ pub fn parse_stil_version(line: &str) -> Option<u32> {
     None
 }
 
+/// Read the HVSC version from a local `STIL.txt` header. Reads 1 KB rather
+/// than parsing the ~15 MB file. ISO-8859-1, matching `StilDb::load`.
+pub fn peek_stil_version(path: &std::path::Path) -> Option<u32> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 1024];
+    let n = f.read(&mut buf).ok()?;
+    let snippet: String = buf[..n].iter().map(|&b| b as char).collect();
+    snippet.lines().take(15).find_map(parse_stil_version)
+}
+
+/// Should the HVSC tree's databases replace the cached ones in the config dir?
+///
+/// Strictly newer only. After an in-app sync both are the same release, so
+/// nothing switches — that keeps Phosphor off the stale `DOCUMENTS/` copy it
+/// used to follow.
+pub fn tree_db_is_newer(cached: Option<u32>, tree: Option<u32>) -> bool {
+    match (cached, tree) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(cached), Some(tree)) => tree > cached,
+    }
+}
+
+/// Would applying `incoming` lose ground against what is already loaded?
+///
+/// Lets the startup tree scan and a mirror download run concurrently: the
+/// download always applies, and a tree load arriving late with older data is
+/// dropped instead of overwriting it. Unversioned incoming data counts as a
+/// downgrade unless nothing is loaded yet.
+pub fn is_downgrade(current: Option<u32>, incoming: Option<u32>) -> bool {
+    match (current, incoming) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(current), Some(incoming)) => incoming < current,
+    }
+}
+
 /// Result of an HVSC update check.
 #[derive(Debug, Clone)]
 pub struct HvscUpdateInfo {
@@ -587,4 +625,88 @@ pub async fn check_hvsc_update(hvsc_base: &str) -> Result<HvscUpdateInfo, String
         }
     }
     Err("Could not parse HVSC version from remote header".to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique per test so parallel runs can't collide.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("phosphor_stil_{tag}_{}.txt", std::process::id()))
+    }
+
+    #[test]
+    fn parses_version_from_header_variants() {
+        assert_eq!(
+            parse_stil_version("#  STIL v85 - SID Tune Information List (June 28, 2026)"),
+            Some(85)
+        );
+        assert_eq!(parse_stil_version("# STIL v84"), Some(84));
+        assert_eq!(parse_stil_version("#  HVSC #83 - something"), Some(83));
+        assert_eq!(parse_stil_version("#  no version here"), None);
+    }
+
+    #[test]
+    fn tree_copy_wins_only_when_strictly_newer() {
+        // Manual update: tree ahead of our cache.
+        assert!(tree_db_is_newer(Some(85), Some(86)));
+        // Regression guard — equal versions must never switch (post-sync case).
+        assert!(!tree_db_is_newer(Some(85), Some(85)));
+        assert!(!tree_db_is_newer(Some(85), Some(80)));
+        assert!(tree_db_is_newer(None, Some(85)));
+        assert!(!tree_db_is_newer(Some(85), None));
+        assert!(!tree_db_is_newer(None, None));
+    }
+
+    #[test]
+    fn opportunistic_load_never_loses_ground() {
+        // Download landed first with a newer release; a late tree load
+        // must not drag us back.
+        assert!(is_downgrade(Some(87), Some(86)));
+        assert!(!is_downgrade(Some(86), Some(86)));
+        assert!(!is_downgrade(Some(85), Some(86)));
+        assert!(is_downgrade(Some(85), None));
+        // Nothing loaded — lets an offline first launch adopt the tree's copy.
+        assert!(!is_downgrade(None, Some(85)));
+        assert!(!is_downgrade(None, None));
+    }
+
+    #[test]
+    fn peeks_version_without_reading_whole_file() {
+        let path = temp_path("peek");
+        // Body far exceeds the 1 KB peek budget.
+        let mut body = String::from(
+            "##############################################\n             #\n             #  STIL v85 - SID Tune Information List (June 28, 2026)\n             #\n             ##############################################\n",
+        );
+        body.push_str(&"/MUSICIANS/X/Filler.sid\n COMMENT: padding\n".repeat(4000));
+        std::fs::write(&path, &body).unwrap();
+
+        assert_eq!(peek_stil_version(&path), Some(85));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn peek_handles_latin1_and_missing_files() {
+        // Non-ASCII header byte: a strict UTF-8 decode would abort here.
+        let path = temp_path("latin1");
+        let mut bytes = b"#  Fren\xe7h byte above\n#  STIL v84 - list\n".to_vec();
+        bytes.extend_from_slice(b"# trailing\n");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(peek_stil_version(&path), Some(84));
+        std::fs::remove_file(&path).ok();
+
+        // Absent file → None.
+        assert_eq!(
+            peek_stil_version(&std::env::temp_dir().join("phosphor_stil_definitely_absent.txt")),
+            None
+        );
+
+        // Present but versionless.
+        let path = temp_path("noversion");
+        std::fs::write(&path, b"# just a header\n# with no version\n").unwrap();
+        assert_eq!(peek_stil_version(&path), None);
+        std::fs::remove_file(&path).ok();
+    }
 }
