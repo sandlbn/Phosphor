@@ -1,11 +1,19 @@
 # Rust build output
 /target/
+# Separate cargo target dir used by the Arch PKGBUILD
+/target-arch/
 
 # Packaging / distribution artifacts (installers, bundles, .deb/.pkg/.exe)
 /dist/
 
 # CI signing working directories (SignPath downloads signed artifacts here)
 /signed/
+
+# makepkg working directories and output (PKGBUILD itself is tracked)
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.zst
+/packaging/arch/*.log
 
 # Code-signing material — never commit private keys / certificates
 *.pfx

@@ -183,18 +183,46 @@ This produces `dist\Phosphor-<version>-windows-x86_64-setup.exe`. The script bui
 
 ### Linux
 
-1. Add a udev rule for the USBSID-Pico (VID `cafe`):
+#### Arch Linux
+
+Build and install a real package straight from a checkout — it ships the udev
+rule and applies it to an already-connected board, so the USBSID-Pico works
+without a re-plug:
 
 ```bash
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="cafe", MODE="0666"' | sudo tee /etc/udev/rules.d/99-usbsid.rules
-sudo udevadm control --reload-rules
+make arch_install       # makepkg -si
 ```
 
-2. Build and run:
+Use `make arch_pkg` to produce `dist/phosphor-<version>-1-x86_64.pkg.tar.zst`
+without installing it. The PKGBUILD lives in [packaging/arch/](packaging/arch/).
+
+#### Debian / Ubuntu
+
+Grab the `.deb` from [Releases](https://github.com/sandlbn/Phosphor/releases),
+or build one with `make linux_deb`. It ships the same udev rule.
+
+#### From source
 
 ```bash
 cargo build --release
 ./target/release/phosphor
+```
+
+Building from source does **not** install the udev rule, and without it the
+USBSID-Pico is inaccessible to a non-root user — Phosphor falls back to the
+emulated engines and reports the device as unavailable. Install it by hand:
+
+```bash
+sudo cp packaging/99-usbsid-pico.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=cafe
+```
+
+Confirm it took effect — `/dev/usbsid0` should exist and the underlying
+`/dev/bus/usb/*` node should be writable by your user:
+
+```bash
+ls -l /dev/usbsid*
 ```
 
 ## Configuration
