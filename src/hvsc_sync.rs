@@ -952,9 +952,7 @@ async fn run_zip_sync(
         files_total: extracted,
         bytes_done,
         bytes_total,
-        current: format!(
-            "Done. {extracted} new files, {skipped} already present{corrupt_note}."
-        ),
+        current: format!("Done. {extracted} new files, {skipped} already present{corrupt_note}."),
     });
     let _ = tx.send(HvscSyncEvent::Done(Ok(())));
     Ok(())
@@ -971,8 +969,8 @@ fn extract_zip(
     tx: &Sender<HvscSyncEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(u32, u32, u32), String> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("open {}: {e}", zip_path.display()))?;
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("open {}: {e}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|e| format!("Not a valid zip archive: {e}"))?;
     let total = archive.len() as u32;
@@ -1097,8 +1095,7 @@ enum ArchiveKind {
 /// links. Magic bytes are the ground truth.
 fn detect_archive_kind(path: &Path) -> Result<ArchiveKind, String> {
     use std::io::Read as _;
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut buf = [0u8; 8];
     let n = f
         .read(&mut buf)
@@ -1131,8 +1128,8 @@ fn extract_7z(
     tx: &Sender<HvscSyncEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(u32, u32, u32), String> {
-    let file = std::fs::File::open(sz_path)
-        .map_err(|e| format!("open {}: {e}", sz_path.display()))?;
+    let file =
+        std::fs::File::open(sz_path).map_err(|e| format!("open {}: {e}", sz_path.display()))?;
     // sevenz-rust2's ArchiveReader::new takes (source, password). It reads
     // the archive length via Seek internally — no separate file-size arg
     // (unlike the abandoned sevenz-rust 0.6).
@@ -1173,9 +1170,12 @@ fn extract_7z(
         // Sanitise: reject entries with `..` / absolute paths. Same
         // discipline as the zip extractor.
         let raw = Path::new(entry.name());
-        let has_escape = raw
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir));
+        let has_escape = raw.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        });
         if has_escape {
             skipped += 1;
             return Ok(true);
@@ -1188,8 +1188,7 @@ fn extract_7z(
 
         if entry.is_directory() {
             if let Err(e) = std::fs::create_dir_all(&out_path) {
-                *hard_err.borrow_mut() =
-                    Some(format!("mkdir {}: {e}", out_path.display()));
+                *hard_err.borrow_mut() = Some(format!("mkdir {}: {e}", out_path.display()));
                 return Ok(false);
             }
             return Ok(true);
@@ -1206,16 +1205,14 @@ fn extract_7z(
 
         if let Some(parent) = out_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                *hard_err.borrow_mut() =
-                    Some(format!("mkdir {}: {e}", parent.display()));
+                *hard_err.borrow_mut() = Some(format!("mkdir {}: {e}", parent.display()));
                 return Ok(false);
             }
         }
         let mut out = match std::fs::File::create(&out_path) {
             Ok(f) => f,
             Err(e) => {
-                *hard_err.borrow_mut() =
-                    Some(format!("create {}: {e}", out_path.display()));
+                *hard_err.borrow_mut() = Some(format!("create {}: {e}", out_path.display()));
                 return Ok(false);
             }
         };
@@ -1235,8 +1232,7 @@ fn extract_7z(
                 corrupt += 1;
             }
             Err(e) => {
-                *hard_err.borrow_mut() =
-                    Some(format!("extract {}: {e}", out_path.display()));
+                *hard_err.borrow_mut() = Some(format!("extract {}: {e}", out_path.display()));
                 return Ok(false);
             }
         }
@@ -1345,7 +1341,12 @@ pub fn default_hvsc_zip_url(rsync_url: &str, known_version: Option<&str>) -> Opt
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))?;
     // Strip an optional leading `v` from stored versions like "v85".
     let version_num: u32 = known_version
-        .and_then(|s| s.trim().trim_start_matches(|c: char| c == 'v' || c == 'V').parse().ok())
+        .and_then(|s| {
+            s.trim()
+                .trim_start_matches(|c: char| c == 'v' || c == 'V')
+                .parse()
+                .ok()
+        })
         .unwrap_or(LATEST_KNOWN_HVSC_VERSION);
     match host.as_str() {
         "hvsc.brona.dk" => Some(format!(
