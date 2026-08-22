@@ -15,11 +15,13 @@ LIN_OUT := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64.deb
 DOCKER_IMAGE := phosphor-linux-build
 DOCKERFILE   := Dockerfile.linux-build
 
-.PHONY: help clean dist linux_deb linux_deb_docker linux_image macos_pkg
+.PHONY: help clean dist linux_deb linux_deb_docker linux_image macos_pkg arch_pkg arch_install
 
 help:
 	@echo "Targets:"
 	@echo "  make linux_deb         - build .deb via cargo deb (must run on Linux)"
+	@echo "  make arch_pkg          - build Arch .pkg.tar.zst via makepkg"
+	@echo "  make arch_install      - build and install the Arch package (needs sudo)"
 	@echo "  make linux_deb_docker  - build Linux x86_64 .deb via Docker (works on macOS too)"
 	@echo "  make linux_image       - (re)build the Docker image only"
 	@echo "  make macos_pkg         - rename/copy macOS pkg"
@@ -73,6 +75,26 @@ linux_deb_docker: linux_image
 	@DEB_PATH=$$(ls -1 target-linux/debian/*.deb | head -n 1); \
 	cp "$$DEB_PATH" "$(LIN_OUT)"; \
 	echo "Built: $(LIN_OUT)"
+
+# -----------------------
+# Arch Linux
+# -----------------------
+# makepkg refuses to run as root and insists on being invoked from the
+# directory holding the PKGBUILD. The PKGBUILD builds from this checkout,
+# so the package always reflects the working tree, tagged or not.
+ARCH_DIR := packaging/arch
+
+arch_pkg:
+	@command -v makepkg >/dev/null || { echo "makepkg not found — Arch/pacman only"; exit 1; }
+	@mkdir -p $(DIST_DIR)
+	cd $(ARCH_DIR) && makepkg -f
+	@PKG_PATH=$$(ls -1t $(ARCH_DIR)/*.pkg.tar.zst | head -n 1); \
+	cp "$$PKG_PATH" "$(DIST_DIR)/"; \
+	echo "Built: $(DIST_DIR)/$$(basename $$PKG_PATH)"
+
+arch_install:
+	@command -v makepkg >/dev/null || { echo "makepkg not found — Arch/pacman only"; exit 1; }
+	cd $(ARCH_DIR) && makepkg -si
 
 # -----------------------
 # macOS

@@ -1,0 +1,34 @@
+# systemd's 35-systemd-udev-reload.hook already reloads the rule set when a
+# package touches /usr/lib/udev/rules.d/. Reloading only affects devices that
+# appear *after* it, though, so a USBSID-Pico that was already plugged in
+# keeps its old root-only permissions until something re-applies the rules.
+# The trigger below does that in place, so the board works without a re-plug.
+_retrigger() {
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm trigger --subsystem-match=usb --subsystem-match=tty \
+            --attr-match=idVendor=cafe || true
+    fi
+}
+
+post_install() {
+    _retrigger
+    cat <<'EOF'
+Phosphor installed.
+
+A udev rule granting non-root access to the USBSID-Pico (VID cafe:4011) was
+installed to /usr/lib/udev/rules.d/99-usbsid-pico.rules and applied to any
+board currently attached. If Phosphor still reports the device as
+unavailable, unplug and re-plug the board.
+
+Verify permissions with:
+  ls -l /dev/usbsid*
+EOF
+}
+
+post_upgrade() {
+    _retrigger
+}
+
+post_remove() {
+    _retrigger
+}
