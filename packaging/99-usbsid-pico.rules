@@ -1,9 +1,32 @@
-# Copy to /etc/udev/rules.d
-# Reload udev with:
-# sudo udevadm control --reload-rules && sudo udevadm trigger
-ACTION=="*", KERNEL=="ttyUSB[0-9]*",MODE="0777", GROUP:="plugdev", TAG+="uaccess"
-ACTION=="*", KERNEL=="ttyACM[0-9]*",MODE="0777", GROUP:="plugdev", TAG+="uaccess"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4011", MODE="0777"
-SUBSYSTEMS=="tty", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4011", MODE="0777"
-SUBSYSTEMS=="tty", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4011", MODE="0777", SYMLINK+="usbsid%n"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4011", MODE="0777", SYMLINK+="usbsid%n"
+# udev rules for USBSID-Pico (LouDnl) — VID cafe / PID 4011
+#
+# Phosphor's direct playback path talks to the board's vendor-specific
+# interface through libusb, which needs *write* access to the usbfs node
+# (/dev/bus/usb/BBB/DDD). Without this file that node is root-owned 0664
+# and Phosphor fails at open with LIBUSB_ERROR_ACCESS.
+#
+# Install:
+#   sudo cp 99-usbsid-pico.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# TAG+="uaccess" is the portable mechanism: systemd-logind puts an ACL on
+# the node for whoever owns the active local session, so it works on Arch,
+# Debian and Fedora alike without depending on a distro-specific group
+# (plugdev doesn't exist on Arch; uucp doesn't exist on Debian). MODE is
+# the fallback for the cases uaccess doesn't cover — notably SSH sessions
+# and seatless systems, where there is no active local seat to grant to.
+#
+# Every rule here is scoped to the USBSID-Pico's VID/PID on purpose. An
+# earlier revision matched KERNEL=="ttyUSB[0-9]*" / "ttyACM[0-9]*" with no
+# vendor filter, which relaxed permissions on every serial device attached
+# to the machine — modems, Arduinos, USB-serial adapters and all.
+
+# Raw USB device node — this is the one libusb opens.
+SUBSYSTEM=="usb", ATTR{idVendor}=="cafe", ATTR{idProduct}=="4011", \
+    TAG+="uaccess", MODE="0666", SYMLINK+="usbsid%n"
+
+# CDC-ACM serial interface the same board exposes. Not used by Phosphor's
+# libusb path, but keeps serial-console tooling usable and gives it a
+# stable /dev/usbsid-tty name.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4011", \
+    TAG+="uaccess", MODE="0666", SYMLINK+="usbsid-tty"

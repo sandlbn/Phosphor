@@ -1,0 +1,96 @@
+# Maintainer: Marcin Spoczynski <marcin@spoczynski.com>
+#
+# Builds Phosphor from the checkout this file lives in, so the package
+# contains your working tree rather than a published tarball. That is the
+# useful behaviour during development and when the fix you need isn't in a
+# tag yet. To turn this into an AUR-style release PKGBUILD, drop the
+# `_repo` indirection and use:
+#
+#   source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+#
+# Build and install:
+#   cd packaging/arch && makepkg -si
+# or from the repo root:
+#   make arch_pkg
+
+pkgname=phosphor
+pkgver=0.4.6
+pkgrel=1
+pkgdesc="SID music player for USBSID-Pico hardware, software emulation, and Ultimate 64"
+arch=('x86_64')
+url="https://github.com/sandlbn/Phosphor"
+license=('MIT')
+# Matches the binary's actual NEEDED entries: libasound (cpal), libusb-1.0
+# (USBSID-Pico), libudev, libstdc++/libgcc (the bundled C++ SID cores).
+# iced dlopens its windowing and graphics backends rather than linking them,
+# so Wayland/X11/Vulkan don't appear here — see optdepends.
+depends=('alsa-lib' 'libusb' 'systemd-libs' 'gcc-libs' 'glibc')
+# base-devel (gcc, make, autoconf, automake, libtool, pkgconf) is assumed
+# present by makepkg and is not repeated here. mp3lame-sys drives autotools
+# and sidplayfp-sys/sidlite-sys drive cc, all of which that covers. git is
+# needed because gosh-dl is pinned as a git dependency in Cargo.toml.
+makedepends=('rust' 'git')
+optdepends=('vulkan-driver: GPU rendering for the iced UI (falls back to software)'
+            'vulkan-swrast: software Vulkan, for machines with no GPU driver')
+# Phosphor links native C (LAME, libsidplayfp, SIDLite) built by `cc` in
+# build scripts. Cross-language LTO between those objects and rustc's is
+# not set up, so leave it off rather than emit link-time warnings.
+# !debug because the release profile carries no debug symbols, so the split
+# debug package comes out empty and only produces gdb-add-index errors.
+options=('!lto' '!debug')
+install="$pkgname.install"
+source=()
+sha256sums=()
+
+_repo="$(cd "$startdir/../.." && pwd)"
+# Kept out of the developer's own target/ so a package build never
+# invalidates their incremental cache, and out of $srcdir because makepkg
+# wipes that between runs — which would force a full rebuild every time.
+_target="$_repo/target-arch"
+
+pkgver() {
+    # Track Cargo.toml so `makepkg` never packages a stale version string.
+    sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$_repo/Cargo.toml" | head -n1
+}
+
+prepare() {
+    cd "$_repo"
+    # Keep build artefacts out of the developer's own target/ cache.
+    export CARGO_TARGET_DIR="$_target"
+    cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+    cd "$_repo"
+    export CARGO_TARGET_DIR="$_target"
+    export RUSTUP_TOOLCHAIN=stable
+    # `usb` is the default feature and is what makes the USBSID-Pico path
+    # exist at all; spelled out so a future default change can't silently
+    # ship a package without hardware support.
+    cargo build --release --locked --features usb --bin phosphor
+}
+
+package() {
+    cd "$_repo"
+
+    install -Dm755 "$_target/release/phosphor" \
+        "$pkgdir/usr/bin/phosphor"
+
+    # Non-root access to the USBSID-Pico. Without this the libusb open in
+    # sid_direct.rs fails with LIBUSB_ERROR_ACCESS and Phosphor can only
+    # use the emulated engines. /usr/lib is the correct tree for rules
+    # shipped by a package; /etc/udev/rules.d stays free for local edits.
+    install -Dm644 packaging/99-usbsid-pico.rules \
+        "$pkgdir/usr/lib/udev/rules.d/99-usbsid-pico.rules"
+
+    install -Dm644 packaging/phosphor.desktop \
+        "$pkgdir/usr/share/applications/phosphor.desktop"
+    install -Dm644 assets/phosphor.png \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/phosphor.png"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # SIL OFL text for the Noto icon fonts embedded in the binary.
+    install -Dm644 assets/fonts/OFL.txt \
+        "$pkgdir/usr/share/licenses/$pkgname/OFL-Noto.txt"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

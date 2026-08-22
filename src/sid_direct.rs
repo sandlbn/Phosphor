@@ -11,6 +11,46 @@ use crate::sid_device::SidDevice;
 use usbsid_pico::{ClockSpeed, UsbSid};
 use usbsid_pico_config::transport::{Transport, TransportError};
 
+/// Turn a libusb init failure into something the user can act on.
+///
+/// A board that is plugged in and enumerating still fails to open when the
+/// usbfs node is root-only, which is the default on a machine that never
+/// installed the udev rule. libusb reports that as a bare "Access denied",
+/// which reads like a broken cable rather than a one-line fix, so name the
+/// actual remedy on the platforms where it applies.
+fn open_error(msg: &str) -> String {
+    let lower = msg.to_ascii_lowercase();
+    let permission_denied = lower.contains("access")
+        || lower.contains("permission")
+        || lower.contains("denied")
+        || lower.contains("insufficient");
+
+    if !permission_denied {
+        return format!("USB init failed: {msg}");
+    }
+
+    #[cfg(target_os = "linux")]
+    return format!(
+        "USB init failed: {msg}\n\
+         The USBSID-Pico is connected but not accessible to your user.\n\
+         Install the udev rule and re-apply it to the attached board:\n\
+         \x20 sudo cp packaging/99-usbsid-pico.rules /etc/udev/rules.d/\n\
+         \x20 sudo udevadm control --reload-rules\n\
+         \x20 sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=cafe\n\
+         The Arch package and the .deb both install this rule for you."
+    );
+
+    #[cfg(target_os = "windows")]
+    return format!(
+        "USB init failed: {msg}\n\
+         The USBSID-Pico needs the WinUSB driver. Install it with Zadig\n\
+         (https://zadig.akeo.ie/), selecting the USBSID-Pico interface."
+    );
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    return format!("USB init failed: {msg}");
+}
+
 pub struct DirectDevice {
     dev: UsbSid,
     /// Tracked connection state for the GUI's "Disconnected" indicator.
@@ -23,8 +63,7 @@ pub struct DirectDevice {
 impl DirectDevice {
     pub fn open() -> Result<Self, String> {
         let mut dev = UsbSid::new();
-        dev.init(true, true)
-            .map_err(|e| format!("USB init failed: {e}"))?;
+        dev.init(true, true).map_err(|e| open_error(&e.to_string()))?;
         eprintln!("[sid-direct] USBSID-Pico opened (threaded, cycled)");
         Ok(Self {
             dev,
