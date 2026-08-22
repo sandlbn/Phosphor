@@ -627,7 +627,6 @@ pub async fn check_hvsc_update(hvsc_base: &str) -> Result<HvscUpdateInfo, String
     Err("Could not parse HVSC version from remote header".to_string())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

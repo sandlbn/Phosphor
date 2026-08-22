@@ -15,6 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+
 use walkdir::WalkDir;
 
 use crate::playlist::{PlaylistEntry, SonglengthDb};
@@ -115,6 +118,50 @@ pub struct HvscTune {
     pub has_stil: bool,
 }
 
+impl HvscIndexEntry {
+    /// Rebuild an entry from cached fields, recomputing the lowercase copies
+    /// the sort comparators use rather than storing them on disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehydrate(
+        path: PathBuf,
+        title: String,
+        released: String,
+        author_raw: String,
+        songs: u16,
+        duration_secs: Option<u32>,
+        has_stil: bool,
+    ) -> Self {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        Self {
+            title_lower: title.to_ascii_lowercase(),
+            author_lower: author_raw.to_ascii_lowercase(),
+            path,
+            stem,
+            author_raw,
+            title,
+            released,
+            songs,
+            duration_secs,
+            has_stil,
+        }
+    }
+}
+
+/// Sortable columns in the tune table. One enum covers both list modes;
+/// `Secondary` is "Author / section" in global results and "Released" per
+/// author, which is why it is named for its position rather than its content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvscSortColumn {
+    Title,
+    Secondary,
+    Subs,
+    Len,
+}
+
 /// Flat-index row for global search. Built once per category — one entry
 /// per `.sid`/`.mus` file. Enriched with SID-header + songlength + STIL
 /// metadata so the global-hit list can show the same columns as the
@@ -135,10 +182,8 @@ pub struct HvscIndexEntry {
     pub duration_secs: Option<u32>,
     pub has_stil: bool,
     /// Lowercased copies for case-insensitive search.
-    stem_lower: String,
     author_lower: String,
     title_lower: String,
-    released_lower: String,
 }
 
 #[derive(Debug, Default)]
@@ -170,6 +215,36 @@ pub struct HvscBrowser {
     /// within that author's tunes instead of falling into the global
     /// flat-index view. Per-session; not persisted.
     search_scope_this_author: bool,
+    /// Filters the author column only. Separate from `search` so typing a
+    /// tune name no longer empties the author list.
+    author_filter: String,
+    /// Selected tune, keyed by path rather than index: sorting reorders
+    /// indices, so an index would silently point at a different tune.
+    selected_tune: Option<PathBuf>,
+    /// Row under the cursor. `mouse_area` reports enter/exit but does no
+    /// styling of its own, so hover is tracked here and drawn by the row.
+    hovered_row: Option<usize>,
+    /// Active sort, or `None` to keep relevance order for search results
+    /// and path order for an author's tunes.
+    sort: Option<(HvscSortColumn, crate::ui::SortDirection)>,
+    /// Cached global-search result, recomputed only when the query, sort or
+    /// index changes — `view()` runs ~30x/second and must not rescan 60k
+    /// entries each time.
+    cache: SearchCache,
+}
+
+/// Memoised global-search result. `key` is everything the result depends on.
+#[derive(Debug, Default)]
+struct SearchCache {
+    key: Option<(
+        String,
+        Option<(HvscSortColumn, crate::ui::SortDirection)>,
+        u64,
+    )>,
+    results: Vec<usize>,
+    /// True number of matches, which may exceed `results.len()` once the
+    /// display cap kicks in. Reported to the user verbatim.
+    total_matches: usize,
 }
 
 impl Default for HvscCategory {
@@ -227,6 +302,9 @@ impl HvscBrowser {
             self.flat_index_loaded = false;
             self.flat_index_building = false;
             self.flat_index_version = self.flat_index_version.wrapping_add(1);
+            self.selected_tune = None;
+            self.hovered_row = None;
+            self.cache = SearchCache::default();
         }
     }
 
@@ -241,7 +319,20 @@ impl HvscBrowser {
             self.flat_index_loaded = false;
             self.flat_index_building = false;
             self.flat_index_version = self.flat_index_version.wrapping_add(1);
+            self.selected_tune = None;
+            self.hovered_row = None;
+            self.cache = SearchCache::default();
         }
+    }
+
+    /// Drop the index so the next build starts from scratch. Backs the
+    /// manual "rebuild" affordance for when the collection changed on disk.
+    pub fn forget_flat_index(&mut self) {
+        self.flat_index.clear();
+        self.flat_index_loaded = false;
+        self.flat_index_building = false;
+        self.flat_index_version = self.flat_index_version.wrapping_add(1);
+        self.cache = SearchCache::default();
     }
 
     pub fn flat_index_version(&self) -> u64 {
@@ -262,6 +353,47 @@ impl HvscBrowser {
 
     pub fn set_search(&mut self, query: String) {
         self.search = query;
+    }
+
+    pub fn author_filter(&self) -> &str {
+        &self.author_filter
+    }
+
+    pub fn set_author_filter(&mut self, query: String) {
+        self.author_filter = query;
+    }
+
+    pub fn selected_tune(&self) -> Option<&Path> {
+        self.selected_tune.as_deref()
+    }
+
+    pub fn set_selected_tune(&mut self, path: Option<PathBuf>) {
+        self.selected_tune = path;
+    }
+
+    pub fn hovered_row(&self) -> Option<usize> {
+        self.hovered_row
+    }
+
+    pub fn set_hovered_row(&mut self, row: Option<usize>) {
+        self.hovered_row = row;
+    }
+
+    pub fn sort(&self) -> Option<(HvscSortColumn, crate::ui::SortDirection)> {
+        self.sort
+    }
+
+    /// Click a header: same column flips direction, a new column starts
+    /// ascending, and a third click on the same column clears the sort and
+    /// returns to relevance order.
+    pub fn toggle_sort(&mut self, col: HvscSortColumn) {
+        self.sort = match self.sort {
+            Some((c, crate::ui::SortDirection::Ascending)) if c == col => {
+                Some((col, crate::ui::SortDirection::Descending))
+            }
+            Some((c, crate::ui::SortDirection::Descending)) if c == col => None,
+            _ => Some((col, crate::ui::SortDirection::Ascending)),
+        };
     }
 
     pub fn flat_index(&self) -> &[HvscIndexEntry] {
@@ -305,29 +437,192 @@ impl HvscBrowser {
         self.flat_index_loaded = true;
     }
 
-    /// Indices into `flat_index` matching the current search query
-    /// against filename stem, author/section folder name, SID header
-    /// title, or `released`. Capped at 500 hits so the UI doesn't render
-    /// an unbounded list while the user types one letter at a time.
-    pub fn filtered_flat(&self) -> Vec<usize> {
-        if self.search.trim().is_empty() {
-            return Vec::new();
+    /// Cached global-search hits. Recomputed by `recompute_search` only when
+    /// the query, sort or index changes — never from `view()`.
+    pub fn flat_results(&self) -> &[usize] {
+        &self.cache.results
+    }
+
+    /// True match count, which may exceed `flat_results().len()` once the
+    /// display cap applies.
+    pub fn flat_total_matches(&self) -> usize {
+        self.cache.total_matches
+    }
+
+    /// Recompute the global-search cache if anything it depends on changed.
+    /// Cheap to call every update tick; the key comparison is the fast path.
+    pub fn recompute_search(&mut self) {
+        let key = (
+            self.search.trim().to_string(),
+            self.sort,
+            self.flat_index_version,
+        );
+        if self.cache.key.as_ref() == Some(&key) {
+            return;
         }
-        let needle = self.search.to_ascii_lowercase();
-        let mut out = Vec::new();
+        let query = key.0.clone();
+        if query.is_empty() {
+            self.cache = SearchCache {
+                key: Some(key),
+                results: Vec::new(),
+                total_matches: 0,
+            };
+            return;
+        }
+
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let pattern = HvscQuery::parse(&query);
+        let mut buf = Vec::new();
+
+        let mut scored: Vec<(u32, usize)> = Vec::new();
         for (i, e) in self.flat_index.iter().enumerate() {
-            if e.stem_lower.contains(&needle)
-                || e.author_lower.contains(&needle)
-                || e.title_lower.contains(&needle)
-                || e.released_lower.contains(&needle)
-            {
-                out.push(i);
-                if out.len() >= 500 {
-                    break;
-                }
+            if let Some(score) = score_entry(&pattern, e, &mut matcher, &mut buf) {
+                scored.push((score, i));
             }
         }
-        out
+        let total = scored.len();
+
+        match self.sort {
+            // Explicit sort wins over relevance, but ranking still decides
+            // which hits survive the cap, so a good match is never dropped
+            // in favour of a weak one that merely sorts earlier.
+            Some((col, dir)) => {
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                scored.truncate(MAX_FLAT_RESULTS);
+                let index = &self.flat_index;
+                scored.sort_by(|a, b| hvsc_sort_cmp(col, dir, &index[a.1], &index[b.1]));
+            }
+            None => {
+                // Best score first; ties fall back to title for stability.
+                let index = &self.flat_index;
+                scored.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| index[a.1].title_lower.cmp(&index[b.1].title_lower))
+                });
+                scored.truncate(MAX_FLAT_RESULTS);
+            }
+        }
+
+        self.cache = SearchCache {
+            key: Some(key),
+            results: scored.into_iter().map(|(_, i)| i).collect(),
+            total_matches: total,
+        };
+    }
+}
+
+/// Most rows shown for a global search. Ranking runs over the whole index
+/// first, so this caps what is *drawn*, not what is considered.
+pub const MAX_FLAT_RESULTS: usize = 500;
+
+/// A query compiled once per search: a contiguous-substring form and a
+/// typo-tolerant fuzzy form.
+///
+/// Fuzzy matching alone is far too loose on a 20k-row index. Searching
+/// "antti" subsequence-matches "F-a-n-t-as-t-i-c_Zool" and dozens like it,
+/// which buried the actual `Hannula_Antti`. Scoring both ways and boosting
+/// the substring hit keeps typo tolerance without letting it dominate.
+pub struct HvscQuery {
+    substring: Pattern,
+    fuzzy: Pattern,
+}
+
+impl HvscQuery {
+    pub fn parse(query: &str) -> Self {
+        Self {
+            substring: Pattern::new(
+                query,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Substring,
+            ),
+            fuzzy: Pattern::new(
+                query,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            ),
+        }
+    }
+}
+
+/// How far a contiguous match outranks a merely-subsequence one. Large
+/// enough that no amount of fuzzy score can lift noise above a real hit.
+const SUBSTRING_BOOST: u32 = 10_000;
+
+/// Relevance score for one index entry, or `None` if it does not match.
+///
+/// Fields are weighted so a title hit outranks an incidental match in
+/// `released`, and a contiguous match anywhere beats a scattered one.
+pub fn score_entry(
+    query: &HvscQuery,
+    entry: &HvscIndexEntry,
+    matcher: &mut Matcher,
+    buf: &mut Vec<char>,
+) -> Option<u32> {
+    let mut best = None;
+    for (text, weight) in [
+        (entry.title.as_str(), 3u32),
+        (entry.author_raw.as_str(), 3),
+        (entry.stem.as_str(), 2),
+        (entry.released.as_str(), 1),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
+        let haystack = Utf32Str::new(text, buf);
+        let field = match query.substring.score(haystack, matcher) {
+            Some(sub) => SUBSTRING_BOOST + sub,
+            None => match query.fuzzy.score(haystack, matcher) {
+                Some(f) => f,
+                None => continue,
+            },
+        };
+        let weighted = field * weight;
+        best = Some(best.map_or(weighted, |b: u32| b.max(weighted)));
+    }
+    best
+}
+
+/// Same ordering as `hvsc_sort_cmp`, for the per-author list, which holds
+/// `PlaylistEntry` rather than index rows. `Secondary` is "Released" here.
+pub fn tune_sort_cmp(
+    col: HvscSortColumn,
+    dir: crate::ui::SortDirection,
+    a: &crate::playlist::PlaylistEntry,
+    b: &crate::playlist::PlaylistEntry,
+) -> std::cmp::Ordering {
+    let ord = match col {
+        HvscSortColumn::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+        HvscSortColumn::Secondary => a.released.to_lowercase().cmp(&b.released.to_lowercase()),
+        HvscSortColumn::Subs => a.songs.cmp(&b.songs),
+        HvscSortColumn::Len => a.duration_secs.cmp(&b.duration_secs),
+    }
+    .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    match dir {
+        crate::ui::SortDirection::Ascending => ord,
+        crate::ui::SortDirection::Descending => ord.reverse(),
+    }
+}
+
+/// Comparator for the tune table's sortable columns.
+pub fn hvsc_sort_cmp(
+    col: HvscSortColumn,
+    dir: crate::ui::SortDirection,
+    a: &HvscIndexEntry,
+    b: &HvscIndexEntry,
+) -> std::cmp::Ordering {
+    let ord = match col {
+        HvscSortColumn::Title => a.title_lower.cmp(&b.title_lower),
+        HvscSortColumn::Secondary => a.author_lower.cmp(&b.author_lower),
+        HvscSortColumn::Subs => a.songs.cmp(&b.songs),
+        HvscSortColumn::Len => a.duration_secs.cmp(&b.duration_secs),
+    }
+    // Ties resolve by title so repeated sorts don't shuffle equal rows.
+    .then_with(|| a.title_lower.cmp(&b.title_lower));
+    match dir {
+        crate::ui::SortDirection::Ascending => ord,
+        crate::ui::SortDirection::Descending => ord.reverse(),
     }
 }
 
@@ -391,10 +686,8 @@ pub fn build_flat_index_worker(
         // parent works for both HVSC layouts here.
         let author_dir = p.parent().unwrap_or(&category_dir);
         let has_stil = stil_has_entry(author_dir, p, stil.as_ref(), Some(root.as_path()));
-        let stem_lower = stem.to_ascii_lowercase();
         let author_lower = author_raw.to_ascii_lowercase();
         let title_lower = title.to_ascii_lowercase();
-        let released_lower = released.to_ascii_lowercase();
         out.push(HvscIndexEntry {
             path: p.to_path_buf(),
             stem,
@@ -404,10 +697,8 @@ pub fn build_flat_index_worker(
             songs,
             duration_secs,
             has_stil,
-            stem_lower,
             author_lower,
             title_lower,
-            released_lower,
         });
     }
     out.sort_by(|a, b| a.title_lower.cmp(&b.title_lower));
@@ -660,19 +951,20 @@ impl HvscBrowser {
         self.tunes.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
     }
 
-    /// Indices into `authors` matching the search query (case-insensitive
-    /// substring against both raw and display name).
+    /// Indices into `authors` matching the *author* filter box. Deliberately
+    /// independent of `search`: sharing one string meant typing a tune name
+    /// emptied the author column.
     pub fn filtered_authors(&self) -> Vec<usize> {
-        if self.search.trim().is_empty() {
+        if self.author_filter.trim().is_empty() {
             return (0..self.authors.len()).collect();
         }
-        let needle = self.search.to_ascii_lowercase();
+        let needle = self.author_filter.trim().to_lowercase();
         self.authors
             .iter()
             .enumerate()
             .filter(|(_, a)| {
-                a.raw_name.to_ascii_lowercase().contains(&needle)
-                    || a.display_name.to_ascii_lowercase().contains(&needle)
+                a.raw_name.to_lowercase().contains(&needle)
+                    || a.display_name.to_lowercase().contains(&needle)
             })
             .map(|(i, _)| i)
             .collect()
@@ -681,22 +973,33 @@ impl HvscBrowser {
     /// Indices into `tunes` matching the search query — title, author,
     /// released, or filename stem.
     pub fn filtered_tunes(&self) -> Vec<usize> {
-        if self.search.trim().is_empty() {
+        let mut out = self.filtered_tunes_unsorted();
+        if let Some((col, dir)) = self.sort {
+            let tunes = &self.tunes;
+            out.sort_by(|&a, &b| tune_sort_cmp(col, dir, &tunes[a].entry, &tunes[b].entry));
+        }
+        out
+    }
+
+    fn filtered_tunes_unsorted(&self) -> Vec<usize> {
+        // `trim` matters: the old code lowercased the raw string, so a single
+        // trailing space from a paste matched nothing at all.
+        let needle = self.search.trim().to_lowercase();
+        if needle.is_empty() {
             return (0..self.tunes.len()).collect();
         }
-        let needle = self.search.to_ascii_lowercase();
         self.tunes
             .iter()
             .enumerate()
             .filter(|(_, t)| {
                 let e = &t.entry;
-                e.title.to_ascii_lowercase().contains(&needle)
-                    || e.author.to_ascii_lowercase().contains(&needle)
-                    || e.released.to_ascii_lowercase().contains(&needle)
+                e.title.to_lowercase().contains(&needle)
+                    || e.author.to_lowercase().contains(&needle)
+                    || e.released.to_lowercase().contains(&needle)
                     || e.path
                         .file_stem()
                         .and_then(|s| s.to_str())
-                        .map(|s| s.to_ascii_lowercase().contains(&needle))
+                        .map(|s| s.to_lowercase().contains(&needle))
                         .unwrap_or(false)
             })
             .map(|(i, _)| i)
@@ -824,5 +1127,231 @@ mod tests {
     #[test]
     fn display_name_passes_through_single_word() {
         assert_eq!(derive_display_name("Zyron"), "Zyron");
+    }
+
+    fn entry(
+        title: &str,
+        author: &str,
+        released: &str,
+        songs: u16,
+        secs: Option<u32>,
+    ) -> HvscIndexEntry {
+        HvscIndexEntry {
+            path: PathBuf::from(format!("/hvsc/{author}/{title}.sid")),
+            stem: title.to_string(),
+            author_raw: author.to_string(),
+            title: title.to_string(),
+            released: released.to_string(),
+            songs,
+            duration_secs: secs,
+            has_stil: false,
+            title_lower: title.to_ascii_lowercase(),
+            author_lower: author.to_ascii_lowercase(),
+        }
+    }
+
+    fn score(query: &str, e: &HvscIndexEntry) -> Option<u32> {
+        let mut m = Matcher::new(Config::DEFAULT);
+        let pat = HvscQuery::parse(query);
+        let mut buf = Vec::new();
+        score_entry(&pat, e, &mut m, &mut buf)
+    }
+
+    #[test]
+    fn fuzzy_tolerates_typos() {
+        let commando = entry("Commando", "Hubbard_Rob", "1985 Elite", 1, Some(90));
+        // The point of the whole fuzzy change: a dropped letter still matches.
+        assert!(score("commndo", &commando).is_some());
+        assert!(score("Commando", &commando).is_some());
+        // Matching the author works too, since it is one of the scored fields.
+        assert!(score("hubbard", &commando).is_some());
+        assert!(score("zzzzqqq", &commando).is_none());
+    }
+
+    #[test]
+    fn title_outranks_incidental_released_match() {
+        // "elite" is this one's actual title...
+        let by_title = entry("Elite", "Braben_David", "1984 Acornsoft", 1, Some(60));
+        // ...and only the publisher of this one. The title hit must win, which
+        // the old first-500-alphabetically behaviour could not express.
+        let by_released = entry("Zoom", "Someone_Else", "1985 Elite", 1, Some(60));
+        let a = score("elite", &by_title).expect("title should match");
+        let b = score("elite", &by_released).expect("released should match");
+        assert!(a > b, "title hit {a} should outrank released hit {b}");
+    }
+
+    #[test]
+    fn real_author_beats_subsequence_noise() {
+        // Reported case: searching "antti" ranked "Fantastic_Zool" and
+        // "Blanchette_Francois" above the actual Antti authors, because
+        // a-n-t-t-i appears in order inside both. A contiguous hit must win.
+        let real = entry("Some Tune", "Hannula_Antti", "1994", 1, Some(60));
+        let noise = entry("Melody Rulez", "Fantastic_Zool", "1995", 1, Some(60));
+        let noise2 = entry("Creepspread", "Blanchette_Francois", "1996", 1, Some(60));
+
+        let r = score("antti", &real).expect("real author must match");
+        for (name, n) in [("Fantastic_Zool", &noise), ("Blanchette_Francois", &noise2)] {
+            if let Some(ns) = score("antti", n) {
+                assert!(r > ns, "Hannula_Antti ({r}) must outrank {name} ({ns})");
+            }
+        }
+    }
+
+    #[test]
+    fn substring_beats_fuzzy_even_across_fields() {
+        // A contiguous match in the lowest-weighted field still beats a
+        // scattered match in the highest-weighted one.
+        let contiguous = entry("Zzz", "Nobody", "antti 1994", 1, Some(60));
+        let scattered = entry("Fantastic Adventure", "Nobody", "1995", 1, Some(60));
+        let c = score("antti", &contiguous).expect("substring in released");
+        if let Some(sc) = score("antti", &scattered) {
+            assert!(c > sc, "contiguous {c} must beat scattered {sc}");
+        }
+    }
+
+    #[test]
+    fn sort_columns_order_both_ways() {
+        use crate::ui::SortDirection::{Ascending, Descending};
+        let a = entry("Alpha", "AAA", "1985", 1, Some(10));
+        let b = entry("Beta", "BBB", "1986", 9, Some(99));
+
+        for (col, expect_a_first) in [
+            (HvscSortColumn::Title, true),
+            (HvscSortColumn::Secondary, true),
+            (HvscSortColumn::Subs, true),
+            (HvscSortColumn::Len, true),
+        ] {
+            let asc = hvsc_sort_cmp(col, Ascending, &a, &b);
+            let desc = hvsc_sort_cmp(col, Descending, &a, &b);
+            assert_eq!(asc.is_lt(), expect_a_first, "ascending {col:?}");
+            assert_eq!(
+                desc,
+                asc.reverse(),
+                "descending {col:?} must mirror ascending"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_is_stable_on_ties() {
+        use crate::ui::SortDirection::Ascending;
+        // Equal on the sorted column — the title tie-break keeps the order
+        // fixed so repeated sorts don't shuffle rows around.
+        let a = entry("Alpha", "AAA", "1985", 5, Some(10));
+        let b = entry("Beta", "BBB", "1985", 5, Some(10));
+        assert!(hvsc_sort_cmp(HvscSortColumn::Subs, Ascending, &a, &b).is_lt());
+        assert!(hvsc_sort_cmp(HvscSortColumn::Subs, Ascending, &b, &a).is_gt());
+    }
+
+    #[test]
+    fn toggle_sort_cycles_asc_desc_then_off() {
+        use crate::ui::SortDirection::{Ascending, Descending};
+        let mut b = HvscBrowser::default();
+        assert_eq!(b.sort(), None);
+        b.toggle_sort(HvscSortColumn::Title);
+        assert_eq!(b.sort(), Some((HvscSortColumn::Title, Ascending)));
+        b.toggle_sort(HvscSortColumn::Title);
+        assert_eq!(b.sort(), Some((HvscSortColumn::Title, Descending)));
+        // Third click clears it, returning results to relevance order.
+        b.toggle_sort(HvscSortColumn::Title);
+        assert_eq!(b.sort(), None);
+        // A different column always starts ascending.
+        b.toggle_sort(HvscSortColumn::Len);
+        assert_eq!(b.sort(), Some((HvscSortColumn::Len, Ascending)));
+    }
+
+    #[test]
+    fn author_filter_is_independent_of_tune_search() {
+        let mut b = HvscBrowser::default();
+        b.authors = vec![
+            HvscAuthor {
+                raw_name: "Hubbard_Rob".into(),
+                display_name: "Hubbard, Rob".into(),
+                letter: 'H',
+                path: PathBuf::from("/hvsc/H/Hubbard_Rob"),
+            },
+            HvscAuthor {
+                raw_name: "Galway_Martin".into(),
+                display_name: "Galway, Martin".into(),
+                letter: 'G',
+                path: PathBuf::from("/hvsc/G/Galway_Martin"),
+            },
+        ];
+        // Searching for a tune must not empty the author column — the whole
+        // point of splitting the two boxes.
+        b.set_search("commando".into());
+        assert_eq!(b.filtered_authors().len(), 2);
+        // The author box still filters on its own terms.
+        b.set_author_filter("hubbard".into());
+        assert_eq!(b.filtered_authors(), vec![0]);
+    }
+
+    #[test]
+    fn search_cache_reports_true_total_when_capped() {
+        let mut b = HvscBrowser::default();
+        // More matches than the display cap.
+        b.flat_index = (0..MAX_FLAT_RESULTS + 120)
+            .map(|i| entry(&format!("Commando {i}"), "AAA", "1985", 1, Some(10)))
+            .collect();
+        b.flat_index_loaded = true;
+        b.set_search("commando".into());
+        b.recompute_search();
+        assert_eq!(b.flat_results().len(), MAX_FLAT_RESULTS, "list is capped");
+        assert_eq!(
+            b.flat_total_matches(),
+            MAX_FLAT_RESULTS + 120,
+            "but the true match count is reported, not the index size"
+        );
+    }
+
+    #[test]
+    fn search_cache_recomputes_only_when_inputs_change() {
+        let mut b = HvscBrowser::default();
+        b.flat_index = vec![entry("Commando", "Hubbard_Rob", "1985", 1, Some(10))];
+        b.flat_index_loaded = true;
+        b.set_search("commando".into());
+        b.recompute_search();
+        assert_eq!(b.flat_results().len(), 1);
+
+        // Mutating the index behind the cache's back is invisible until the
+        // version changes — proving view() reads a cache and does not rescan.
+        b.flat_index.clear();
+        b.recompute_search();
+        assert_eq!(
+            b.flat_results().len(),
+            1,
+            "cache still serves the old result"
+        );
+
+        // A sort change is part of the key, so it does force a recompute.
+        b.toggle_sort(HvscSortColumn::Title);
+        b.recompute_search();
+        assert_eq!(b.flat_results().len(), 0);
+    }
+
+    #[test]
+    fn trailing_space_still_matches() {
+        let mut b = HvscBrowser::default();
+        b.tunes = vec![HvscTune {
+            entry: crate::playlist::PlaylistEntry {
+                path: PathBuf::from("/hvsc/Commando.sid"),
+                title: "Commando".into(),
+                author: String::new(),
+                released: String::new(),
+                songs: 1,
+                selected_song: 1,
+                is_pal: true,
+                num_sids: 1,
+                is_rsid: false,
+                md5: None,
+                duration_secs: None,
+                has_wds: false,
+            },
+            has_stil: false,
+        }];
+        // The old code lowercased the raw string, so one pasted trailing
+        // space matched nothing at all.
+        b.set_search("commando ".into());
+        assert_eq!(b.filtered_tunes(), vec![0]);
     }
 }

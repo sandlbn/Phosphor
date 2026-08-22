@@ -15,6 +15,7 @@ use iced::widget::{
 use iced::{mouse, Alignment, Color, Element, Length, Padding, Point, Rectangle, Size, Theme};
 
 use crate::config::{Config, FavoritesDb};
+use crate::hvsc_browser::HvscSortColumn;
 use crate::player::{PlayState, PlayerStatus};
 use crate::playlist::Playlist;
 use crate::recently_played::{format_played_at, RecentlyPlayed};
@@ -24,6 +25,25 @@ use visualizer::{TrackerRef, Visualizer};
 /// Fixed scrollable ID for the playlist widget.
 pub fn playlist_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-playlist")
+}
+
+/// Scroll position + viewport height for the HVSC browser's two virtualised
+/// lists, so `view()` can work out which rows are actually on screen.
+#[derive(Debug, Clone, Copy)]
+pub struct HvscScroll {
+    pub authors_y: f32,
+    pub authors_h: f32,
+    pub tunes_y: f32,
+    pub tunes_h: f32,
+}
+
+/// Fixed scrollable IDs for the HVSC browser's two lists.
+pub fn hvsc_authors_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("phosphor-hvsc-authors")
+}
+
+pub fn hvsc_tunes_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("phosphor-hvsc-tunes")
 }
 
 /// Fixed scrollable ID for the recently played widget.
@@ -378,6 +398,21 @@ pub enum Message {
     /// Toggle "search within selected author only" — visible in the search
     /// row when an author is selected.
     HvscBrowserSearchScopeToggled(bool),
+    /// Filters the author column only, independent of the tune search.
+    HvscBrowserAuthorFilterChanged(String),
+    /// Single click on a tune row. Selects; double-click plays.
+    HvscBrowserSelectTune(usize),
+    HvscBrowserSelectFlat(usize),
+    /// Row under the cursor, for the hover highlight.
+    HvscBrowserRowHovered(Option<usize>),
+    HvscBrowserSortBy(crate::hvsc_browser::HvscSortColumn),
+    /// Discard the on-disk index cache and re-walk the collection.
+    HvscBrowserRebuildIndex,
+    /// Fires after the typing pause; carries the sequence number it was
+    /// scheduled with so superseded keystrokes are ignored.
+    HvscSearchDebounced(u64),
+    HvscAuthorsScrolled(iced::widget::scrollable::Viewport),
+    HvscTunesScrolled(iced::widget::scrollable::Viewport),
 
     // Browse panel: source toggle (Local HVSC vs Assembly64)
     BrowserSourceChanged(crate::hvsc_browser::BrowserSource),
@@ -2047,6 +2082,7 @@ pub fn browser_view<'a>(
     hvsc_sync_in_progress: bool,
     hvsc_sync_status: &'a str,
     session_mode: &'a crate::SessionMode,
+    scroll: HvscScroll,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::BrowserSource;
 
@@ -2057,10 +2093,7 @@ pub fn browser_view<'a>(
         } else {
             s.label().to_string()
         };
-        tool_button(
-            Box::leak(label.into_boxed_str()),
-            Message::BrowserSourceChanged(s),
-        )
+        tool_button(label, Message::BrowserSourceChanged(s))
     };
 
     let header = container(
@@ -2088,6 +2121,7 @@ pub fn browser_view<'a>(
             hvsc_update_available,
             hvsc_sync_in_progress,
             hvsc_sync_status,
+            scroll,
         ),
         BrowserSource::Assembly64 => assembly64_browser_view(a64),
         BrowserSource::PublishedPlaylists => {
@@ -2201,7 +2235,7 @@ group:Hubbard year:1985, or category:demos commando."#,
         let expanded = a64.expansion(&entry.id).is_some();
         let chev = if expanded { "▾" } else { "▸" };
         let toggle = tool_button(
-            Box::leak(format!("{} {}", chev, entry.name).into_boxed_str()),
+            format!("{} {}", chev, entry.name),
             Message::Assembly64ToggleExpand(entry.id.clone(), entry.category),
         );
 
@@ -2470,7 +2504,7 @@ pub fn published_playlists_view<'a>(
         let expanded = b.is_expanded(&meta.file);
         let chev = if expanded { "▾" } else { "▸" };
         let toggle = tool_button(
-            Box::leak(format!("{chev} {}", meta.name).into_boxed_str()),
+            format!("{chev} {}", meta.name),
             Message::PublishedPlaylistsToggleExpand(meta.file.clone()),
         );
 
@@ -2624,6 +2658,120 @@ fn format_relative_time(unix_secs: i64) -> String {
     }
 }
 
+/// Table cell that clips to its own bounds. iced clips text to the enclosing
+/// *viewport*, not the widget, so without this a long title paints straight
+/// across the columns to its right.
+fn nowrap_cell<'a>(content: Element<'a, Message>, width: Length) -> Element<'a, Message> {
+    container(content)
+        .width(width)
+        .height(Length::Fill)
+        .clip(true)
+        .into()
+}
+
+fn nowrap_text<'a>(s: String, col: Color, size: f32, width: Length) -> Element<'a, Message> {
+    nowrap_cell(
+        text(s)
+            .size(font::sized(size))
+            .color(col)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+        width,
+    )
+}
+
+/// Width reserved for the ▶ / ➕ cluster in both the header and every row so
+/// the two provably line up. Scales with the font, as the buttons do.
+fn hvsc_actions_width() -> f32 {
+    84.0 * font::scale()
+}
+
+/// Width of the scrollable's overlaying vertical scrollbar.
+const HVSC_SCROLLBAR_W: f32 = 10.0;
+
+/// Shared column widths for the HVSC tune table. `secondary` is "Author /
+/// section" in global results and "Released" per author.
+struct HvscCols {
+    title: Length,
+    secondary: Length,
+    subs: Length,
+    len: Length,
+    stil: Length,
+}
+
+fn hvsc_cols() -> HvscCols {
+    HvscCols {
+        title: Length::FillPortion(5),
+        secondary: Length::FillPortion(3),
+        subs: Length::Fixed(40.0),
+        len: Length::Fixed(60.0),
+        stil: Length::Fixed(40.0),
+    }
+}
+
+/// Clickable column header. Lifted from the playlist's local `header_btn`
+/// closure so both tables sort the same way and look the same.
+fn sortable_header<'a>(
+    label: &'a str,
+    col: crate::hvsc_browser::HvscSortColumn,
+    active: Option<(crate::hvsc_browser::HvscSortColumn, SortDirection)>,
+    width: Length,
+) -> Element<'a, Message> {
+    let is_active = active.map(|(c, _)| c == col).unwrap_or(false);
+    let display = match active {
+        Some((c, dir)) if c == col => format!("{}{}", label, dir.arrow()),
+        _ => label.to_string(),
+    };
+    let text_color = if is_active {
+        Color::from_rgb(0.75, 0.88, 1.0)
+    } else {
+        Color::from_rgb(0.55, 0.57, 0.62)
+    };
+    container(
+        button(
+            text(display)
+                .size(font::sized(11.0))
+                .color(text_color)
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .on_press(Message::HvscBrowserSortBy(col))
+        .padding(Padding::from([2, 4]))
+        .style(|_theme: &Theme, st| button::Style {
+            background: match st {
+                button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
+                    1.0, 1.0, 1.0, 0.06,
+                ))),
+                _ => None,
+            },
+            text_color: Color::WHITE,
+            border: iced::Border {
+                radius: 2.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    )
+    .width(width)
+    .clip(true)
+    .into()
+}
+
+/// Background for one tune row, lowest layer first: zebra stripe, hover,
+/// selection. Stripes alone are what let the eye follow a row across to the
+/// buttons on a wide screen; hover and selection confirm the one you are on.
+fn hvsc_row_bg(striped: bool, hovered: bool, selected: bool) -> Option<iced::Background> {
+    let c = if selected {
+        Color::from_rgba(0.3, 0.5, 0.8, 0.2)
+    } else if hovered {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.04)
+    } else if striped {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.02)
+    } else {
+        return None;
+    };
+    Some(iced::Background::Color(c))
+}
+
 /// Two-column HVSC browser panel. Left: author list (alphabetical, sticky
 /// letter headers). Right: tunes belonging to the selected author. Footer
 /// has Add-all + category segmented control + Close.
@@ -2632,6 +2780,7 @@ pub fn hvsc_browser_view<'a>(
     update_available: bool,
     sync_in_progress: bool,
     sync_status: &'a str,
+    scroll: HvscScroll,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::HvscCategory;
 
@@ -2766,9 +2915,11 @@ pub fn hvsc_browser_view<'a>(
         .into(),
     );
 
-    // ── Left column: search + author list ──────────────────────────────────
-    let search_input = text_input("Search authors / tunes", browser.search())
-        .on_input(Message::HvscBrowserSearchChanged)
+    // ── Left column: author filter + author list ───────────────────────────
+    // Filters authors only. Previously one box drove both panes, so typing a
+    // tune name emptied the author list out from under you.
+    let search_input = text_input("Filter authors", browser.author_filter())
+        .on_input(Message::HvscBrowserAuthorFilterChanged)
         .size(font::sized(12.0))
         .padding(Padding::from([6, 10]))
         .width(Length::Fill)
@@ -2785,48 +2936,86 @@ pub fn hvsc_browser_view<'a>(
             selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
         });
 
-    let mut author_col: Column<'a, Message> = column![].spacing(1);
-    let mut last_letter: Option<char> = None;
+    // Author list, virtualised. Without this the browser rebuilds a button
+    // widget for every one of ~1850 authors on every frame, which is the bulk
+    // of the panel's render cost.
     let filtered_authors = browser.filtered_authors();
     let total_authors = browser.authors().len();
+
+    // Flatten letter headers and authors into one uniform-height list so the
+    // visible window is a simple offset/height division.
+    enum AuthorItem {
+        Letter(char),
+        Author(usize),
+    }
+    let mut items: Vec<AuthorItem> = Vec::with_capacity(filtered_authors.len() + 32);
+    let mut last_letter: Option<char> = None;
     for &idx in &filtered_authors {
         let a = &browser.authors()[idx];
-        // Sticky-ish letter header (just an inline divider row).
         if Some(a.letter) != last_letter {
             last_letter = Some(a.letter);
-            author_col = author_col.push(
-                container(
-                    text(a.letter.to_string())
-                        .size(font::sized(11.0))
-                        .color(Color::from_rgb(0.45, 0.47, 0.55)),
-                )
-                .padding(Padding::from([4, 10])),
-            );
+            items.push(AuthorItem::Letter(a.letter));
         }
-        let is_selected = browser.selected_author_idx() == Some(idx);
-        let row_bg = if is_selected {
-            Color::from_rgb(0.20, 0.25, 0.35)
-        } else {
-            Color::from_rgba(0.0, 0.0, 0.0, 0.0)
-        };
-        let label = button(
-            text(&a.display_name)
-                .size(font::sized(13.0))
-                .color(Color::from_rgb(0.85, 0.87, 0.9)),
-        )
-        .on_press(Message::HvscBrowserAuthorSelected(idx))
-        .padding(Padding::from([4, 12]))
-        .width(Length::Fill)
-        .style(move |_t: &Theme, st| button::Style {
-            background: Some(iced::Background::Color(match st {
-                button::Status::Hovered => Color::from_rgb(0.16, 0.18, 0.22),
-                _ => row_bg,
-            })),
-            text_color: Color::from_rgb(0.85, 0.87, 0.9),
-            border: iced::Border::default(),
-            ..Default::default()
-        });
-        author_col = author_col.push(label);
+        items.push(AuthorItem::Author(idx));
+    }
+
+    let arh = row_height();
+    let a_first = ((scroll.authors_y / arh) as usize).saturating_sub(OVERSCAN);
+    let a_in_view = (scroll.authors_h / arh).ceil() as usize + 1;
+    let a_last = (a_first + a_in_view + OVERSCAN * 2).min(items.len());
+
+    let mut author_col: Column<'a, Message> = column![].spacing(0).width(Length::Fill);
+    if a_first > 0 {
+        author_col = author_col.push(Space::new().height(Length::Fixed(a_first as f32 * arh)));
+    }
+    for item in items.get(a_first..a_last).unwrap_or(&[]) {
+        match *item {
+            AuthorItem::Letter(c) => {
+                author_col = author_col.push(
+                    container(
+                        text(c.to_string())
+                            .size(font::sized(11.0))
+                            .color(Color::from_rgb(0.45, 0.47, 0.55)),
+                    )
+                    .height(Length::Fixed(arh))
+                    .padding(Padding::from([0, 10]))
+                    .align_y(Alignment::Center),
+                );
+            }
+            AuthorItem::Author(idx) => {
+                let a = &browser.authors()[idx];
+                let is_selected = browser.selected_author_idx() == Some(idx);
+                let row_bg = if is_selected {
+                    Color::from_rgb(0.20, 0.25, 0.35)
+                } else {
+                    Color::from_rgba(0.0, 0.0, 0.0, 0.0)
+                };
+                let label = button(
+                    text(&a.display_name)
+                        .size(font::sized(13.0))
+                        .color(Color::from_rgb(0.85, 0.87, 0.9))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .on_press(Message::HvscBrowserAuthorSelected(idx))
+                .padding(Padding::from([0, 12]))
+                .width(Length::Fill)
+                .height(Length::Fixed(arh))
+                .style(move |_t: &Theme, st| button::Style {
+                    background: Some(iced::Background::Color(match st {
+                        button::Status::Hovered => Color::from_rgb(0.16, 0.18, 0.22),
+                        _ => row_bg,
+                    })),
+                    text_color: Color::from_rgb(0.85, 0.87, 0.9),
+                    border: iced::Border::default(),
+                    ..Default::default()
+                });
+                author_col = author_col.push(label);
+            }
+        }
+    }
+    let a_rest = items.len().saturating_sub(a_last);
+    if a_rest > 0 {
+        author_col = author_col.push(Space::new().height(Length::Fixed(a_rest as f32 * arh)));
     }
 
     // Label depends on category — DEMOS/GAMES list "sections" (0-9, A-F,
@@ -2859,8 +3048,7 @@ pub fn hvsc_browser_view<'a>(
 
     let search_row = row![
         search_input,
-        scope_chip,
-        tool_button("🎲 Surprise me", Message::HvscBrowserSurpriseMe),
+        tool_button("🎲", Message::HvscBrowserSurpriseMe),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
@@ -2870,7 +3058,11 @@ pub fn hvsc_browser_view<'a>(
         text(author_count_label)
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.45, 0.47, 0.55)),
-        scrollable(author_col).height(Length::Fill),
+        scrollable(author_col)
+            .id(hvsc_authors_scrollable_id())
+            .on_scroll(Message::HvscAuthorsScrolled)
+            .width(Length::Fill)
+            .height(Length::Fill),
     ]
     .spacing(6)
     .padding(Padding::from([8, 8]))
@@ -2883,10 +3075,12 @@ pub fn hvsc_browser_view<'a>(
     let has_search = !browser.search().trim().is_empty();
     let author_selected = browser.selected_author().is_some();
     let scope_author = browser.search_scope_this_author() && author_selected;
-    let flat_results: Vec<usize> = if has_search && !scope_author {
-        browser.filtered_flat()
+    // Read the cache the update loop filled. `view()` runs ~30x/second and
+    // must not rescan the index.
+    let flat_results: &[usize] = if has_search && !scope_author {
+        browser.flat_results()
     } else {
-        Vec::new()
+        &[]
     };
     let flat_building = has_search
         && !scope_author
@@ -2897,14 +3091,23 @@ pub fn hvsc_browser_view<'a>(
 
     // ── Right column: tune list ─────────────────────────────────────────────
     let right_header: Element<'a, Message> = if show_flat_results {
-        let total = browser.flat_index().len();
+        let indexed = browser.flat_index().len();
+        let total = browser.flat_total_matches();
+        let shown = flat_results.len();
         let label = if flat_building {
             "Indexing tunes…".to_string()
+        } else if total > shown {
+            // Name the category: the index is per-category, so "21082 indexed"
+            // against a 61k collection reads like a broken build otherwise.
+            format!(
+                "top {shown} of {total} matches — {indexed} indexed in {}",
+                browser.category().label()
+            )
         } else {
             format!(
-                "{} matches across all (showing up to 500 of {})",
-                flat_results.len(),
-                total
+                "{shown} match{} — {indexed} indexed in {}",
+                if shown == 1 { "" } else { "es" },
+                browser.category().label()
             )
         };
         row![
@@ -2945,172 +3148,238 @@ pub fn hvsc_browser_view<'a>(
         }
     };
 
-    // Tune rows (no virtualisation for MVP — typical author has <50 tunes).
-    let mut tune_col: Column<'a, Message> = column![].spacing(1);
-    if show_flat_results {
-        // Global search results — mirror the per-author column layout so
-        // the user sees the same signal (title / author / released / #
-        // songs / duration / STIL) whether browsing an author or
-        // searching across the whole category.
-        let col_author_w = Length::FillPortion(3);
-        let col_subs_w = Length::Fixed(40.0);
-        let col_len_w = Length::Fixed(60.0);
-        let col_stil_w = Length::Fixed(40.0);
-        tune_col = tune_col.push(
-            row![
-                text("Title")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(Length::FillPortion(5)),
-                text("Author / section")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_author_w),
-                text("#")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_subs_w),
-                text("Len")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_len_w),
-                text("STIL")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_stil_w),
-                Space::new().width(Length::Fixed(72.0)),
-            ]
-            .padding(Padding::from([2, 10]))
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        if flat_building {
-            // No rows yet — the header already shows "Indexing tunes…";
-            // leave the tune column empty rather than flashing a stale
-            // list from a prior category.
-        } else {
-            for &fi in &flat_results {
-                let f = &browser.flat_index()[fi];
-                let duration_label = match f.duration_secs {
-                    Some(s) => format!("{}:{:02}", s / 60, s % 60),
-                    None => "—".to_string(),
-                };
-                let stil_marker = if f.has_stil { "✓" } else { "" };
-                let row_widget = row![
-                    text(&f.title)
-                        .size(font::sized(13.0))
-                        .color(Color::from_rgb(0.85, 0.87, 0.9))
-                        .width(Length::FillPortion(5))
-                        .wrapping(text::Wrapping::None),
-                    text(&f.author_raw)
-                        .size(font::sized(12.0))
-                        .color(Color::from_rgb(0.65, 0.67, 0.72))
-                        .width(col_author_w)
-                        .wrapping(text::Wrapping::None),
-                    text(f.songs.to_string())
-                        .size(font::sized(12.0))
-                        .color(Color::from_rgb(0.65, 0.67, 0.72))
-                        .width(col_subs_w),
-                    text(duration_label)
-                        .size(font::sized(12.0))
-                        .color(Color::from_rgb(0.65, 0.67, 0.72))
-                        .width(col_len_w),
-                    text(stil_marker)
-                        .size(font::sized(12.0))
-                        .color(Color::from_rgb(0.4, 0.85, 0.5))
-                        .width(col_stil_w),
-                    tool_button("▶", Message::HvscBrowserPlayFlat(fi)),
+    // Tune rows. Every row is a fixed-height, full-width container so the
+    // zebra stripe reads as a continuous line from the title across to the
+    // buttons — that line is what makes a wide screen usable.
+    // Header lives OUTSIDE the scrollable so the sortable column headers stay
+    // reachable in a long list. `tune_col` holds only data rows.
+    let mut table_header: Option<Element<'a, Message>> = None;
+    let mut tune_col: Column<'a, Message> = column![].spacing(0).width(Length::Fill);
+    let cols = hvsc_cols();
+    let sort = browser.sort();
+    let hovered = browser.hovered_row();
+    let selected_path = browser.selected_tune();
+
+    // Header shared by both list modes; only the second column differs.
+    let header_row = |secondary: &'a str| -> Element<'a, Message> {
+        let inner = row![
+            sortable_header("Title", HvscSortColumn::Title, sort, cols.title),
+            sortable_header(secondary, HvscSortColumn::Secondary, sort, cols.secondary),
+            sortable_header("#", HvscSortColumn::Subs, sort, cols.subs),
+            sortable_header("Len", HvscSortColumn::Len, sort, cols.len),
+            nowrap_text(
+                "STIL".to_string(),
+                Color::from_rgb(0.55, 0.57, 0.62),
+                11.0,
+                cols.stil
+            ),
+            // Matches the row's action cluster, plus the scrollbar gutter: the
+            // scrollbar overlays the rows, so without it the header would sit
+            // a few pixels right of the columns it names.
+            Space::new().width(Length::Fixed(hvsc_actions_width() + HVSC_SCROLLBAR_W)),
+        ]
+        .width(Length::Fill)
+        .padding(Padding::from([0, 10]))
+        .spacing(8)
+        .align_y(Alignment::Center);
+        // Pin the height. The cells use `Length::Fill` height so they inherit
+        // the row box, but a Row *encloses* its children's sizing, so without
+        // a fixed height here the header would claim the entire pane.
+        container(inner)
+            .width(Length::Fill)
+            .height(Length::Fixed(row_height()))
+            .clip(true)
+            .into()
+    };
+
+    // One tune row. `i` is the position in the visible list (for striping and
+    // hover); `idx` is the index the action messages carry.
+    #[allow(clippy::too_many_arguments)]
+    fn tune_row<'a>(
+        i: usize,
+        title: &'a str,
+        secondary: &'a str,
+        songs: u16,
+        duration_secs: Option<u32>,
+        has_stil: bool,
+        is_selected: bool,
+        is_hovered: bool,
+        cols: &HvscCols,
+        play: Message,
+        add: Message,
+        select: Message,
+    ) -> Element<'a, Message> {
+        let duration_label = match duration_secs {
+            Some(s) => format!("{}:{:02}", s / 60, s % 60),
+            None => "—".to_string(),
+        };
+        let meta = Color::from_rgb(0.65, 0.67, 0.72);
+        // Double-click reuses the existing play path rather than adding one.
+        let dbl = play.clone();
+        let content = row![
+            nowrap_text(
+                title.to_string(),
+                Color::from_rgb(0.85, 0.87, 0.9),
+                13.0,
+                cols.title
+            ),
+            nowrap_text(secondary.to_string(), meta, 12.0, cols.secondary),
+            nowrap_text(songs.to_string(), meta, 12.0, cols.subs),
+            nowrap_text(duration_label, meta, 12.0, cols.len),
+            nowrap_text(
+                if has_stil { "✓" } else { "" }.to_string(),
+                Color::from_rgb(0.4, 0.85, 0.5),
+                12.0,
+                cols.stil
+            ),
+            container(
+                row![
+                    tool_button("▶", play),
                     Space::new().width(Length::Fixed(4.0)),
-                    tool_button("➕", Message::HvscBrowserAddFlat(fi)),
+                    tool_button("➕", add),
                 ]
-                .padding(Padding::from([2, 10]))
-                .spacing(8)
-                .align_y(Alignment::Center);
-                tune_col = tune_col.push(row_widget);
+                .align_y(Alignment::Center)
+            )
+            .width(Length::Fixed(hvsc_actions_width())),
+        ]
+        .width(Length::Fill)
+        .padding(Padding::from([0, 10]))
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let bg = hvsc_row_bg(i % 2 == 1, is_hovered, is_selected);
+        let styled = container(content)
+            .width(Length::Fill)
+            .height(Length::Fixed(row_height()))
+            .clip(true)
+            .style(move |_t: &Theme| container::Style {
+                background: bg,
+                ..Default::default()
+            });
+
+        // `mouse_area` supplies the click semantics; the ▶ / ➕ buttons inside
+        // capture their own presses, so clicking one does not also select.
+        mouse_area(styled)
+            .on_press(select)
+            .on_double_click(dbl)
+            .on_enter(Message::HvscBrowserRowHovered(Some(i)))
+            .on_exit(Message::HvscBrowserRowHovered(None))
+            .into()
+    }
+
+    // Visible window for the tune list. 500 search hits x ~10 widgets each,
+    // rebuilt every frame, was the panel's dominant render cost.
+    let trh = row_height();
+    let t_first = ((scroll.tunes_y / trh) as usize).saturating_sub(OVERSCAN);
+    let t_in_view = (scroll.tunes_h / trh).ceil() as usize + 1;
+    let visible = |total: usize| -> (usize, usize) {
+        (
+            t_first.min(total),
+            (t_first + t_in_view + OVERSCAN * 2).min(total),
+        )
+    };
+
+    if show_flat_results {
+        table_header = Some(header_row("Author / section"));
+        if !flat_building {
+            let (lo, hi) = visible(flat_results.len());
+            if lo > 0 {
+                tune_col = tune_col.push(Space::new().height(Length::Fixed(lo as f32 * trh)));
+            }
+            for (i, &fi) in flat_results.iter().enumerate().take(hi).skip(lo) {
+                let f = &browser.flat_index()[fi];
+                tune_col = tune_col.push(tune_row(
+                    i,
+                    &f.title,
+                    &f.author_raw,
+                    f.songs,
+                    f.duration_secs,
+                    f.has_stil,
+                    selected_path == Some(f.path.as_path()),
+                    hovered == Some(i),
+                    &cols,
+                    Message::HvscBrowserPlayFlat(fi),
+                    Message::HvscBrowserAddFlat(fi),
+                    Message::HvscBrowserSelectFlat(fi),
+                ));
+            }
+            let rest = flat_results.len().saturating_sub(hi);
+            if rest > 0 {
+                tune_col = tune_col.push(Space::new().height(Length::Fixed(rest as f32 * trh)));
             }
         }
     } else if browser.selected_author().is_some() {
-        // Column widths. Title + Released share the flexible space with
-        // FillPortion so short titles don't leave a giant gap before the
-        // metadata, and long publisher strings in `released` don't wrap
-        // to multiple lines. The right-side metric columns stay fixed so
-        // they align across rows.
-        let col_subs_w = Length::Fixed(40.0);
-        let col_len_w = Length::Fixed(60.0);
-        let col_stil_w = Length::Fixed(40.0);
-        // Column header
-        tune_col = tune_col.push(
-            row![
-                text("Title")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(Length::FillPortion(5)),
-                text("Released")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(Length::FillPortion(3)),
-                text("#")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_subs_w),
-                text("Len")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_len_w),
-                text("STIL")
-                    .size(font::sized(11.0))
-                    .color(Color::from_rgb(0.55, 0.57, 0.62))
-                    .width(col_stil_w),
-                Space::new().width(Length::Fixed(72.0)),
-            ]
-            .padding(Padding::from([2, 10]))
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
+        table_header = Some(header_row("Released"));
         let filtered_tunes = browser.filtered_tunes();
-        for &idx in &filtered_tunes {
+        let (lo, hi) = visible(filtered_tunes.len());
+        if lo > 0 {
+            tune_col = tune_col.push(Space::new().height(Length::Fixed(lo as f32 * trh)));
+        }
+        for (i, &idx) in filtered_tunes.iter().enumerate().take(hi).skip(lo) {
             let t = &browser.tunes()[idx];
             let e = &t.entry;
-            let duration_label = match e.duration_secs {
-                Some(s) => format!("{}:{:02}", s / 60, s % 60),
-                None => "—".to_string(),
-            };
-            let stil_marker = if t.has_stil { "✓" } else { "" };
-            let row_widget = row![
-                text(&e.title)
-                    .size(font::sized(13.0))
-                    .color(Color::from_rgb(0.85, 0.87, 0.9))
-                    .width(Length::FillPortion(5))
-                    .wrapping(text::Wrapping::None),
-                text(&e.released)
-                    .size(font::sized(12.0))
-                    .color(Color::from_rgb(0.65, 0.67, 0.72))
-                    .width(Length::FillPortion(3))
-                    .wrapping(text::Wrapping::None),
-                text(e.songs.to_string())
-                    .size(font::sized(12.0))
-                    .color(Color::from_rgb(0.65, 0.67, 0.72))
-                    .width(col_subs_w),
-                text(duration_label)
-                    .size(font::sized(12.0))
-                    .color(Color::from_rgb(0.65, 0.67, 0.72))
-                    .width(col_len_w),
-                text(stil_marker)
-                    .size(font::sized(12.0))
-                    .color(Color::from_rgb(0.4, 0.85, 0.5))
-                    .width(col_stil_w),
-                tool_button("▶", Message::HvscBrowserPlayTune(idx)),
-                Space::new().width(Length::Fixed(4.0)),
-                tool_button("➕", Message::HvscBrowserAddTune(idx)),
-            ]
-            .padding(Padding::from([2, 10]))
-            .spacing(8)
-            .align_y(Alignment::Center);
-            tune_col = tune_col.push(row_widget);
+            tune_col = tune_col.push(tune_row(
+                i,
+                &e.title,
+                &e.released,
+                e.songs,
+                e.duration_secs,
+                t.has_stil,
+                selected_path == Some(e.path.as_path()),
+                hovered == Some(i),
+                &cols,
+                Message::HvscBrowserPlayTune(idx),
+                Message::HvscBrowserAddTune(idx),
+                Message::HvscBrowserSelectTune(idx),
+            ));
+        }
+        let rest = filtered_tunes.len().saturating_sub(hi);
+        if rest > 0 {
+            tune_col = tune_col.push(Space::new().height(Length::Fixed(rest as f32 * trh)));
         }
     }
 
-    let right_col = column![right_header, scrollable(tune_col).height(Length::Fill),]
+    let tune_search = text_input("Search tunes…", browser.search())
+        .on_input(Message::HvscBrowserSearchChanged)
+        .size(font::sized(12.0))
+        .padding(Padding::from([6, 10]))
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _st| text_input::Style {
+            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.27, 0.30),
+            },
+            icon: Color::from_rgb(0.5, 0.5, 0.6),
+            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+            value: Color::from_rgb(0.85, 0.87, 0.9),
+            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+        });
+    let tune_search_row = row![
+        tune_search,
+        scope_chip,
+        tool_button("⟳", Message::HvscBrowserRebuildIndex),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let mut table: Column<'a, Message> = column![].width(Length::Fill).height(Length::Fill);
+    if let Some(h) = table_header {
+        table = table.push(h).push(rule::horizontal(1));
+    }
+    table = table.push(
+        scrollable(tune_col)
+            .id(hvsc_tunes_scrollable_id())
+            .on_scroll(Message::HvscTunesScrolled)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    );
+
+    // The table fills the pane: the action buttons sit flush against the right
+    // edge rather than leaving a dead margin. Row striping and the hover
+    // highlight are what keep a wide row readable, so width costs nothing here.
+    let right_col = column![tune_search_row, right_header, table]
         .spacing(8)
         .padding(Padding::from([8, 8]))
         .width(Length::Fill);
@@ -3123,10 +3392,7 @@ pub fn hvsc_browser_view<'a>(
         } else {
             cat.label().to_string()
         };
-        tool_button(
-            Box::leak(label.into_boxed_str()),
-            Message::HvscBrowserCategoryChanged(cat),
-        )
+        tool_button(label, Message::HvscBrowserCategoryChanged(cat))
     };
 
     let add_all_label = match browser.selected_author() {
@@ -3134,10 +3400,7 @@ pub fn hvsc_browser_view<'a>(
         None => "⬇ Add all".to_string(),
     };
     let add_all_btn: Element<'a, Message> = if browser.selected_author().is_some() {
-        tool_button(
-            Box::leak(add_all_label.into_boxed_str()),
-            Message::HvscBrowserAddAllFromAuthor,
-        )
+        tool_button(add_all_label, Message::HvscBrowserAddAllFromAuthor)
     } else {
         // Inert placeholder: same layout, dimmed look (no on_press).
         text("⬇ Add all")
@@ -4304,7 +4567,13 @@ fn with_tip<'a>(content: impl Into<Element<'a, Message>>, tip: &'a str) -> Eleme
         .into()
 }
 
-fn tool_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
+/// Standard dark chip button. Takes anything text-like so callers with an
+/// owned `String` don't have to leak it to get a `&'a str` — five call sites
+/// were doing exactly that, once per frame.
+fn tool_button<'a>(
+    label: impl iced::widget::text::IntoFragment<'a>,
+    msg: Message,
+) -> Element<'a, Message> {
     button(text(label).size(font::sized(12.0)))
         .on_press(msg)
         .padding(Padding::from([4, 10]))

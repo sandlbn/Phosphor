@@ -63,7 +63,8 @@ pub struct DirectDevice {
 impl DirectDevice {
     pub fn open() -> Result<Self, String> {
         let mut dev = UsbSid::new();
-        dev.init(true, true).map_err(|e| open_error(&e.to_string()))?;
+        dev.init(true, true)
+            .map_err(|e| open_error(&e.to_string()))?;
         eprintln!("[sid-direct] USBSID-Pico opened (threaded, cycled)");
         Ok(Self {
             dev,

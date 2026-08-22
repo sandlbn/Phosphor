@@ -34,6 +34,7 @@ mod sid_direct;
 mod assembly64;
 mod assembly64_browser;
 mod hvsc_browser;
+mod hvsc_index_cache;
 mod hvsc_sync;
 mod published_playlists;
 mod published_playlists_browser;
@@ -333,6 +334,14 @@ struct App {
     /// Remote HVSC version reported by the boot-time `check_hvsc_update`
     /// probe. None until the probe finishes (or if it fails).
     hvsc_remote_version: Option<u32>,
+    /// Bumped per keystroke in the HVSC search box; a debounced task only
+    /// acts if its sequence number is still the latest.
+    hvsc_search_seq: u64,
+    /// Scroll state for the HVSC browser's two virtualised lists.
+    hvsc_authors_scroll_y: f32,
+    hvsc_authors_viewport_h: f32,
+    hvsc_tunes_scroll_y: f32,
+    hvsc_tunes_viewport_h: f32,
     /// Pre-formatted "HVSC v84 ✓" / "HVSC v72 → v84 ⚠" string for the
     /// status bar. Recomputed by `refresh_hvsc_status()` whenever the
     /// local STIL DB loads or the remote check returns.
@@ -635,6 +644,11 @@ impl App {
             heard_db,
             heard_text: String::new(),
             hvsc_remote_version: None,
+            hvsc_search_seq: 0,
+            hvsc_authors_scroll_y: 0.0,
+            hvsc_authors_viewport_h: 600.0,
+            hvsc_tunes_scroll_y: 0.0,
+            hvsc_tunes_viewport_h: 600.0,
             hvsc_status_text: String::new(),
             hvsc_update_available: false,
             show_recently_played: false,
@@ -2339,36 +2353,87 @@ impl App {
                 if let Err(e) = self.hvsc_browser.load_authors_if_needed() {
                     eprintln!("[hvsc-browser] {e}");
                 }
+                // `set_category` throws the index away. Without restarting the
+                // build here, a category switch with text still in the search
+                // box showed nothing until the user cleared and retyped it.
+                return self.hvsc_kick_index_build();
             }
 
             Message::HvscBrowserSearchChanged(q) => {
-                let was_empty = self.hvsc_browser.search().is_empty();
+                // Update the box immediately so typing feels instant, but let
+                // the pause below decide when to actually search — fuzzy
+                // scoring 60k entries on every keystroke is wasted work.
                 self.hvsc_browser.set_search(q);
-                // First non-empty keystroke on a cold cache — kick off a
-                // background walk to enrich every SID/MUS in this
-                // category with title/released/duration/STIL. On SSD the
-                // build takes ~5-10 s for ~10k files; the UI keeps
-                // running because it's dispatched through Task::perform.
-                if was_empty && !self.hvsc_browser.search().is_empty() {
-                    if let Some((root, category, version)) =
-                        self.hvsc_browser.begin_flat_index_build()
-                    {
-                        let stil = self.stil_db.clone();
-                        let songlength = self.songlength_db.clone();
-                        return Task::perform(
-                            async move {
-                                hvsc_browser::build_flat_index_worker(
-                                    root, category, stil, songlength,
-                                )
-                            },
-                            move |index| Message::HvscFlatIndexReady(version, index),
-                        );
-                    }
+                self.hvsc_search_seq = self.hvsc_search_seq.wrapping_add(1);
+                let seq = self.hvsc_search_seq;
+                return Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+                        seq
+                    },
+                    Message::HvscSearchDebounced,
+                );
+            }
+
+            Message::HvscSearchDebounced(seq) => {
+                // A newer keystroke has already been scheduled — drop this one.
+                if seq != self.hvsc_search_seq {
+                    return Task::none();
                 }
+                self.hvsc_browser.recompute_search();
+                return self.hvsc_kick_index_build();
+            }
+
+            Message::HvscBrowserAuthorFilterChanged(q) => {
+                self.hvsc_browser.set_author_filter(q);
+            }
+
+            Message::HvscBrowserSelectTune(idx) => {
+                let path = self
+                    .hvsc_browser
+                    .tunes()
+                    .get(idx)
+                    .map(|t| t.entry.path.clone());
+                self.hvsc_browser.set_selected_tune(path);
+            }
+
+            Message::HvscBrowserSelectFlat(fi) => {
+                let path = self
+                    .hvsc_browser
+                    .flat_index()
+                    .get(fi)
+                    .map(|e| e.path.clone());
+                self.hvsc_browser.set_selected_tune(path);
+            }
+
+            Message::HvscAuthorsScrolled(v) => {
+                self.hvsc_authors_scroll_y = v.absolute_offset().y;
+                self.hvsc_authors_viewport_h = v.bounds().height;
+            }
+
+            Message::HvscTunesScrolled(v) => {
+                self.hvsc_tunes_scroll_y = v.absolute_offset().y;
+                self.hvsc_tunes_viewport_h = v.bounds().height;
+            }
+
+            Message::HvscBrowserRowHovered(row) => {
+                self.hvsc_browser.set_hovered_row(row);
+            }
+
+            Message::HvscBrowserSortBy(col) => {
+                self.hvsc_browser.toggle_sort(col);
+                self.hvsc_browser.recompute_search();
+            }
+
+            Message::HvscBrowserRebuildIndex => {
+                hvsc_index_cache::clear_all();
+                self.hvsc_browser.forget_flat_index();
+                return self.hvsc_kick_index_build();
             }
 
             Message::HvscFlatIndexReady(version, index) => {
                 self.hvsc_browser.install_flat_index(version, index);
+                self.hvsc_browser.recompute_search();
             }
 
             Message::HvscBrowserSearchScopeToggled(on) => {
@@ -3119,10 +3184,9 @@ impl App {
                 // thread, since the files may live on cloud/network storage.
                 if let Some(root_str) = self.config.hvsc_root.clone() {
                     // User-driven: honour an older tree too.
-                    return Task::perform(
-                        load_hvsc_metadata(PathBuf::from(root_str), true),
-                        |m| Message::HvscMetadataLoaded(Box::new(m)),
-                    );
+                    return Task::perform(load_hvsc_metadata(PathBuf::from(root_str), true), |m| {
+                        Message::HvscMetadataLoaded(Box::new(m))
+                    });
                 }
             }
 
@@ -3319,8 +3383,7 @@ impl App {
                     };
                     match hvsc_sync::HvscSyncHandle::start_from_zip(&url, &dest) {
                         Ok(handle) => {
-                            self.config.hvsc_root =
-                                Some(dest.to_string_lossy().into_owned());
+                            self.config.hvsc_root = Some(dest.to_string_lossy().into_owned());
                             self.config.save();
                             self.hvsc_sync = Some(handle);
                             self.hvsc_sync_status = "Starting zip download…".to_string();
@@ -3688,6 +3751,12 @@ impl App {
                 self.hvsc_sync.is_some(),
                 &self.hvsc_sync_status,
                 &self.session_mode,
+                ui::HvscScroll {
+                    authors_y: self.hvsc_authors_scroll_y,
+                    authors_h: self.hvsc_authors_viewport_h,
+                    tunes_y: self.hvsc_tunes_scroll_y,
+                    tunes_h: self.hvsc_tunes_viewport_h,
+                },
             );
             column![
                 info_bar,
@@ -4068,6 +4137,48 @@ impl App {
         }
     }
 
+    /// Start a background flat-index build if one is warranted and none is
+    /// already running. `begin_flat_index_build` is itself idempotent, so this
+    /// is safe to call from every path that can invalidate the index.
+    fn hvsc_kick_index_build(&mut self) -> Task<Message> {
+        if self.hvsc_browser.search().trim().is_empty() {
+            return Task::none();
+        }
+        let Some((root, category, version)) = self.hvsc_browser.begin_flat_index_build() else {
+            return Task::none();
+        };
+        let stil = self.stil_db.clone();
+        let songlength = self.songlength_db.clone();
+        // Release the tree is on, so a cache built for an older HVSC is not
+        // reused after an update.
+        let hvsc_version = self
+            .stil_db
+            .as_ref()
+            .and_then(|db| db.hvsc_version)
+            .or_else(|| {
+                self.config
+                    .hvsc_known_version
+                    .as_deref()
+                    .and_then(|v| v.trim().trim_start_matches(['v', 'V']).parse().ok())
+            });
+        Task::perform(
+            async move {
+                if let Some(cached) = hvsc_index_cache::load(&root, category, hvsc_version) {
+                    return cached;
+                }
+                let index =
+                    hvsc_browser::build_flat_index_worker(root.clone(), category, stil, songlength);
+                // Only persist a complete walk — a partial index would look
+                // valid on the next load.
+                if !index.is_empty() {
+                    hvsc_index_cache::save(&root, category, hvsc_version, &index);
+                }
+                index
+            },
+            move |index| Message::HvscFlatIndexReady(version, index),
+        )
+    }
+
     /// Recompute the auto-download status line shown in the search bar.
     /// Call after each auto-download completes.  Clears the line once both
     /// databases are loaded so it doesn't clutter the UI permanently.
@@ -4109,6 +4220,10 @@ impl App {
     }
 
     fn apply_post_hvsc_sync(&mut self) {
+        // A sync rewrites the tree wholesale, so every cached index is suspect.
+        hvsc_index_cache::clear_all();
+        self.hvsc_browser.forget_flat_index();
+
         let Some(root) = self.config.hvsc_root.clone() else {
             return;
         };

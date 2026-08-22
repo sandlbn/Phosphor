@@ -49,6 +49,12 @@ url = "2.5"
 # Player ↔ GUI communication
 crossbeam-channel = "0.5"
 
+# Fuzzy matching for HVSC search. Typo tolerance plus relevance ranking, so
+# "commndo" finds "Commando" and an exact title hit outranks an incidental
+# substring in `released`. Its only deps (memchr, unicode-segmentation) were
+# already in the lockfile, so this adds nothing transitively.
+nucleo-matcher = "0.3"
+
 # Shuffle & randomisation
 rand = "0.8"
 
