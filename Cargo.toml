@@ -76,6 +76,19 @@ reqwest = { version = "0.13.2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 open = "5"
+# In-app archive extraction for the "fast first-time HVSC sync" path.
+# Two formats supported because HVSC mirrors serve both:
+#   * .zip  — the standard, handled by `zip` (deflate only — HVSC
+#             archives never use bzip2/zstd, so we skip those features).
+#   * .7z   — brona.dk's `HVSC_XX-all-of-them.7z`, handled by
+#             `sevenz-rust` (pure-Rust LZMA/LZMA2 decoder, no C deps).
+# We dispatch by magic bytes at extract time; the URL suffix is not
+# consulted (mirrors sometimes serve one via a redirect from the other).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# `sevenz-rust2` is the maintained fork of the abandoned `sevenz-rust`
+# (last release 0.6.1, ~2023). The fork adds PPMD support (method
+# `0x030401`), which brona.dk's HVSC 7z archives use.
+sevenz-rust2 = "0.21"
 
 # Unix signal handling (macOS/Linux)
 [target.'cfg(unix)'.dependencies]

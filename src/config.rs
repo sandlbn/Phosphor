@@ -44,6 +44,11 @@ pub struct Config {
     pub hvsc_rsync_url: String,
     /// ISO-8601 timestamp of the last successful HVSC sync (display only).
     pub hvsc_last_sync: Option<String>,
+    /// Optional URL to a HVSC zip archive, used by the "Fast first-time
+    /// sync" path (see [`crate::hvsc_sync::HvscSyncHandle::start_from_zip`]).
+    /// Empty / None = the button is disabled — HVSC's canonical zip URL
+    /// changes per release, so we don't ship a default that might 404.
+    pub hvsc_zip_url: Option<String>,
     /// Browser source toggle. "local" (default) or "a64". Persisted so
     /// the user's last-picked source survives restarts.
     pub browser_source: String,
@@ -130,6 +135,7 @@ impl Default for Config {
             hvsc_root: None,
             hvsc_rsync_url: DEFAULT_HVSC_RSYNC_URL.to_string(),
             hvsc_last_sync: None,
+            hvsc_zip_url: None,
             browser_source: "local".to_string(),
             assembly64_last_query: None,
             published_playlists_last_synced: None,
@@ -276,6 +282,11 @@ impl Config {
                 if val != "null" {
                     config.hvsc_last_sync = strip_json_string(val);
                 }
+            } else if let Some(rest) = line.strip_prefix("\"hvsc_zip_url\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.hvsc_zip_url = strip_json_string(val);
+                }
             } else if let Some(rest) = line.strip_prefix("\"browser_source\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if let Some(s) = strip_json_string(val) {
@@ -421,6 +432,7 @@ impl Config {
                 "  \"hvsc_known_version\": {},\n",
                 "  \"hvsc_rsync_url\": \"{}\",\n",
                 "  \"hvsc_last_sync\": {},\n",
+                "  \"hvsc_zip_url\": {},\n",
                 "  \"browser_source\": \"{}\",\n",
                 "  \"assembly64_last_query\": {},\n",
                 "  \"published_playlists_last_synced\": {},\n",
@@ -457,6 +469,7 @@ impl Config {
             fmt_opt_str(&self.hvsc_known_version),
             self.hvsc_rsync_url,
             fmt_opt_str(&self.hvsc_last_sync),
+            fmt_opt_str(&self.hvsc_zip_url),
             self.browser_source,
             fmt_opt_str(&self.assembly64_last_query),
             fmt_opt_i64(self.published_playlists_last_synced),

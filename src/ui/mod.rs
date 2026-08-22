@@ -458,6 +458,13 @@ pub enum Message {
     /// Per-Tick drain — UI consumes the queued progress events here.
     HvscRsyncPoll,
 
+    // HVSC zip sync — an alternative first-time-fast path that pulls a
+    // single archive instead of ~75k individual HTTP GETs. Uses the same
+    // `hvsc_sync` handle + progress event stream as the rsync path, so
+    // only one of the two can run at a time.
+    HvscZipUrlChanged(String),
+    HvscZipSyncStart,
+
     // No-op
     None,
 }
@@ -3757,6 +3764,96 @@ pub fn settings_panel<'a>(
     ]
     .spacing(6);
 
+    // ── HVSC "fast first-time sync" via a single zip archive ────
+    // Rationale: the recursive HTTPS crawl above issues one GET per
+    // file (~75k of them) against community-run mirrors that respond at
+    // a few KB/s. A first-time sync can take hours. Downloading a single
+    // ~500 MB zip is orders of magnitude faster.
+    //
+    // Empty URL by default (HVSC's canonical zip URL moves per release
+    // — no safe default). Button disabled until the user pastes one.
+    // Effective URL = user's override if set, else auto-derived from the
+    // rsync mirror + last-known HVSC version. Showing the derived URL in
+    // the input (as the actual value, not just a placeholder) lets users
+    // see what will be fetched before they click Sync.
+    let hvsc_zip_url_str = config
+        .hvsc_zip_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            crate::hvsc_sync::default_hvsc_zip_url(
+                &config.hvsc_rsync_url,
+                config.hvsc_known_version.as_deref(),
+            )
+        })
+        .unwrap_or_default();
+    let has_zip_url = !hvsc_zip_url_str.trim().is_empty();
+    let zip_button_label = if hvsc_sync_active {
+        // If ANY sync is running, defer to the rsync section's cancel button.
+        "⚡ Fast sync (archive) — sync in progress"
+    } else if has_zip_url {
+        "⚡ Fast sync (archive)"
+    } else {
+        "⚡ Fast sync (archive) — paste URL above"
+    };
+    let zip_button: Element<'a, Message> = if has_zip_url && !hvsc_sync_active {
+        tool_button(zip_button_label, Message::HvscZipSyncStart)
+    } else {
+        // Disabled look — same shape but no on_press.
+        button(text(zip_button_label).size(font::sized(12.0)))
+            .padding(Padding::from([6, 12]))
+            .style(|_t: &Theme, _st| button::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.16, 0.17, 0.20))),
+                text_color: Color::from_rgb(0.45, 0.47, 0.52),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30),
+                },
+                ..Default::default()
+            })
+            .into()
+    };
+    let hvsc_zip_section = column![
+        text("Fast first-time sync (archive):")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        text_input(
+            "https://…/HVSC.zip or .7z — full C64Music archive URL",
+            &hvsc_zip_url_str
+        )
+        .on_input(Message::HvscZipUrlChanged)
+        .size(font::sized(12.0))
+        .padding(Padding::from([6, 10]))
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _st| text_input::Style {
+            background: iced::Background::Color(Color::from_rgb(0.14, 0.15, 0.18)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.25, 0.27, 0.30),
+            },
+            icon: Color::from_rgb(0.5, 0.5, 0.6),
+            placeholder: Color::from_rgb(0.4, 0.4, 0.5),
+            value: Color::from_rgb(0.85, 0.87, 0.9),
+            selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+        }),
+        text(
+            "Downloads the whole tree in one archive, extracts into the HVSC \
+             root above (any C64Music/ prefix is stripped). Much faster than \
+             the file-by-file HTTPS sync for a cold user. Files already \
+             present with the same size are skipped. \
+             Supported: .zip (deflate), .7z (LZMA / LZMA2 / PPMD). \
+             The default URL is auto-derived from your mirror host + last-\
+             known HVSC version — edit it if the version is stale or you \
+             prefer a different mirror."
+        )
+        .size(font::sized(11.0))
+        .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        zip_button,
+    ]
+    .spacing(6);
+
     // ── HTTP Remote Control ─────────────────────────────────────
     let remote_url = if http_remote_running {
         let ip = local_ip_address().unwrap_or_else(|| "localhost".to_string());
@@ -3973,6 +4070,8 @@ pub fn settings_panel<'a>(
                 .push(liked_section)
                 .push(rule::horizontal(1))
                 .push(hvsc_section)
+                .push(rule::horizontal(1))
+                .push(hvsc_zip_section)
                 .push(rule::horizontal(1))
                 .push(dl_section)
                 .push(rule::horizontal(1))

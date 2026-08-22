@@ -812,6 +812,39 @@ impl App {
         // immediately, before the remote check returns.
         app.refresh_hvsc_status();
 
+        // Pick up an HVSC tree the user refreshed outside Phosphor. Nothing
+        // else notices: the databases above come from the config dir,
+        // `DOCUMENTS/` is only re-read when the root path changes, and there
+        // is no file watching. Safe to race the download queued above —
+        // `HvscMetadataLoaded` compares versions before applying.
+        {
+            // `initial_hvsc_root` has been moved into the browser by now.
+            let hvsc_root = app
+                .config
+                .hvsc_root
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            if let Some(root) = hvsc_root.as_ref() {
+                let cached_ver = app.stil_db.as_ref().and_then(|db| db.hvsc_version);
+                let tree_ver = stil::peek_stil_version(&root.join("DOCUMENTS").join("STIL.txt"));
+                if stil::tree_db_is_newer(cached_ver, tree_ver) {
+                    eprintln!(
+                        "[phosphor] HVSC tree at {} is v{} but cached databases are {} — \
+                         loading from DOCUMENTS/",
+                        root.display(),
+                        tree_ver.unwrap_or(0),
+                        cached_ver.map_or_else(|| "unversioned".to_string(), |v| format!("v{v}")),
+                    );
+                    let root = root.clone();
+                    tasks.push(Task::perform(load_hvsc_metadata(root, false), |m| {
+                        Message::HvscMetadataLoaded(Box::new(m))
+                    }));
+                }
+            }
+        }
+
         (app, Task::batch(tasks))
     }
 
@@ -2141,6 +2174,12 @@ impl App {
                     remote_version: remote_ver,
                     local_version: local_ver,
                 };
+                // Store on every successful check, not just the up-to-date
+                // branch: a first install has no local HVSC, so `is_newer()`
+                // is always true and the archive URL stayed pinned to
+                // LATEST_KNOWN_HVSC_VERSION.
+                self.config.hvsc_known_version = Some(format!("v{remote_ver}"));
+                self.config.save();
                 if info.is_newer() {
                     eprintln!("[phosphor] {}", info.description());
                     // Auto-download both updated databases — same as first-launch flow.
@@ -2159,8 +2198,6 @@ impl App {
                     ]);
                 } else {
                     eprintln!("[phosphor] HVSC is up to date (v{remote_ver})");
-                    self.config.hvsc_known_version = Some(format!("v{remote_ver}"));
-                    self.config.save();
                 }
             }
 
@@ -3081,9 +3118,11 @@ impl App {
                 // DOCUMENTS/ so metadata is available right away — OFF the UI
                 // thread, since the files may live on cloud/network storage.
                 if let Some(root_str) = self.config.hvsc_root.clone() {
-                    return Task::perform(load_hvsc_metadata(PathBuf::from(root_str)), |m| {
-                        Message::HvscMetadataLoaded(Box::new(m))
-                    });
+                    // User-driven: honour an older tree too.
+                    return Task::perform(
+                        load_hvsc_metadata(PathBuf::from(root_str), true),
+                        |m| Message::HvscMetadataLoaded(Box::new(m)),
+                    );
                 }
             }
 
@@ -3122,6 +3161,20 @@ impl App {
 
             Message::HvscMetadataLoaded(meta) => {
                 let meta = *meta;
+                // Compare versions rather than trust arrival order, so the
+                // startup scan and a mirror download converge either way. Both
+                // databases come from one DOCUMENTS/ snapshot and are gated
+                // together; Songlengths.md5 has no version of its own.
+                let incoming_ver = meta.stil.as_ref().and_then(|db| db.hvsc_version);
+                let current_ver = self.stil_db.as_ref().and_then(|db| db.hvsc_version);
+                if !meta.allow_downgrade && stil::is_downgrade(current_ver, incoming_ver) {
+                    eprintln!(
+                        "[phosphor] Ignoring HVSC tree databases ({}) — already loaded {}",
+                        incoming_ver.map_or_else(|| "unversioned".to_string(), |v| format!("v{v}")),
+                        current_ver.map_or_else(|| "unversioned".to_string(), |v| format!("v{v}")),
+                    );
+                    return Task::none();
+                }
                 let mut loaded_any = false;
                 if let (Some(db), Some(path)) = (meta.songlength, meta.songlength_path) {
                     self.config.remember_songlength_path(&path);
@@ -3202,6 +3255,82 @@ impl App {
 
             Message::HvscRsyncPoll => {
                 // No-op — actual drain happens in poll_status() each Tick.
+            }
+
+            Message::HvscZipUrlChanged(url) => {
+                let trimmed = url.trim();
+                // The field shows the derived URL as its value, so a stray
+                // keystroke would otherwise persist it as an override — and
+                // overrides beat derivation, pinning the archive to this
+                // release forever. Matching the derived URL means "no override".
+                let derived = hvsc_sync::default_hvsc_zip_url(
+                    &self.config.hvsc_rsync_url,
+                    self.config.hvsc_known_version.as_deref(),
+                );
+                self.config.hvsc_zip_url =
+                    if trimmed.is_empty() || derived.as_deref() == Some(trimmed) {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                self.config.save();
+            }
+
+            Message::HvscZipSyncStart => {
+                if self.hvsc_sync.is_some() {
+                    // Another sync (rsync or zip) is already running — ignore.
+                } else {
+                    // Same "user override wins, else derive from mirror
+                    // host + known version" resolution the UI uses.
+                    let url = self
+                        .config
+                        .hvsc_zip_url
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            hvsc_sync::default_hvsc_zip_url(
+                                &self.config.hvsc_rsync_url,
+                                self.config.hvsc_known_version.as_deref(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    if url.trim().is_empty() {
+                        self.hvsc_sync_status =
+                            "No archive URL set and none could be derived from your \
+                             HVSC mirror — paste one under Fast first-time sync."
+                                .to_string();
+                        return Task::none();
+                    }
+                    let dest = match self
+                        .config
+                        .hvsc_root
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from)
+                        .or_else(hvsc_sync::default_hvsc_root)
+                    {
+                        Some(p) => p,
+                        None => {
+                            self.hvsc_sync_status =
+                                "Cannot determine destination — set HVSC root manually."
+                                    .to_string();
+                            return Task::none();
+                        }
+                    };
+                    match hvsc_sync::HvscSyncHandle::start_from_zip(&url, &dest) {
+                        Ok(handle) => {
+                            self.config.hvsc_root =
+                                Some(dest.to_string_lossy().into_owned());
+                            self.config.save();
+                            self.hvsc_sync = Some(handle);
+                            self.hvsc_sync_status = "Starting zip download…".to_string();
+                            self.hvsc_sync_progress = None;
+                        }
+                        Err(e) => {
+                            self.hvsc_sync_status = format!("Error: {e}");
+                        }
+                    }
+                }
             }
 
             Message::DownloadStil => {
@@ -5299,6 +5428,9 @@ pub struct HvscMetaLoad {
     stil_path: Option<PathBuf>,
     songlength: Option<playlist::SonglengthDb>,
     songlength_path: Option<PathBuf>,
+    /// `true` when the user picked this tree explicitly, so an older one
+    /// still loads. `false` for the startup scan — see `stil::is_downgrade`.
+    allow_downgrade: bool,
 }
 
 /// Load STIL.txt + Songlengths.md5 from `<root>/DOCUMENTS/` **off the UI
@@ -5306,7 +5438,7 @@ pub struct HvscMetaLoad {
 /// cloud/network-backed) file reads never block the UI event loop — the same
 /// reason the Surprise directory walk was moved off-thread. Missing files just
 /// yield `None` (the loaders return `Err`).
-async fn load_hvsc_metadata(root: PathBuf) -> HvscMetaLoad {
+async fn load_hvsc_metadata(root: PathBuf, allow_downgrade: bool) -> HvscMetaLoad {
     let docs = root.join("DOCUMENTS");
 
     let sl_path = docs.join("Songlengths.md5");
@@ -5326,6 +5458,7 @@ async fn load_hvsc_metadata(root: PathBuf) -> HvscMetaLoad {
         stil_path: stil_path_out,
         songlength,
         songlength_path,
+        allow_downgrade,
     }
 }
 
