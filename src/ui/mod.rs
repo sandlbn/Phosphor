@@ -143,6 +143,21 @@ pub struct DeviceConfigSnapshot {
     pub firmware_version: String,
     pub pcb_version: String,
     pub config: usbsid_pico_config::DeviceConfig,
+    /// PCB revision folded to Clojure's integer form (e.g. `"1.5"` → 15).
+    /// Zero when the firmware didn't respond with a parseable version —
+    /// gating routines never grant a feature to a zero board.
+    pub pcb_version_raw: u32,
+    /// Which feature toggles the connected board supports. Populated once
+    /// when the snapshot is built from `pcb_version_raw` via
+    /// [`usbsid_pico_config::fw_capabilities`] so every render on this
+    /// snapshot sees the same answer.
+    pub capabilities: usbsid_pico_config::Capabilities,
+    /// Last-read FPGASID diagnostic buffer, if the user has clicked
+    /// "🔍 Read diag" on the FPGASID panel. `None` until then — a plain
+    /// refresh does NOT re-read this because the readback takes a
+    /// non-trivial USB round-trip and only matters when an FPGASID is
+    /// actually installed.
+    pub fpga_diag: Option<usbsid_pico_config::FpgaSidDiag>,
 }
 
 /// Which tab of the Settings panel is currently in view. Defaults to
@@ -292,6 +307,20 @@ pub enum Message {
     /// thirteen near-identical Message variants.
     DeviceConfigAction(crate::player::DeviceConfigCmd),
     DeviceConfigResult(Result<DeviceConfigSnapshot, String>),
+    /// User clicked "Import INI…" — opens a native file dialog, parses
+    /// the picked file on top of the current snapshot, and pushes the
+    /// resulting `DeviceConfig` to the device.
+    DeviceConfigImportIni,
+    /// User clicked "Export INI…" — opens a save dialog and writes the
+    /// current snapshot's config in `cfg_usbsid.c`-compatible INI form.
+    DeviceConfigExportIni,
+    /// Internal glue for the two-step "set status text, then dispatch the
+    /// player command" flow used by INI import — the picker returns
+    /// asynchronously, so the status update has to travel with the cmd.
+    DeviceConfigStatusThenAction(String, crate::player::DeviceConfigCmd),
+    /// Fires when the export save-dialog closes. Ok(Some) → wrote file;
+    /// Ok(None) → user cancelled; Err → I/O error.
+    DeviceConfigExportResult(Result<Option<std::path::PathBuf>, String>),
 
     // Settings
     ToggleSettings,

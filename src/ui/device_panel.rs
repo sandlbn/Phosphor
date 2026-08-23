@@ -76,16 +76,26 @@ fn build_loaded<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
     ]
     .spacing(16);
 
-    // FPGASID stub: shown when any socket actually has a FPGASID configured.
-    if snap.config.socket1.chip_type == ChipType::FpgaSid
-        || snap.config.socket2.chip_type == ChipType::FpgaSid
+    // FPGASID panel: shown when any socket actually has a FPGASID
+    // configured AND the board can drive the diagnostic readback (v1.5+).
+    // Panel starts empty; user clicks "🔍 Read diag" to populate it.
+    if (snap.config.socket1.chip_type == ChipType::FpgaSid
+        || snap.config.socket2.chip_type == ChipType::FpgaSid)
+        && snap.capabilities.fpga_diag
     {
-        col = col.push(section_fpgasid_stub());
+        col = col.push(section_fpgasid(snap));
     }
 
-    col.push(section_advanced(snap))
-        .push(section_presets())
-        .push(section_tools())
+    // "Advanced" — v1.5-only knobs (`need_confirmation`,
+    // `disable_changedetect`, `preset_auto_detect`, `last_preset` display).
+    // Hidden entirely on older PCBs so a v1.3 user isn't shown toggles
+    // whose SET_CONFIG opcode the firmware would reject.
+    if snap.capabilities.presets_v15 {
+        col = col.push(section_advanced(snap));
+    }
+    col.push(section_presets(snap))
+        .push(section_ini_io())
+        .push(section_tools(snap))
         .push(section_actions())
         .into()
 }
@@ -225,16 +235,22 @@ fn section_about<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
 
 fn section_clock<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
     let current = snap.config.clock_rate;
-    let options: &[ClockRate] = &[
+    // `Ntsc2` is a v1.5+ external-clock refinement — it's only meaningful
+    // when the board can drive its own clock source. Keeping it in the
+    // picker on older PCBs would let a user select a rate the firmware
+    // silently ignores.
+    let mut options: Vec<ClockRate> = vec![
         ClockRate::Default,
         ClockRate::Pal,
         ClockRate::Ntsc,
         ClockRate::Drean,
-        ClockRate::Ntsc2,
     ];
+    if snap.capabilities.external_clock {
+        options.push(ClockRate::Ntsc2);
+    }
     let labels: Vec<String> = options.iter().map(|r| r.label().to_string()).collect();
     let selected = current.label().to_string();
-    let options_for_callback = options.to_vec();
+    let options_for_callback = options.clone();
     let picker = pick_list(labels, Some(selected), move |chosen| {
         let idx = options_for_callback
             .iter()
@@ -244,7 +260,7 @@ fn section_clock<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
     })
     .text_size(font::sized(12.0));
 
-    column![
+    let mut col = column![
         section_title("Clock"),
         row![
             text("Rate")
@@ -257,12 +273,16 @@ fn section_clock<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
         toggle_row("Lock clockrate", snap.config.lock_clockrate, |v| {
             DeviceConfigEdit::LockClockrate(v)
         }),
-        toggle_row("External clock", snap.config.external_clock, |v| {
-            DeviceConfigEdit::ExternalClock(v)
-        }),
     ]
-    .spacing(4)
-    .into()
+    .spacing(4);
+    if snap.capabilities.external_clock {
+        col = col.push(toggle_row(
+            "External clock",
+            snap.config.external_clock,
+            |v| DeviceConfigEdit::ExternalClock(v),
+        ));
+    }
+    col.into()
 }
 
 fn section_socket<'a>(
@@ -322,24 +342,38 @@ fn section_socket<'a>(
 }
 
 fn section_audio<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
-    column![
-        section_title("Audio routing"),
-        toggle_row("Lock audio switch", snap.config.lock_audio_switch, |v| {
-            DeviceConfigEdit::LockAudioSwitch(v)
-        }),
-        toggle_row("Mirrored", snap.config.mirrored, |v| {
+    // Row visibility:
+    //   * `Lock audio switch` → v1.3+ (audio switch introduced with 1.3).
+    //   * `Mirrored`/`Flipped`/`Mixed` → v1.5+ (packed into byte 60 of the
+    //     v0.7 layout; on 1.3/1.4 the byte is unused and toggling here
+    //     would silently no-op on-device).
+    //   * `Stereo (vs Mono)` → always visible; the flag exists on every
+    //     PCB revision.
+    let mut col = column![section_title("Audio routing")].spacing(4);
+    if snap.capabilities.lock_audio_switch {
+        col = col.push(toggle_row(
+            "Lock audio switch",
+            snap.config.lock_audio_switch,
+            |v| DeviceConfigEdit::LockAudioSwitch(v),
+        ));
+    }
+    if snap.capabilities.mixed {
+        col = col.push(toggle_row("Mirrored", snap.config.mirrored, |v| {
             DeviceConfigEdit::Mirrored(v)
-        }),
-        toggle_row("Flipped", snap.config.flipped, |v| {
+        }));
+        col = col.push(toggle_row("Flipped", snap.config.flipped, |v| {
             DeviceConfigEdit::Flipped(v)
-        }),
-        toggle_row("Mixed", snap.config.mixed, |v| DeviceConfigEdit::Mixed(v)),
-        toggle_row("Stereo (vs Mono)", snap.config.stereo_enabled, |v| {
-            DeviceConfigEdit::StereoEnabled(v)
-        }),
-    ]
-    .spacing(4)
-    .into()
+        }));
+        col = col.push(toggle_row("Mixed", snap.config.mixed, |v| {
+            DeviceConfigEdit::Mixed(v)
+        }));
+    }
+    col = col.push(toggle_row(
+        "Stereo (vs Mono)",
+        snap.config.stereo_enabled,
+        |v| DeviceConfigEdit::StereoEnabled(v),
+    ));
+    col.into()
 }
 
 fn section_protocols<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
@@ -529,9 +563,11 @@ fn rgb_sid_picker<'a>(current: i8) -> Element<'a, Message> {
 }
 
 fn section_advanced<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+    // Caller has already checked `snap.capabilities.presets_v15`; this
+    // section is exclusively the v1.5+ toggles.
     let cfg = &snap.config;
     let mut col = column![
-        section_title("Advanced (PCB v1.5+)"),
+        section_title("Advanced"),
         toggle_row("Need confirmation", cfg.need_confirmation, |v| {
             DeviceConfigEdit::NeedConfirmation(v)
         }),
@@ -540,6 +576,10 @@ fn section_advanced<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> 
             cfg.disable_changedetect,
             |v| DeviceConfigEdit::DisableChangeDetect(v),
         ),
+        toggle_row("Preset auto-detect", cfg.preset_auto_detect, |v| {
+            DeviceConfigEdit::PresetAutoDetect(v)
+        }),
+        kv_row("Last preset (id)", cfg.last_preset.to_string()),
     ]
     .spacing(4);
     if cfg.need_confirmation {
@@ -558,21 +598,92 @@ fn section_advanced<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> 
     col.into()
 }
 
-fn section_fpgasid_stub<'a>() -> Element<'a, Message> {
-    column![
+/// FPGASID diagnostic panel. Renders the readback that
+/// [`crate::player::DeviceConfigCmd::ReadFpgaSidDiag`] populates.
+///
+/// The base address for the read is picked from whichever socket has an
+/// FPGASID chip: socket 1 → `0x00`, socket 2 → `0x40` (matches
+/// [`usbsid_pico_config::SidSlot::addr_for_id`] for SID ids 0 and 2 — the
+/// first SID slot of each physical socket).
+fn section_fpgasid<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+    let addr: u8 = if snap.config.socket1.chip_type == ChipType::FpgaSid {
+        0x00
+    } else {
+        0x40
+    };
+    let mut col = column![
         section_title("FPGASID"),
-        text(
-            "FPGASID-specific config (revision, address-decoder, etc.) is not yet \
-              supported in Phosphor. Use the upstream USBSID-Pico-Configtool for now."
-        )
-        .size(font::sized(12.0))
-        .color(Color::from_rgb(0.85, 0.75, 0.45)),
+        row![
+            small_button(
+                "🔍 Read diag",
+                Message::DeviceConfigAction(DeviceConfigCmd::ReadFpgaSidDiag(addr))
+            ),
+            text(format!(
+                "Reads at $D{:03X} (socket {})",
+                if addr == 0 { 0x400 } else { 0x500 },
+                if addr == 0 { 1 } else { 2 }
+            ))
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     ]
-    .spacing(4)
-    .into()
+    .spacing(4);
+
+    if let Some(diag) = snap.fpga_diag.as_ref() {
+        let mut hex = String::with_capacity(16);
+        for b in diag.unique_id.iter() {
+            hex.push_str(&format!("{b:02X}"));
+        }
+        col = col.push(kv_row(
+            "Identifier",
+            format!("{:04X} (FPGASID)", diag.idnum),
+        ));
+        col = col.push(kv_row("CPLD revision", format!("{:02X}", diag.cpld)));
+        col = col.push(kv_row("FPGA revision", format!("{:02X}", diag.fpga)));
+        col = col.push(kv_row("PCA revision", format!("{:02X}", diag.pca)));
+        col = col.push(kv_row("Unique id", hex));
+        col = col.push(kv_row(
+            "Clock frequency",
+            format!("{:.3} μs", diag.frequency_us),
+        ));
+        col = col.push(kv_row("Select pins", format!("{:02X}", diag.select_pins)));
+        col = col.push(kv_row(
+            "Index A / B",
+            format!("{:02X} / {:02X}", diag.idxa, diag.idxb),
+        ));
+        col = col.push(kv_row(
+            "Filter bias A / B",
+            format!("{:02X} / {:02X}", diag.flta, diag.fltb),
+        ));
+        for sid in diag.per_sid.iter() {
+            let label = format!("Slot {} / SID {}", sid.slot, sid.sidno);
+            col = col.push(
+                text(label)
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.75, 0.77, 0.82)),
+            );
+            col = col.push(kv_row("  Output mode", sid.output_mode.to_string()));
+            col = col.push(kv_row("  ExtIn source", sid.extin_source.to_string()));
+            col = col.push(kv_row("  Register readback", sid.readback.to_string()));
+            col = col.push(kv_row("  Register delay", sid.reg_delay.to_string()));
+            col = col.push(kv_row("  Mixed waveform", sid.mixed_wave.to_string()));
+            col = col.push(kv_row("  Crunchy DAC", sid.crunchy_dac.to_string()));
+            col = col.push(kv_row("  Filter mode", sid.filter_mode.to_string()));
+            col = col.push(kv_row("  DigiFIX", format!("{}", sid.digifix)));
+        }
+    } else {
+        col = col.push(
+            text("Click Read diag to populate.")
+                .size(font::sized(12.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        );
+    }
+    col.into()
 }
 
-fn section_tools<'a>() -> Element<'a, Message> {
+fn section_tools<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
     let detect_row = row![
         small_button(
             "🔎 Detect SIDs",
@@ -588,6 +699,21 @@ fn section_tools<'a>() -> Element<'a, Message> {
         ),
     ]
     .spacing(8);
+
+    // v1.5-only advisory. SID / clone detection on 1.5 boards can
+    // misidentify chips or return partial results — the user should know
+    // to sanity-check the socket panels afterwards and re-run if needed.
+    let v15_detect_warning: Option<Element<'a, Message>> =
+        snap.capabilities.presets_v15.then(|| {
+            text(
+                "⚠ On PCB v1.5 boards, SID / clone detection can occasionally \
+                 misidentify a chip or return partial results — verify the \
+                 Socket panels after running, and re-run if anything looks off.",
+            )
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.95, 0.35, 0.35))
+            .into()
+        });
 
     let test_row = row![
         text("Test tones")
@@ -647,13 +773,20 @@ fn section_tools<'a>() -> Element<'a, Message> {
     .spacing(6)
     .align_y(Alignment::Center);
 
-    column![section_title("Tools"), detect_row, test_row, hw_row]
-        .spacing(6)
-        .into()
+    let mut col = column![section_title("Tools"), detect_row].spacing(6);
+    if let Some(warning) = v15_detect_warning {
+        col = col.push(warning);
+    }
+    col.push(test_row).push(hw_row).into()
 }
 
-fn section_presets<'a>() -> Element<'a, Message> {
-    let presets: &[Preset] = &[
+fn section_presets<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+    // Presets available on every firmware line — MIRRORED_SID (0x45) and
+    // the DUAL_FLIPPED / QUAD_* family (0x48-0x4B) are v1.5-only opcodes
+    // per the Clojure `driver.clj:805-822` table; sending them to a v1.3
+    // board raises an exception, so we hide them entirely when the PCB
+    // doesn't advertise `presets_v15`.
+    let base: &[Preset] = &[
         Preset::SingleS1,
         Preset::SingleS2,
         Preset::DualBoth,
@@ -662,6 +795,8 @@ fn section_presets<'a>() -> Element<'a, Message> {
         Preset::TripleS1,
         Preset::TripleS2,
         Preset::Quad,
+    ];
+    let v15: &[Preset] = &[
         Preset::Mirrored,
         Preset::MirroredDual,
         Preset::DualFlipped,
@@ -669,6 +804,11 @@ fn section_presets<'a>() -> Element<'a, Message> {
         Preset::QuadMixed,
         Preset::QuadFlipMixed,
     ];
+
+    let mut presets: Vec<Preset> = base.to_vec();
+    if snap.capabilities.presets_v15 {
+        presets.extend_from_slice(v15);
+    }
 
     let mut grid = column![section_title("Presets")].spacing(4);
     // Two columns per row.
@@ -686,6 +826,32 @@ fn section_presets<'a>() -> Element<'a, Message> {
         grid = grid.push(r);
     }
     grid.into()
+}
+
+/// "Import INI…" / "Export INI…" buttons — wire-compatible with the
+/// upstream Clojure tool's `cfg_usbsid.c`-format INI dumps. Both open
+/// native file dialogs on the desktop side.
+fn section_ini_io<'a>() -> Element<'a, Message> {
+    column![
+        section_title("Import / Export INI"),
+        row![
+            button(text("📥 Import INI…").size(font::sized(13.0)))
+                .on_press(Message::DeviceConfigImportIni)
+                .padding(Padding::from([6, 14]))
+                .style(phosphor_button_style),
+            button(text("📤 Export INI…").size(font::sized(13.0)))
+                .on_press(Message::DeviceConfigExportIni)
+                .padding(Padding::from([6, 14]))
+                .style(phosphor_button_style),
+            text("Compatible with the upstream Configtool.")
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(4)
+    .into()
 }
 
 fn section_actions<'a>() -> Element<'a, Message> {

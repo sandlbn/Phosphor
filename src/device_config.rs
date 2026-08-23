@@ -167,6 +167,25 @@ pub fn run<T: Transport>(
             send_cfg_opcode(&mut dev, cfg_op::RESET_MIDI_STATE, [0, 0, 0, 0])?;
             Ok(None)
         }
+
+        DeviceConfigCmd::LoadConfig(new_cfg) => {
+            // Write the parsed INI's config verbatim, apply, then refresh
+            // so the GUI reflects whatever the firmware actually accepted
+            // (e.g. legacy fw will silently drop v1.5-only fields).
+            dev.write_config(new_cfg)
+                .map_err(|e| format!("write_config: {e}"))?;
+            dev.apply().map_err(|e| format!("apply: {e}"))?;
+            refresh(&mut dev).map(Some)
+        }
+
+        DeviceConfigCmd::ReadFpgaSidDiag(addr) => {
+            let diag = dev
+                .read_fpgasid_diag(*addr)
+                .map_err(|e| format!("read_fpgasid_diag(0x{addr:02X}): {e}"))?;
+            let mut snap = refresh(&mut dev)?;
+            snap.fpga_diag = Some(diag);
+            Ok(Some(snap))
+        }
     }
 }
 
@@ -211,6 +230,7 @@ fn apply_edit(cfg: &mut usbsid_pico_config::DeviceConfig, edit: DeviceConfigEdit
         RgbLedSidToUse(v) => cfg.rgb_led.sid_to_use = v,
         NeedConfirmation(v) => cfg.need_confirmation = v,
         DisableChangeDetect(v) => cfg.disable_changedetect = v,
+        PresetAutoDetect(v) => cfg.preset_auto_detect = v,
     }
 }
 
@@ -218,9 +238,19 @@ fn refresh<T: Transport>(dev: &mut Device<T>) -> Result<DeviceConfigSnapshot, St
     let firmware_version = dev
         .read_firmware_version()
         .map_err(|e| format!("read_firmware_version: {e}"))?;
+    // Pick the encode/decode layout the device speaks BEFORE the first
+    // config round-trip. Legacy firmware (< 0.7) has a different byte
+    // grid — reading it with the v0.7 decoder would silently misdecode
+    // chip types (b13/b24 are packed nibbles in v0.7 but a clonetype byte
+    // in legacy).
+    dev.set_fw_flavor(usbsid_pico_config::fw_flavor_from_version(
+        &firmware_version,
+    ));
     let pcb_version = dev
         .read_pcb_version()
         .map_err(|e| format!("read_pcb_version: {e}"))?;
+    let pcb_version_raw = usbsid_pico_config::parse_pcb_version(&pcb_version).unwrap_or(0);
+    let capabilities = usbsid_pico_config::fw_capabilities(pcb_version_raw);
     let config = dev
         .read_config_lenient()
         .map_err(|e| format!("read_config: {e}"))?;
@@ -228,5 +258,10 @@ fn refresh<T: Transport>(dev: &mut Device<T>) -> Result<DeviceConfigSnapshot, St
         firmware_version,
         pcb_version,
         config,
+        pcb_version_raw,
+        capabilities,
+        // Preserved across refresh by the caller (see the ReadFpgaSidDiag
+        // handler in `run`) — a plain refresh doesn't re-read.
+        fpga_diag: None,
     })
 }
