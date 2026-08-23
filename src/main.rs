@@ -1636,6 +1636,28 @@ impl App {
                 self.config.save();
             }
 
+            Message::TogglePseudoStereo => {
+                self.config.pseudo_stereo_enabled = !self.config.pseudo_stereo_enabled;
+                self.config.save();
+                self.restart_current_track_if_playing();
+            }
+
+            Message::SetPseudoStereoStrength(s) => {
+                let s = player::pseudo_stereo::DetuneStrength::from_config_str(&s)
+                    .as_config_str()
+                    .to_string();
+                let changed =
+                    s != self.config.pseudo_stereo_strength || !self.config.pseudo_stereo_enabled;
+                if changed {
+                    self.config.pseudo_stereo_strength = s;
+                    // Picking a width while the feature is off obviously means
+                    // "give me that width".
+                    self.config.pseudo_stereo_enabled = true;
+                    self.config.save();
+                    self.restart_current_track_if_playing();
+                }
+            }
+
             #[cfg(target_os = "macos")]
             Message::SetMacosUsbMode(mode) => {
                 if mode != self.config.macos_usb_mode {
@@ -2521,19 +2543,7 @@ impl App {
                         let _ = vi;
                         self.selected = Some(abs_i);
                     }
-                    self.send_cmd(player::PlayerCmd::Play {
-                        path,
-                        song,
-                        force_stereo: self.config.force_stereo_2sid
-                            || std::env::args().any(|a| a == "--stereo"),
-                        sid4_addr: parse_sid4_from_args(),
-                        audio_port: if self.config.u64_audio_enabled {
-                            Some(self.config.u64_audio_port)
-                        } else {
-                            None
-                        },
-                        restart_usb_on_load: self.config.restart_usb_on_load,
-                    });
+                    self.send_cmd(self.play_cmd(path, song));
                     self.show_hvsc_browser = false;
                 }
             }
@@ -2572,19 +2582,7 @@ impl App {
                     if let Some(abs_i) = self.playlist.entries.iter().position(|e| e.path == path) {
                         self.selected = Some(abs_i);
                     }
-                    self.send_cmd(player::PlayerCmd::Play {
-                        path,
-                        song,
-                        force_stereo: self.config.force_stereo_2sid
-                            || std::env::args().any(|a| a == "--stereo"),
-                        sid4_addr: parse_sid4_from_args(),
-                        audio_port: if self.config.u64_audio_enabled {
-                            Some(self.config.u64_audio_port)
-                        } else {
-                            None
-                        },
-                        restart_usb_on_load: self.config.restart_usb_on_load,
-                    });
+                    self.send_cmd(self.play_cmd(path, song));
                     self.show_hvsc_browser = false;
                 }
             }
@@ -2648,19 +2646,7 @@ impl App {
                 if let Some(abs_i) = self.playlist.entries.iter().position(|e| e.path == path) {
                     self.selected = Some(abs_i);
                 }
-                self.send_cmd(player::PlayerCmd::Play {
-                    path,
-                    song,
-                    force_stereo: self.config.force_stereo_2sid
-                        || std::env::args().any(|a| a == "--stereo"),
-                    sid4_addr: parse_sid4_from_args(),
-                    audio_port: if self.config.u64_audio_enabled {
-                        Some(self.config.u64_audio_port)
-                    } else {
-                        None
-                    },
-                    restart_usb_on_load: self.config.restart_usb_on_load,
-                });
+                self.send_cmd(self.play_cmd(path, song));
                 crate::dlog!("SurprisePicked: PlayerCmd::Play sent, closing browser");
                 self.show_hvsc_browser = false;
             }
@@ -2860,19 +2846,7 @@ impl App {
                             {
                                 self.selected = Some(abs_i);
                             }
-                            self.send_cmd(player::PlayerCmd::Play {
-                                path,
-                                song: resolved_song,
-                                force_stereo: self.config.force_stereo_2sid
-                                    || std::env::args().any(|a| a == "--stereo"),
-                                sid4_addr: parse_sid4_from_args(),
-                                audio_port: if self.config.u64_audio_enabled {
-                                    Some(self.config.u64_audio_port)
-                                } else {
-                                    None
-                                },
-                                restart_usb_on_load: self.config.restart_usb_on_load,
-                            });
+                            self.send_cmd(self.play_cmd(path, resolved_song));
                             self.show_hvsc_browser = false;
                         }
                     }
@@ -3661,6 +3635,7 @@ impl App {
                 &self.http_port_text,
                 &self.base_font_size_text,
                 &self.proxy_url_text,
+                self.device_cfg.as_ref(),
                 self.hvsc_sync.is_some(),
                 &self.hvsc_sync_status,
                 self.hvsc_sync_progress,
@@ -4075,29 +4050,13 @@ impl App {
             self.selected = Some(idx);
             self.scroll_to_current = true;
 
-            let force_stereo =
-                self.config.force_stereo_2sid || std::env::args().any(|a| a == "--stereo");
-            let sid4_addr = parse_sid4_from_args();
             let play_path = entry.path.clone();
             let play_song = entry.selected_song;
 
             self.show_stil_overlay = false;
             self.tracker_history.reset();
             self.tracker_view.reset();
-            let audio_port = if self.config.output_engine == "u64" && self.config.u64_audio_enabled
-            {
-                Some(self.config.u64_audio_port)
-            } else {
-                None
-            };
-            self.send_cmd(PlayerCmd::Play {
-                path: play_path,
-                song: play_song,
-                force_stereo,
-                sid4_addr,
-                audio_port,
-                restart_usb_on_load: self.config.restart_usb_on_load,
-            });
+            self.send_cmd(self.play_cmd(play_path, play_song));
             self.clear_advance_status();
             // Fresh track — drop the debounce so the auto-advance for THIS
             // track's first subtune isn't gated by the previous track's fire.
@@ -4157,6 +4116,53 @@ impl App {
             },
             move |index| Message::HvscFlatIndexReady(version, index),
         )
+    }
+
+    /// Re-issue Play for the current track so a playback-affecting setting
+    /// takes effect now rather than at the next track.
+    ///
+    /// This restarts the tune from the beginning — the stereo setup is decided
+    /// in `setup_playback`, and there is no cheap way to hot-swap it without a
+    /// new PlayerCmd plus a mid-stream re-tune of SID2. Without it, changing
+    /// the width would be silent until the next track, which makes the three
+    /// presets impossible to compare.
+    fn restart_current_track_if_playing(&mut self) {
+        if self.status.state == PlayState::Playing {
+            if let Some(idx) = self.playlist.current {
+                self.play_track(idx);
+            }
+        }
+    }
+
+    /// Build a `PlayerCmd::Play` for `path`/`song` from current config.
+    ///
+    /// Single source of truth: six call sites used to repeat this block, which
+    /// is how a stale `sid4_addr` once slipped into five of them (see the
+    /// regression test in `player/mod.rs`). A new playback option added here
+    /// can't be missed at one of them.
+    fn play_cmd(&self, path: PathBuf, song: u16) -> PlayerCmd {
+        PlayerCmd::Play {
+            path,
+            song,
+            force_stereo: self.config.force_stereo_2sid
+                || std::env::args().any(|a| a == "--stereo"),
+            pseudo_stereo: self.config.pseudo_stereo_enabled.then(|| {
+                player::pseudo_stereo::DetuneStrength::from_config_str(
+                    &self.config.pseudo_stereo_strength,
+                )
+            }),
+            sid4_addr: parse_sid4_from_args(),
+            // play_track used the engine check and the other five sites did
+            // not. Unified on the stricter form: `audio_port` is only consumed
+            // by the U64 native path, so opening a UDP listener on any other
+            // engine achieved nothing.
+            audio_port: if self.config.output_engine == "u64" && self.config.u64_audio_enabled {
+                Some(self.config.u64_audio_port)
+            } else {
+                None
+            },
+            restart_usb_on_load: self.config.restart_usb_on_load,
+        }
     }
 
     /// Recompute the auto-download status line shown in the search bar.
@@ -5156,19 +5162,7 @@ impl App {
         {
             self.selected = Some(abs_i);
             if play {
-                self.send_cmd(player::PlayerCmd::Play {
-                    path: entry_path,
-                    song,
-                    force_stereo: self.config.force_stereo_2sid
-                        || std::env::args().any(|a| a == "--stereo"),
-                    sid4_addr: parse_sid4_from_args(),
-                    audio_port: if self.config.u64_audio_enabled {
-                        Some(self.config.u64_audio_port)
-                    } else {
-                        None
-                    },
-                    restart_usb_on_load: self.config.restart_usb_on_load,
-                });
+                self.send_cmd(self.play_cmd(entry_path, song));
             }
         }
     }

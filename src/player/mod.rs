@@ -5,6 +5,7 @@ pub mod hacks;
 pub mod libsidplayfp;
 pub mod memory;
 mod priority;
+pub mod pseudo_stereo;
 pub mod rsid_bus;
 pub mod sid_file;
 
@@ -21,6 +22,7 @@ use mos6502::registers::{StackPointer, Status};
 use crate::sid_device::{create_engine, SidDevice};
 use hacks::{apply_hacks, HackFlags};
 use memory::*;
+use pseudo_stereo::PseudoStereo;
 use rsid_bus::RsidBus;
 use sid_file::*;
 
@@ -35,6 +37,9 @@ pub enum PlayerCmd {
         path: PathBuf,
         song: u16,
         force_stereo: bool,
+        /// `Some(strength)` widens a 1SID tune by detuning the mirrored SID2.
+        /// `None` = off. Only consulted for genuinely mono tunes.
+        pseudo_stereo: Option<pseudo_stereo::DetuneStrength>,
         sid4_addr: u16,
         /// Some(port) → start U64 audio stream on this port after native playback begins.
         audio_port: Option<u16>,
@@ -233,12 +238,26 @@ fn send_sid_writes(
     bridge: &mut dyn SidDevice,
     writes: &[(u32, u8, u8)],
     mirror_mono: bool,
+    pseudo: Option<&mut PseudoStereo>,
     cycles_per_frame: u32,
 ) {
     if writes.is_empty() {
         return;
     }
+    let cycled = build_cycled(writes, mirror_mono, pseudo, cycles_per_frame);
+    bridge.ring_cycled(&cycled);
+}
 
+/// Build the delta-encoded write stream for one frame.
+///
+/// Pure — no device, no I/O — so the mirroring and detune logic can be
+/// unit-tested directly. `send_sid_writes` is a thin wrapper over it.
+fn build_cycled(
+    writes: &[(u32, u8, u8)],
+    mirror_mono: bool,
+    mut pseudo: Option<&mut PseudoStereo>,
+    cycles_per_frame: u32,
+) -> Vec<(u16, u8, u8)> {
     // Clamp cycle timestamps to [0, cycles_per_frame].
     // When the player fires right at the frame boundary it executes a few hundred
     // overflow cycles (see PLAYER_OVERFLOW in run_rsid_sub_emu).  Those SID writes
@@ -252,6 +271,9 @@ fn send_sid_writes(
 
     if mirror_mono {
         // Mono: duplicate each write for SID2 at delta=0 (same cycle position).
+        // With pseudo-stereo the duplicate is transposed a few cents flat; the
+        // mirrored writes stay at delta 0 either way, so both chips remain
+        // cycle-aligned and `ring_cycled`'s clocking is unchanged.
         let mut cycled: Vec<(u16, u8, u8)> = Vec::with_capacity(writes.len() * 2);
         let mut prev_cycle: u32 = 0;
 
@@ -260,12 +282,19 @@ fn send_sid_writes(
             let delta = cycle.saturating_sub(prev_cycle).min(0xFFFF) as u16;
             cycled.push((delta, reg, val));
             if reg <= SID_VOL_REG {
-                cycled.push((0, reg + SID_REG_SIZE, val));
+                match pseudo {
+                    Some(ref mut p) => {
+                        for (r, v) in p.mirror(reg, val).iter() {
+                            cycled.push((0, r, v));
+                        }
+                    }
+                    None => cycled.push((0, reg + SID_REG_SIZE, val)),
+                }
             }
             prev_cycle = cycle;
         }
 
-        bridge.ring_cycled(&cycled);
+        cycled
     } else {
         // Multi-SID: mapper already assigned reg offsets, send as-is.
         let mut cycled: Vec<(u16, u8, u8)> = Vec::with_capacity(writes.len());
@@ -278,7 +307,7 @@ fn send_sid_writes(
             prev_cycle = cycle;
         }
 
-        bridge.ring_cycled(&cycled);
+        cycled
     }
 }
 
@@ -458,6 +487,7 @@ fn player_loop(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
                                         ctx.mirror_mono,
+                                        ctx.pseudo.as_mut(),
                                         ctx.cycles_per_frame,
                                     );
                                     let dt = t0.elapsed();
@@ -483,6 +513,7 @@ fn player_loop(
                                         br.as_mut(),
                                         &cpu.memory.sid_writes,
                                         ctx.mirror_mono,
+                                        ctx.pseudo.as_mut(),
                                         ctx.cycles_per_frame,
                                     );
                                 }
@@ -525,6 +556,7 @@ fn player_loop(
                                         br.as_mut(),
                                         &fp.sid_writes,
                                         ctx.mirror_mono,
+                                        ctx.pseudo.as_mut(),
                                         actual,
                                     );
                                     let dt = t0.elapsed();
@@ -742,6 +774,7 @@ fn handle_cmd(
             path,
             song,
             force_stereo,
+            pseudo_stereo,
             sid4_addr,
             audio_port,
             restart_usb_on_load,
@@ -936,6 +969,7 @@ fn handle_cmd(
                     cycles_per_frame,
                     elapsed: Duration::ZERO,
                     mirror_mono: false,
+                    pseudo: None,
                     track_info,
                     frame_count: 0,
                     next_frame: Instant::now(),
@@ -953,6 +987,7 @@ fn handle_cmd(
                     path,
                     song,
                     force_stereo,
+                    pseudo_stereo,
                     sid4_addr,
                     is_rsid,
                     bridge,
@@ -1030,6 +1065,9 @@ fn handle_cmd(
             if let Some(ref ctx) = play_ctx {
                 let path = ctx.track_info.path.clone();
                 let stereo = ctx.mirror_mono;
+                // Carry the strength off the live context, not off config: a subtune
+                // change should keep whatever the track started with.
+                let pseudo = ctx.pseudo.as_ref().map(|p| p.strength());
                 let is_rsid = ctx.is_rsid();
                 let was_native = ctx.is_native();
                 // Preserve the audio port so we can restart streaming after the
@@ -1147,6 +1185,7 @@ fn handle_cmd(
                                             cycles_per_frame,
                                             elapsed: Duration::ZERO,
                                             mirror_mono: false,
+                                            pseudo: None,
                                             track_info,
                                             frame_count: 0,
                                             next_frame: Instant::now(),
@@ -1169,8 +1208,9 @@ fn handle_cmd(
                     }
                 } else if let Ok(data) = std::fs::read(&path) {
                     if let Ok(sid_file) = load_sid(&data) {
-                        let new_ctx =
-                            setup_playback(sid_file, path, song, stereo, sid4, is_rsid, bridge);
+                        let new_ctx = setup_playback(
+                            sid_file, path, song, stereo, pseudo, sid4, is_rsid, bridge,
+                        );
                         *play_ctx = Some(new_ctx);
                         *state = PlayState::Playing;
                     }
@@ -1331,6 +1371,10 @@ struct PlayContext {
     cycles_per_frame: u32,
     elapsed: Duration,
     mirror_mono: bool,
+    /// Detune state for pseudo-stereo, or `None` when off / not applicable.
+    /// Lives here so it resets automatically on track load and subtune change,
+    /// alongside the `bridge.reset()` that makes its all-zero shadow correct.
+    pseudo: Option<PseudoStereo>,
     track_info: TrackInfo,
     frame_count: u32,
     next_frame: Instant, // absolute deadline for next frame
@@ -1480,6 +1524,7 @@ fn setup_playback(
     path: PathBuf,
     song: u16,
     force_stereo: bool,
+    pseudo_stereo: Option<pseudo_stereo::DetuneStrength>,
     sid4_addr: u16,
     is_rsid: bool,
     bridge: &mut Option<Box<dyn SidDevice>>,
@@ -1496,6 +1541,17 @@ fn setup_playback(
     let force_mono_2sid = force_stereo && num_sids == 2;
     let mono_mode = !is_multi || force_mono_2sid;
     let mirror_mono = mono_mode;
+
+    // Pseudo-stereo widens a genuinely mono tune by transposing the mirrored
+    // SID2 a few cents flat. Deliberately NOT applied when `force_stereo`
+    // collapses a real 2SID tune: that tune has an authored stereo image, and
+    // `num_sids == 1` excludes it. That condition also implies `mirror_mono`,
+    // so there is always a SID2 to detune.
+    let pseudo = match pseudo_stereo {
+        Some(strength) if num_sids == 1 => Some(PseudoStereo::new(strength)),
+        _ => None,
+    };
+    debug_assert!(pseudo.is_none() || mirror_mono);
 
     // When forcing stereo on a 2SID tune, use only the base SID for mapping
     let mapper = if force_mono_2sid {
@@ -1651,9 +1707,18 @@ fn setup_playback(
         PlayEngine::Native { .. } => &empty_writes,
     };
 
+    let mut pseudo = pseudo;
     if let Some(ref mut br) = bridge {
         for &(_cycle, reg, val) in init_writes {
             br.write(reg, val);
+            // These go straight to the device unmirrored, so SID2 never sees
+            // them. Record them anyway: without this, a tune whose play
+            // routine only writes FREQ_HI would be detuned from a stale LO of
+            // zero. Observe-only — emitting here would change existing mono
+            // behaviour.
+            if let Some(ref mut p) = pseudo {
+                p.observe(reg, val);
+            }
         }
         eprintln!(
             "[phosphor] INIT done, {} SID writes sent",
@@ -1814,6 +1879,7 @@ fn setup_playback(
         cycles_per_frame,
         elapsed: Duration::ZERO,
         mirror_mono,
+        pseudo,
         track_info,
         frame_count: 0,
         next_frame: Instant::now(),
@@ -2303,6 +2369,74 @@ fn deliver_nmi_emu(cpu: &mut CPU<RsidBus, Nmos6502>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Characterisation test for the `send_sid_writes` -> `build_cycled` split.
+    /// With no pseudo-stereo the output must be byte-identical to the original
+    /// mirroring loop, including the `reg <= SID_VOL_REG` gate that keeps the
+    /// read-only registers 0x19-0x1F out of the mirror.
+    #[test]
+    fn build_cycled_without_pseudo_is_byte_identical_to_the_old_mirror() {
+        let writes = vec![
+            (0u32, 0x00u8, 0x40u8),
+            (10, 0x01, 0x10),
+            (25, SID_VOL_REG, 0x0F),
+            (30, 0x19, 0xFF), // above SID_VOL_REG -> not mirrored
+        ];
+        let got = build_cycled(&writes, true, None, 19656);
+        assert_eq!(
+            got,
+            vec![
+                (0, 0x00, 0x40),
+                (0, 0x00 + SID_REG_SIZE, 0x40),
+                (10, 0x01, 0x10),
+                (0, 0x01 + SID_REG_SIZE, 0x10),
+                (15, SID_VOL_REG, 0x0F),
+                (0, SID_VOL_REG + SID_REG_SIZE, 0x0F),
+                (5, 0x19, 0xFF),
+            ]
+        );
+    }
+
+    /// Multi-SID tunes must pass straight through with no duplication —
+    /// the mapper has already assigned their register offsets.
+    #[test]
+    fn build_cycled_multi_sid_does_not_duplicate() {
+        let writes = vec![(0u32, 0x00u8, 0x11u8), (7, 0x20, 0x22)];
+        let got = build_cycled(&writes, false, None, 19656);
+        assert_eq!(got, vec![(0, 0x00, 0x11), (7, 0x20, 0x22)]);
+    }
+
+    /// Overflow cycles past the frame boundary are clamped, so the deltas sum
+    /// to at most one frame and `set_flush()` pads from the right position.
+    /// Previously documented in a comment with no test.
+    #[test]
+    fn build_cycled_clamps_overflow_cycles_to_the_frame_boundary() {
+        let cpf = 19656u32;
+        let writes = vec![(0u32, 0x00u8, 1u8), (cpf + 500, 0x01, 2)];
+        let got = build_cycled(&writes, false, None, cpf);
+        let total: u32 = got.iter().map(|&(d, _, _)| d as u32).sum();
+        assert!(total <= cpf, "deltas summed to {total}, frame is {cpf}");
+        assert_eq!(got.last().unwrap().0 as u32, cpf);
+    }
+
+    /// Every pseudo-stereo mirror lands at delta 0, so the two chips stay
+    /// cycle-aligned and the engines' clocking is unchanged — this is what
+    /// makes the detune safe on the sample-count-sensitive SIDLite mixer.
+    #[test]
+    fn pseudo_stereo_mirrors_land_at_delta_zero() {
+        let mut p = pseudo_stereo::PseudoStereo::new(pseudo_stereo::DetuneStrength::Wide);
+        let writes = vec![(0u32, 0x00u8, 0x40u8), (10, 0x01, 0x10), (20, 0x04, 0x41)];
+        let got = build_cycled(&writes, true, Some(&mut p), 19656);
+        for (i, &(delta, reg, _)) in got.iter().enumerate() {
+            if reg >= SID_REG_SIZE {
+                assert_eq!(delta, 0, "mirrored write {i} must be at delta 0");
+            }
+        }
+        // And the mirror actually differs from the source, i.e. it detuned.
+        let src: Vec<_> = got.iter().filter(|&&(_, r, _)| r < SID_REG_SIZE).collect();
+        let dst: Vec<_> = got.iter().filter(|&&(_, r, _)| r >= SID_REG_SIZE).collect();
+        assert!(!src.is_empty() && !dst.is_empty());
+    }
 
     /// Regression: a 1SID tune (`extra_sid_addrs = [0, 0]`) with the
     /// canonical `sid4_addr = 0` must yield a single-entry base list.

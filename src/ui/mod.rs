@@ -172,7 +172,9 @@ impl SettingsTab {
 
     pub fn tip(self) -> &'static str {
         match self {
-            SettingsTab::General => "Skip RSID · stereo · length · sleep · surprise · font size",
+            SettingsTab::General => {
+                "Skip RSID · stereo · width · length · sleep · surprise · font size"
+            }
             SettingsTab::Audio => "Output engine · Ultimate 64 · macOS USB transport",
             SettingsTab::Library => "HVSC sync · Songlengths · STIL",
             SettingsTab::Network => "HTTP proxy · Remote-control server",
@@ -298,6 +300,10 @@ pub enum Message {
     SettingsTabChanged(SettingsTab),
     ToggleSkipRsid,
     ToggleForceStereo2sid,
+    /// Widen mono tunes by detuning the mirrored second SID.
+    TogglePseudoStereo,
+    /// "subtle" | "medium" | "wide". Also switches the feature on.
+    SetPseudoStereoStrength(String),
     /// macOS-only: switch USB transport between root bridge daemon and
     /// in-process libusb. Payload is "bridge" or "direct".
     SetMacosUsbMode(String),
@@ -3574,6 +3580,9 @@ pub fn settings_panel<'a>(
     // Draft HTTP proxy URL — empty string = "no proxy". Applied to all
     // outbound requests once the user clicks Apply.
     proxy_url_text: &'a str,
+    // Cached USBSID-Pico config, for warning when the board's own routing
+    // would cancel pseudo-stereo. `None` = not read yet, say nothing.
+    device_cfg: Option<&'a DeviceConfigSnapshot>,
     // `hvsc_sync_active` true while an HVSC sync is running (swaps
     // Sync/Cancel button + reveals progress bar).
     hvsc_sync_active: bool,
@@ -3818,6 +3827,87 @@ pub fn settings_panel<'a>(
     ].spacing(6);
 
     // ── Default song length ──────────────────────────────────────
+    // ── Pseudo-stereo ────────────────────────────────────────────
+    let ps_on = config.pseudo_stereo_enabled;
+    let ps_strength = crate::player::pseudo_stereo::DetuneStrength::from_config_str(
+        &config.pseudo_stereo_strength,
+    );
+    let strength_btn = |s: crate::player::pseudo_stereo::DetuneStrength| -> Element<'a, Message> {
+        // Two leading spaces on the inactive label keep the button width
+        // stable as the selection moves.
+        let label = if ps_on && s == ps_strength {
+            format!("\u{2713} {}", s.label())
+        } else {
+            format!("  {}", s.label())
+        };
+        tool_button(
+            label,
+            Message::SetPseudoStereoStrength(s.as_config_str().to_string()),
+        )
+    };
+    let strength_help = crate::player::pseudo_stereo::DetuneStrength::ALL
+        .iter()
+        .map(|s| format!("{} {}c", s.label(), s.cents()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut pseudo_section = column![
+        text("Pseudo-stereo (widen mono tunes):")
+            .size(font::sized(14.0))
+            .color(Color::from_rgb(0.75, 0.77, 0.82)),
+        tool_button(
+            if ps_on {
+                "\u{2713} On — detune SID2 for width"
+            } else {
+                "\u{2717} Off — mono tunes stay centred"
+            },
+            Message::TogglePseudoStereo,
+        ),
+        crate::player::pseudo_stereo::DetuneStrength::ALL
+            .into_iter()
+            .fold(row![].spacing(8), |r, s| r.push(strength_btn(s))),
+        text(
+            "Mirrors a 1-SID tune onto the second SID chip with every voice tuned a few \
+             cents flat, so the two chips beat against each other and the tune spreads \
+             across the stereo field. Tunes that already use 2 or 3 SIDs are left exactly \
+             as composed. Changing this restarts the current tune."
+        )
+        .size(font::sized(11.0))
+        .color(Color::from_rgb(0.45, 0.47, 0.52)),
+        text(strength_help)
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.45, 0.47, 0.52)),
+    ]
+    .spacing(6);
+
+    // Engine / board caveats. Warn, never block — the user may be setting up
+    // for hardware they'll plug in later.
+    if config.output_engine == "u64" {
+        pseudo_section = pseudo_section.push(
+            text(
+                "Not available on the Ultimate 64 — the tune plays on the real C64, so \
+                 Phosphor can't re-tune the second chip.",
+            )
+            .size(font::sized(11.0))
+            .color(Color::from_rgb(0.85, 0.65, 0.30)),
+        );
+    } else if let Some(snap) = device_cfg {
+        if snap.config.mirrored || !snap.config.stereo_enabled {
+            let which = if snap.config.mirrored {
+                "Mirrored is on, so the second chip copies the first"
+            } else {
+                "Stereo is off, so both chips sum to one channel"
+            };
+            pseudo_section = pseudo_section.push(
+                text(format!(
+                    "Your USBSID-Pico won't reproduce this: {which}. Change it under \
+                     Device \u{2192} Audio routing."
+                ))
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.85, 0.65, 0.30)),
+            );
+        }
+    }
+
     let cur_len = if config.default_song_length_secs > 0 {
         let m = config.default_song_length_secs / 60;
         let s = config.default_song_length_secs % 60;
@@ -4402,6 +4492,8 @@ pub fn settings_panel<'a>(
                 .push(surprise_section)
                 .push(rule::horizontal(1))
                 .push(stereo_section)
+                .push(rule::horizontal(1))
+                .push(pseudo_section)
                 .push(rule::horizontal(1))
                 .push(length_section)
                 .push(rule::horizontal(1))
