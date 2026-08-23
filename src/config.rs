@@ -83,6 +83,13 @@ pub struct Config {
     /// Force stereo mirroring for 2SID tunes (duplicate SID1 writes to SID2).
     /// When enabled, 2SID tunes play in mono-stereo mode instead of true dual-SID.
     pub force_stereo_2sid: bool,
+    /// Widen 1SID (mono) tunes by mirroring SID1 to SID2 with every voice
+    /// transposed a few cents flat, so the two chips beat against each other.
+    /// Tunes that already use 2+ SIDs are left as composed.
+    pub pseudo_stereo_enabled: bool,
+    /// How far to detune: "subtle" | "medium" | "wide". Only consulted when
+    /// `pseudo_stereo_enabled` is true and the tune is 1SID.
+    pub pseudo_stereo_strength: String,
     /// Restart the USB device when loading a new SID file (macOS only).
     pub restart_usb_on_load: bool,
     /// macOS USB transport mode: "bridge" (default — talk to the root-owned
@@ -147,6 +154,8 @@ impl Default for Config {
             u64_audio_enabled: false,
             u64_audio_port: 11001,
             force_stereo_2sid: false,
+            pseudo_stereo_enabled: false,
+            pseudo_stereo_strength: "medium".to_string(),
             restart_usb_on_load: false,
             macos_usb_mode: "bridge".to_string(),
             http_remote_enabled: false,
@@ -332,6 +341,18 @@ impl Config {
             } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.force_stereo_2sid = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"pseudo_stereo_enabled\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.pseudo_stereo_enabled = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"pseudo_stereo_strength\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if let Some(v) = strip_json_string(val) {
+                    // Whitelist, so a hand-edited config can't produce an
+                    // unrepresentable strength.
+                    if matches!(v.as_str(), "subtle" | "medium" | "wide") {
+                        config.pseudo_stereo_strength = v;
+                    }
+                }
             } else if let Some(rest) = line.strip_prefix("\"restart_usb_on_load\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.restart_usb_on_load = val == "true";
@@ -448,6 +469,8 @@ impl Config {
                 "  \"u64_audio_enabled\": {},\n",
                 "  \"u64_audio_port\": {},\n",
                 "  \"force_stereo_2sid\": {},\n",
+                "  \"pseudo_stereo_enabled\": {},\n",
+                "  \"pseudo_stereo_strength\": \"{}\",\n",
                 "  \"restart_usb_on_load\": {},\n",
                 "  \"macos_usb_mode\": \"{}\",\n",
                 "  \"http_remote_enabled\": {},\n",
@@ -485,6 +508,8 @@ impl Config {
             self.u64_audio_enabled,
             self.u64_audio_port,
             self.force_stereo_2sid,
+            self.pseudo_stereo_enabled,
+            self.pseudo_stereo_strength,
             self.restart_usb_on_load,
             self.macos_usb_mode,
             self.http_remote_enabled,
@@ -649,6 +674,50 @@ mod tests {
         // Neither present -> default.
         let cfg = Config::parse_json("  \"window_width_saved\": 800,\n");
         assert_eq!(cfg.hvsc_mirror_url, DEFAULT_HVSC_MIRROR_URL);
+    }
+
+    #[test]
+    fn pseudo_stereo_round_trips() {
+        let mut cfg = Config::default();
+        assert!(!cfg.pseudo_stereo_enabled, "off by default");
+        assert_eq!(cfg.pseudo_stereo_strength, "medium");
+
+        cfg.pseudo_stereo_enabled = true;
+        cfg.pseudo_stereo_strength = "wide".to_string();
+        let json = cfg.to_json();
+        let back = Config::parse_json(&json);
+        assert!(back.pseudo_stereo_enabled);
+        assert_eq!(back.pseudo_stereo_strength, "wide");
+    }
+
+    #[test]
+    fn pseudo_stereo_strength_rejects_unknown_values() {
+        // A hand-edited config must not be able to produce an
+        // unrepresentable strength.
+        let cfg = Config::parse_json("  \"pseudo_stereo_strength\": \"ludicrous\",\n");
+        assert_eq!(cfg.pseudo_stereo_strength, "medium");
+    }
+
+    /// `to_json` is one positional `format!` where the key template and the
+    /// argument list must stay index-aligned. Nothing checks that at compile
+    /// time, and a misalignment would silently write one field's value into
+    /// another field's slot.
+    #[test]
+    fn to_json_is_valid_and_keys_are_unique() {
+        let json = Config::default().to_json();
+        let keys: Vec<&str> = json
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .filter_map(|l| l.split('"').next())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "duplicate key in to_json output");
+        assert!(keys.contains(&"pseudo_stereo_enabled"));
+        assert!(keys.contains(&"pseudo_stereo_strength"));
+        // Round-tripping the defaults must be a fixed point.
+        assert_eq!(Config::parse_json(&json).to_json(), json);
     }
 
     #[test]
