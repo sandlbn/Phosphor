@@ -28,6 +28,11 @@ pub fn playlist_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("phosphor-playlist")
 }
 
+/// Point size the toolbar's buttons render at when they still have their
+/// labels. `btn_size` drops to 11.0 once compact, but the fit decision has to
+/// be made against the labelled size or it would be circular.
+const TOOLBAR_PT: f32 = 12.0;
+
 /// Scroll position + viewport height for the HVSC browser's two virtualised
 /// lists, so `view()` can work out which rows are actually on screen.
 #[derive(Debug, Clone, Copy)]
@@ -906,7 +911,11 @@ pub fn controls_bar<'a>(
         has_update_badge: new_version.is_some(),
         update_version_len: new_version.map(|v| v.version.len()).unwrap_or(0),
     };
-    let compact = metrics::toolbar_is_compact(window_width, &toolbar_inputs, font::scale());
+    // Pass the actual rendered point size, not the scale factor: the widths
+    // are measured by shaping the real labels at that size, so this follows
+    // whatever font size and display scaling the user has set.
+    let compact =
+        metrics::toolbar_is_compact(window_width, &toolbar_inputs, font::sized(TOOLBAR_PT));
     let btn_size = if compact { 11.0_f32 } else { 12.0 };
     let btn_pad = if compact { 3_u16 } else { 4 };
     let bar_pad = if compact { 4_u16 } else { 6 };
@@ -3895,10 +3904,11 @@ pub fn settings_panel<'a>(
             .into_iter()
             .fold(row![].spacing(8), |r, s| r.push(strength_btn(s))),
         text(
-            "Mirrors a 1-SID tune onto the second SID chip with every voice tuned a few \
-             cents flat, so the two chips beat against each other and the tune spreads \
-             across the stereo field. Tunes that already use 2 or 3 SIDs are left exactly \
-             as composed. Changing this restarts the current tune."
+            "Mirrors a 1-SID tune onto the second SID chip, which is set to the other \
+             model (6581 vs 8580) so the two differ in filter and waveform character — \
+             the same trick real dual-SID setups use — plus a slight detune for movement. \
+             Tunes that already use 2 or 3 SIDs are left exactly as composed. Changing \
+             this restarts the current tune."
         )
         .size(font::sized(11.0))
         .color(Color::from_rgb(0.45, 0.47, 0.52)),

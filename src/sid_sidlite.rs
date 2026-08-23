@@ -11,7 +11,7 @@ use std::thread;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sidlite_sys::{ChipModel, Sid};
 
-use crate::sid_device::SidDevice;
+use crate::sid_device::{blend, SidDevice};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constants
@@ -201,6 +201,8 @@ pub struct SidLiteDevice {
     clock_freq: u32,
     sample_rate: u32,
     chip_model: ChipModel,
+    /// When set, the second chip uses the opposite model for pseudo-stereo.
+    stereo_model_split: bool,
 
     cycles_per_frame: u32,
     cycles_this_frame: u32,
@@ -252,6 +254,7 @@ impl SidLiteDevice {
             clock_freq,
             sample_rate: effective_rate as u32,
             chip_model,
+            stereo_model_split: false,
             cycles_per_frame: PAL_CYCLES_PER_FRAME,
             cycles_this_frame: 0,
             audio_buf,
@@ -270,7 +273,23 @@ impl SidLiteDevice {
     }
 
     fn make_sid(&self) -> Sid {
-        let mut sid = Sid::new(self.chip_model);
+        self.make_sid_with(self.chip_model)
+    }
+
+    /// Model for the second chip — derived, so it survives any rebuild.
+    fn sid2_model(&self) -> ChipModel {
+        if self.stereo_model_split {
+            match self.chip_model {
+                ChipModel::Mos6581 => ChipModel::Mos8580,
+                _ => ChipModel::Mos6581,
+            }
+        } else {
+            self.chip_model
+        }
+    }
+
+    fn make_sid_with(&self, model: ChipModel) -> Sid {
+        let mut sid = Sid::new(model);
         sid.set_sampling_parameters(self.clock_freq, self.sample_rate as u16);
         sid
     }
@@ -346,12 +365,15 @@ impl SidLiteDevice {
         let mut mixed: Vec<(i16, i16)> = Vec::with_capacity(count);
 
         for i in 0..count {
-            let left = filtered1[i];
-            let right = if !filtered2.is_empty() {
+            let l_src = filtered1[i];
+            let r_src = if !filtered2.is_empty() {
                 *filtered2.get(i).unwrap_or(&0)
             } else {
-                left
+                l_src
             };
+            // Same narrowing as the reSID engine — the two must match or the
+            // engines would have different stereo images.
+            let (left, right) = (blend(l_src, r_src), blend(r_src, l_src));
 
             let mut centre: i16 = 0;
             if !filtered3.is_empty() {
@@ -456,9 +478,24 @@ impl SidDevice for SidLiteDevice {
         self.prefill_silence();
     }
 
+    fn set_stereo_model_split(&mut self, enabled: bool) {
+        if enabled == self.stereo_model_split {
+            return;
+        }
+        self.stereo_model_split = enabled;
+        if self.sid2.is_some() {
+            self.sid2 = Some(self.make_sid_with(self.sid2_model()));
+            self.ext2.reset();
+        }
+        eprintln!(
+            "[sidlite] stereo model split {}",
+            if enabled { "on" } else { "off" }
+        );
+    }
+
     fn set_stereo(&mut self, mode: i32) {
         if mode >= 1 && self.sid2.is_none() {
-            self.sid2 = Some(self.make_sid());
+            self.sid2 = Some(self.make_sid_with(self.sid2_model()));
             self.ext2.reset();
             eprintln!("[sidlite] SID2 enabled");
         }

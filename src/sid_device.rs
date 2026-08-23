@@ -6,6 +6,22 @@
 //   "u64"      — Ultimate 64 / Ultimate-II+ via REST API (native SID playback)
 
 /// Common interface for all SID output backends.
+/// Fraction of each chip blended into the opposite channel.
+///
+/// Hard L/R is wider than the reference method: the Ultimate 64 guide pans its
+/// two SIDs only partly apart and recommends the narrower setting for
+/// headphones. A convex blend (weights summing to 1) can't raise the peak, so
+/// this cannot clip. Mono is unaffected — when SID2 is absent both channels
+/// carry SID1 and the blend is an identity.
+pub(crate) const CROSSFEED: i32 = 51; // 0.2 in Q8
+
+/// Blend two hard-panned samples into one channel: `(1-k)*near + k*far`.
+/// Done in i32 and narrowed once, so no intermediate rounding.
+pub(crate) fn blend(near: i16, far: i16) -> i16 {
+    let v = (near as i32 * (256 - CROSSFEED) + far as i32 * CROSSFEED) >> 8;
+    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
 pub trait SidDevice: Send {
     fn init(&mut self) -> Result<(), String>;
     fn set_clock_rate(&mut self, is_pal: bool);
@@ -42,6 +58,15 @@ pub trait SidDevice: Send {
     /// per tune; without this hint every tune plays through a 6581,
     /// which sounds muffled on 8580-composed material.
     fn set_sid_model(&mut self, _model: u8) {}
+
+    /// Ask for the second chip to use the *opposite* SID model, so a mirrored
+    /// mono tune widens through the two models' filter and waveform
+    /// differences — the method the Ultimate 64 and real dual-SID boards use.
+    ///
+    /// Default no-op: only the software engines can choose a model. On USB
+    /// hardware the chips are whatever is socketed, which is the authentic
+    /// case this imitates.
+    fn set_stereo_model_split(&mut self, _enabled: bool) {}
 
     /// Send a complete SID file for native playback on real hardware.
     ///
@@ -239,4 +264,46 @@ fn create_u64(address: &str, password: &str) -> Result<Box<dyn SidDevice>, Strin
     eprintln!("[phosphor] Connecting to Ultimate 64 at {address}…");
     let dev = crate::sid_u64::U64Device::connect(address, password)?;
     Ok(Box::new(dev))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_cannot_clip_at_full_scale() {
+        // A convex blend can't exceed the larger input, so no combination of
+        // extremes can overflow. i16::MIN is the trap case — negating it
+        // overflows, so it must survive untouched.
+        for (a, b) in [
+            (i16::MAX, i16::MAX),
+            (i16::MIN, i16::MIN),
+            (i16::MAX, i16::MIN),
+            (i16::MIN, i16::MAX),
+        ] {
+            let v = blend(a, b);
+            assert!(v >= i16::MIN && v <= i16::MAX);
+            assert!(v.unsigned_abs() <= a.unsigned_abs().max(b.unsigned_abs()));
+        }
+    }
+
+    #[test]
+    fn blend_is_identity_when_both_channels_match() {
+        // Mono: SID1 is copied to both channels, so narrowing must be a no-op
+        // rather than quietly attenuating mono playback.
+        for v in [0i16, 1, -1, 1000, -1000, i16::MAX, i16::MIN] {
+            assert_eq!(blend(v, v), v, "mono must pass through unchanged");
+        }
+    }
+
+    #[test]
+    fn blend_narrows_without_collapsing_to_mono() {
+        // Some of the far channel must arrive, but the near channel must still
+        // dominate — otherwise it is either hard-panned or centred.
+        let (near, far) = (10_000i16, 0i16);
+        let out = blend(near, far);
+        assert!(out < near, "some narrowing applied");
+        assert!(out > near / 2, "near channel still dominates");
+        assert_eq!(CROSSFEED, 51, "0.2 in Q8");
+    }
 }

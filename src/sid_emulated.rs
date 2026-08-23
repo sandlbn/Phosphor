@@ -21,7 +21,7 @@ use std::thread;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use resid::{ChipModel, SamplingMethod, Sid};
 
-use crate::sid_device::SidDevice;
+use crate::sid_device::{blend, SidDevice};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constants
@@ -276,6 +276,8 @@ pub struct EmulatedDevice {
     clock_freq: u32,
     sample_rate: u32,
     chip_model: ChipModel,
+    /// When set, the second chip uses the opposite model for pseudo-stereo.
+    stereo_model_split: bool,
 
     cycles_per_frame: u32,
 
@@ -355,6 +357,7 @@ impl EmulatedDevice {
             clock_freq,
             sample_rate,
             chip_model,
+            stereo_model_split: false,
             cycles_per_frame: PAL_CYCLES_PER_FRAME,
             cycles_this_frame: 0,
             audio_buf,
@@ -383,7 +386,11 @@ impl EmulatedDevice {
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn make_sid(&self) -> SendSid {
-        let mut sid = SendSid::new(self.chip_model);
+        self.make_sid_with(self.chip_model)
+    }
+
+    fn make_sid_with(&self, model: ChipModel) -> SendSid {
+        let mut sid = SendSid::new(model);
         sid.inner().set_sampling_parameters(
             SamplingMethod::Resample,
             self.clock_freq,
@@ -401,6 +408,16 @@ impl EmulatedDevice {
 /// "Both" and "unknown" both fall back to 6581 — same choice as
 /// libsidplayfp's sidplay2 default; keeps ambiguous tunes consistent
 /// with the historical baseline.
+/// The other SID model. Pseudo-stereo puts one on each side, which is how
+/// the Ultimate 64 and real dual-SID boards widen a mono tune: identical
+/// register writes, different filter curve and combined-waveform behaviour.
+fn opposite_model(m: ChipModel) -> ChipModel {
+    match m {
+        ChipModel::Mos6581 => ChipModel::Mos8580,
+        ChipModel::Mos8580 => ChipModel::Mos6581,
+    }
+}
+
 pub fn chip_model_from_header(model_bits: u8) -> ChipModel {
     match model_bits {
         2 => ChipModel::Mos8580,
@@ -427,10 +444,21 @@ fn chip_models_eq(a: ChipModel, b: ChipModel) -> bool {
 impl EmulatedDevice {
     /// Rebuild every populated SID with a new chip model. Cheap
     /// (~microseconds — `resid::Sid::new` just resets internal state).
+    /// Model for the second chip. Derived, never stored: `rebuild_sids` runs
+    /// on every tune load (via `set_sid_model`), so asymmetry held as state on
+    /// sid2 would survive exactly one tune and then be silently stamped away.
+    fn sid2_model(&self) -> ChipModel {
+        if self.stereo_model_split {
+            opposite_model(self.chip_model)
+        } else {
+            self.chip_model
+        }
+    }
+
     fn rebuild_sids(&mut self) {
         self.sid1 = self.make_sid();
         if self.sid2.is_some() {
-            self.sid2 = Some(self.make_sid());
+            self.sid2 = Some(self.make_sid_with(self.sid2_model()));
         }
         if self.sid3.is_some() {
             self.sid3 = Some(self.make_sid());
@@ -609,12 +637,14 @@ impl EmulatedDevice {
         let mut mixed: Vec<(i16, i16)> = Vec::with_capacity(mix_count);
 
         for i in 0..mix_count {
-            let left = all1[i];
-            let right = if self.sid2.is_some() {
+            let l_src = all1[i];
+            let r_src = if self.sid2.is_some() {
                 all2[i]
             } else {
-                left // mono: mirror SID1 to right channel
+                l_src // mono: mirror SID1 to right channel
             };
+            // Narrow the image rather than splitting it hard L/R.
+            let (left, right) = (blend(l_src, r_src), blend(r_src, l_src));
 
             // SID3/SID4 centre-mixed at half volume
             let mut centre: i16 = 0;
@@ -733,6 +763,25 @@ impl SidDevice for EmulatedDevice {
         );
     }
 
+    fn set_stereo_model_split(&mut self, enabled: bool) {
+        if enabled == self.stereo_model_split {
+            return;
+        }
+        self.stereo_model_split = enabled;
+        // Re-make an existing SID2 so the change takes effect on the tune
+        // that asked for it, not the next one.
+        if self.sid2.is_some() {
+            self.sid2 = Some(self.make_sid_with(self.sid2_model()));
+            self.ext2.reset();
+            self.carry2.clear();
+        }
+        eprintln!(
+            "[emulated] stereo model split {} (SID2 = {})",
+            if enabled { "on" } else { "off" },
+            chip_model_name(self.sid2_model())
+        );
+    }
+
     fn set_sid_model(&mut self, model: u8) {
         let new = chip_model_from_header(model);
         if chip_models_eq(new, self.chip_model) {
@@ -789,7 +838,7 @@ impl SidDevice for EmulatedDevice {
 
     fn set_stereo(&mut self, mode: i32) {
         if mode >= 1 && self.sid2.is_none() {
-            self.sid2 = Some(self.make_sid());
+            self.sid2 = Some(self.make_sid_with(self.sid2_model()));
             self.ext2.reset();
             eprintln!("[emulated] SID2 enabled");
         }

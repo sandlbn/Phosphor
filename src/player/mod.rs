@@ -1620,6 +1620,9 @@ fn setup_playback(
         // other engines default no-op this. Called after reset() so the
         // fresh chip state comes up with the correct model.
         br.set_sid_model(header.sid_model);
+        // Before set_stereo, so the second chip is created with the right
+        // model rather than made and then replaced.
+        br.set_stereo_model_split(pseudo.is_some());
         thread::sleep(Duration::from_millis(50));
 
         if use_stereo {

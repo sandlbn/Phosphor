@@ -1,47 +1,77 @@
-// Width estimation for the toolbar, so the compact/icon threshold is derived
-// rather than guessed.
+// Toolbar width measurement, so the labels-vs-icons switch happens when the
+// labels genuinely stop fitting.
 //
-// The old rule was `window_width < 760.0`. Two things were wrong with it:
+// This measures the REAL shaped text through iced's font stack rather than
+// estimating from a per-character table. An earlier version used such a table
+// and over-estimated by 25-50% (it put "Files" at 37px against a real 25px),
+// which stripped the labels while there was still plenty of room. A table also
+// can't be right for everyone: the font, the point size and the display scale
+// all differ per user, and emoji advances vary by fallback font.
 //
-//   * The labelled bottom row actually needs ~854 px at scale 1.0, so anything
-//     in the 760..880 band overflowed while `compact` was still false. Worse,
-//     the Remote pill (+~95) and update badge (+~76) push that past 1000 — the
-//     default 900 px window overflows when both are showing.
-//   * A row's width is *affine*, not linear: `font::sized()` scales the text,
-//     but paddings and spacings are raw `u16` constants that don't scale. So
-//     `760.0 * font::scale()` would be wrong in the other direction.
+// Shaping ~15 labels costs ~0.8 ms, which is far too much to repeat in every
+// `view()` at 30 fps, so results are memoised. The labels are static and the
+// size changes only when the user edits it, so the cache is a handful of
+// entries and effectively permanent.
 //
-// Nothing here touches a renderer, so it can only approximate glyph advances.
-// It deliberately over-estimates: guessing high costs an early switch to icons
-// (harmless), guessing low costs clipped labels (visible). If the app ever sets
-// an explicit default font, re-check the em table below.
-//
-// Every function takes `scale` as a parameter and never reads `font::scale()`
-// itself — that is a process-global atomic, and tests mutating it would race
-// under cargo test's default parallelism.
+// Paddings and spacings below are the literal constants the toolbar widgets
+// use, not guesses — they are raw `u16` in the UI and deliberately do not
+// scale with the font, which is why the total is affine in the text size
+// rather than proportional to it.
 
-/// Approximate advance width of `s`, in em units at 1.0 pt.
-pub fn em_width(s: &str) -> f32 {
-    s.chars()
-        .map(|c| match c {
-            ' ' => 0.30,
-            c if !c.is_ascii() => 1.10, // emoji, arrows, box drawing
-            c if c.is_ascii_uppercase() => 0.72,
-            c if c.is_ascii_lowercase() || c.is_ascii_digit() => 0.60,
-            _ => 0.38, // ascii punctuation
-        })
-        .sum()
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Width of `s` shaped in the real UI font at `pt`, in pixels.
+///
+/// `Shaping::Advanced` so emoji and non-Latin glyphs measure correctly — the
+/// toolbar is mostly emoji, and basic shaping would mis-measure every one.
+fn shape_width(s: &str, pt: f32) -> f32 {
+    // cosmic-text panics outright on a zero line height, and a non-positive
+    // size is meaningless anyway. Guard rather than let a stray font setting
+    // take the process down.
+    if !(pt > 0.0) || s.is_empty() {
+        return 0.0;
+    }
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::{LineHeight, Paragraph as _, Shaping, Text, Wrapping};
+    use iced::{alignment, Font, Pixels, Size};
+
+    Paragraph::with_text(Text {
+        content: s,
+        bounds: Size::INFINITE,
+        size: Pixels(pt),
+        line_height: LineHeight::default(),
+        font: Font::default(),
+        align_x: alignment::Horizontal::Left.into(),
+        align_y: alignment::Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::None,
+    })
+    .min_width()
 }
 
-/// Text width in px at a given design point size and font scale.
-pub fn text_px(s: &str, pt: f32, scale: f32) -> f32 {
-    em_width(s) * pt * scale
+/// Memoised `shape_width`. Keyed on the text and the exact size bits, so a
+/// font-size change re-measures rather than serving a stale width.
+pub fn text_px(s: &str, pt: f32) -> f32 {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), f32>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (s.to_owned(), pt.to_bits());
+    if let Ok(map) = cache.lock() {
+        if let Some(&w) = map.get(&key) {
+            return w;
+        }
+    }
+    let w = shape_width(s, pt);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, w);
+    }
+    w
 }
 
-/// Button width: scaled text plus horizontal padding on both sides. Padding
-/// is a raw constant in the UI, so it is *not* multiplied by `scale`.
-pub fn button_px(label: &str, pt: f32, pad_h: f32, scale: f32) -> f32 {
-    text_px(label, pt, scale) + pad_h * 2.0
+/// Button width: measured label plus the horizontal padding on both sides.
+/// Padding is a raw constant in the UI, so it does not scale with the font.
+pub fn button_px(label: &str, pt: f32, pad_h: f32) -> f32 {
+    text_px(label, pt) + pad_h * 2.0
 }
 
 /// Toolbar state that changes how wide the rows need to be.
@@ -55,7 +85,6 @@ pub struct ToolbarInputs {
 }
 
 // Non-compact geometry, mirroring `controls_bar`.
-const PT: f32 = 12.0;
 const PAD_H: f32 = 10.0; // small_button
 const ACCENT_PAD_H: f32 = 12.0; // accent_button (Library)
 const GROUP_SPACING: f32 = 4.0;
@@ -63,43 +92,37 @@ const ROW_SPACING: f32 = 8.0;
 const BAR_PAD_H: f32 = 16.0;
 const SEP_PX: f32 = 9.0; // 1 px rule + [0,4] padding
 
-fn group_px(labels: &[&str], pt: f32, pad_h: f32, scale: f32) -> f32 {
-    let text: f32 = labels.iter().map(|l| button_px(l, pt, pad_h, scale)).sum();
+fn group_px(labels: &[&str], pt: f32, pad_h: f32) -> f32 {
+    let text: f32 = labels.iter().map(|l| button_px(l, pt, pad_h)).sum();
     text + GROUP_SPACING * labels.len().saturating_sub(1) as f32
 }
 
 /// Width the bottom row (file ops, Library, panel toggles) needs with labels.
-pub fn controls_bottom_row_px(inputs: &ToolbarInputs, scale: f32) -> f32 {
+pub fn controls_bottom_row_px(inputs: &ToolbarInputs, pt: f32) -> f32 {
     let file_ops = group_px(
         &["➕ Files", "📁 Folder", "📂 Open", "💾 Save", "🗑 Clear"],
-        PT,
+        pt,
         PAD_H,
-        scale,
     );
-    let library = button_px("📚 Library", PT, ACCENT_PAD_H, scale);
-    let toggles = group_px(
-        &["🕐 Recent", "SID", "🔧 Device", "⚙ Settings"],
-        PT,
-        PAD_H,
-        scale,
-    );
+    let library = button_px("📚 Library", pt, ACCENT_PAD_H);
+    let toggles = group_px(&["🕐 Recent", "SID", "🔧 Device", "⚙ Settings"], pt, PAD_H);
 
     let mut extras = 0.0;
     if inputs.has_remote_pill {
-        extras += button_px("● Remote", PT, PAD_H, scale) + ROW_SPACING;
+        extras += button_px("● Remote", pt, PAD_H) + ROW_SPACING;
     }
     if inputs.has_update_badge {
         let v = "⬆ ".to_string() + &"0".repeat(inputs.update_version_len.max(1));
-        extras += button_px(&v, PT, PAD_H, scale) + ROW_SPACING;
+        extras += button_px(&v, pt, PAD_H) + ROW_SPACING;
     }
 
     file_ops + library + toggles + SEP_PX * 2.0 + ROW_SPACING * 4.0 + BAR_PAD_H * 2.0 + extras
 }
 
 /// Width the top row (transport, subtune, shuffle/repeat) needs with labels.
-pub fn controls_top_row_px(inputs: &ToolbarInputs, scale: f32) -> f32 {
-    let transport = group_px(&["◄◄", "▶", "■", "►►", "🎲"], PT, PAD_H, scale);
-    let subtune = group_px(&["◄ tune", "tune ►"], PT, PAD_H, scale);
+pub fn controls_top_row_px(inputs: &ToolbarInputs, pt: f32) -> f32 {
+    let transport = group_px(&["◄◄", "▶", "■", "►►", "🎲"], pt, PAD_H);
+    let subtune = group_px(&["◄ tune", "tune ►"], pt, PAD_H);
     let shuffle = if inputs.shuffle_on {
         "🔀 On"
     } else {
@@ -110,18 +133,22 @@ pub fn controls_top_row_px(inputs: &ToolbarInputs, scale: f32) -> f32 {
     } else {
         inputs.repeat_label.as_str()
     };
-    let mode = group_px(&[shuffle, repeat], PT, PAD_H, scale);
+    let mode = group_px(&[shuffle, repeat], pt, PAD_H);
 
     transport + subtune + mode + SEP_PX * 2.0 + ROW_SPACING * 4.0 + BAR_PAD_H * 2.0
 }
 
-/// Headroom before switching, absorbing estimator error.
+/// No headroom: switch only when the labels genuinely do not fit.
 ///
-/// Kept deliberately small. Two independent reconstructions put the labelled
-/// row at 854-871 px, and the default window is 900 — a larger cushion would
-/// strip labels at the default size, which is a real cost for no benefit.
-/// 3% covers the spread between those two estimates.
-const SAFETY_FACTOR: f32 = 1.03;
+/// An earlier version carried a margin to absorb error in a per-character
+/// width estimate. The widths are now measured by shaping the real text, so
+/// there is no error to absorb, and any margin would drop the labels while
+/// there was still room — the exact complaint this replaced.
+///
+/// Erring on the side of keeping labels is safe: `Wrapping::None` means an
+/// overflowing label clips rather than wrapping to a second line, so the worst
+/// case is a slightly cropped word, not a broken toolbar.
+const SAFETY_FACTOR: f32 = 1.0;
 const SAFETY_PX: f32 = 0.0;
 
 /// Should the toolbar drop its labels and show icons only?
@@ -129,8 +156,8 @@ const SAFETY_PX: f32 = 0.0;
 /// Driven by the wider of the two rows. One flag for both, because the rows
 /// share `btn_size`/`btn_pad`/`row_spacing` and a labelled row sitting above
 /// an icon-only row reads as a bug.
-pub fn toolbar_is_compact(window_width: f32, inputs: &ToolbarInputs, scale: f32) -> bool {
-    let need = controls_bottom_row_px(inputs, scale).max(controls_top_row_px(inputs, scale));
+pub fn toolbar_is_compact(window_width: f32, inputs: &ToolbarInputs, pt: f32) -> bool {
+    let need = controls_bottom_row_px(inputs, pt).max(controls_top_row_px(inputs, pt));
     window_width < need * SAFETY_FACTOR + SAFETY_PX
 }
 
@@ -138,16 +165,16 @@ pub fn toolbar_is_compact(window_width: f32, inputs: &ToolbarInputs, scale: f32)
 /// check against the labelled width — the icon row must always be narrower,
 /// or dropping labels wouldn't buy anything.
 #[cfg(test)]
-pub fn controls_icons_px(inputs: &ToolbarInputs, scale: f32) -> f32 {
-    let file_ops = group_px(&["➕", "📁", "📂", "💾", "🗑"], PT, 6.0, scale);
-    let library = button_px("📚", PT, 8.0, scale);
-    let toggles = group_px(&["🕐", "SID", "🔧", "⚙"], PT, 6.0, scale);
+pub fn controls_icons_px(inputs: &ToolbarInputs, pt: f32) -> f32 {
+    let file_ops = group_px(&["➕", "📁", "📂", "💾", "🗑"], pt, 6.0);
+    let library = button_px("📚", pt, 8.0);
+    let toggles = group_px(&["🕐", "SID", "🔧", "⚙"], pt, 6.0);
     let mut extras = 0.0;
     if inputs.has_remote_pill {
-        extras += button_px("●", PT, 6.0, scale) + ROW_SPACING;
+        extras += button_px("●", pt, 6.0) + ROW_SPACING;
     }
     if inputs.has_update_badge {
-        extras += button_px("⬆", PT, 6.0, scale) + ROW_SPACING;
+        extras += button_px("⬆", pt, 6.0) + ROW_SPACING;
     }
     file_ops + library + toggles + SEP_PX * 2.0 + ROW_SPACING * 4.0 + 12.0 * 2.0 + extras
 }
@@ -166,6 +193,8 @@ pub fn info_bar_is_compact(window_width: f32, scale: f32) -> bool {
 mod tests {
     use super::*;
 
+    const PT: f32 = 12.0;
+
     fn inputs() -> ToolbarInputs {
         ToolbarInputs {
             repeat_label: "⮔ Off".to_string(),
@@ -174,72 +203,74 @@ mod tests {
     }
 
     #[test]
-    fn em_width_is_monotonic() {
-        assert_eq!(em_width(""), 0.0);
-        assert!(em_width("Settings") > em_width("Set"));
+    fn measurement_is_real_and_monotonic() {
+        assert!(text_px("Settings", PT) > text_px("Set", PT));
         // A space is what makes "⚙ Settings" wrappable, so it must count.
-        assert!(em_width("⚙ Settings") > em_width("⚙Settings"));
-        assert!(em_width("⚙ Settings") > em_width("⚙"));
+        assert!(text_px("⚙ Settings", PT) > text_px("⚙", PT));
+        // Bigger type measures wider — this is what makes the whole thing
+        // follow the user's font size instead of a baked-in table.
+        assert!(text_px("Settings", PT * 2.0) > text_px("Settings", PT));
     }
 
     #[test]
-    fn row_width_is_affine_not_linear() {
-        let i = inputs();
-        // Equal per-unit-scale deltas => affine in `scale`.
-        let d1 = controls_bottom_row_px(&i, 2.0) - controls_bottom_row_px(&i, 1.0);
-        let d2 = controls_bottom_row_px(&i, 3.0) - controls_bottom_row_px(&i, 2.0);
-        assert!((d1 - d2).abs() < 0.01, "{d1} vs {d2}");
+    fn memoisation_returns_the_same_value() {
+        // Shaping costs ~50us per label, far too much for every frame, so the
+        // result is cached. A stale or key-colliding cache would show up here.
+        let a = text_px("⚙ Settings", PT);
+        let b = text_px("⚙ Settings", PT);
+        assert_eq!(a, b);
+        assert_ne!(text_px("⚙ Settings", PT), text_px("⚙ Settings", PT * 1.5));
+    }
 
-        // The fixed padding term survives scale -> 0. This is exactly what a
-        // naive `760.0 * font::scale()` gets wrong.
+    #[test]
+    fn row_width_is_affine_in_text_size() {
+        // Padding is a raw constant that does not scale, so the total keeps a
+        // fixed term. A purely proportional model (`760 * scale`) gets this
+        // wrong in the opposite direction to the old per-character table.
+        let i = inputs();
+        // Padding survives even when the text measures nothing.
         assert!(controls_bottom_row_px(&i, 0.0) > 0.0);
+        // Equal steps in size give equal steps in width => affine, not
+        // proportional.
+        let d1 = controls_bottom_row_px(&i, 24.0) - controls_bottom_row_px(&i, 12.0);
+        let d2 = controls_bottom_row_px(&i, 36.0) - controls_bottom_row_px(&i, 24.0);
+        assert!(
+            (d1 - d2).abs() / d1.max(1.0) < 0.05,
+            "expected near-equal deltas, got {d1} and {d2}"
+        );
     }
 
     #[test]
-    fn compact_triggers_before_the_row_overflows() {
-        // The regression test for the reported bug: at scale 1.0 the row needs
-        // ~854 px, and the old rule returned "not compact" for anything >= 760.
+    fn compact_triggers_only_when_labels_really_do_not_fit() {
+        // The reported bug: an over-estimating width table stripped the labels
+        // while there was still plenty of room. Compact must be false at any
+        // width that genuinely fits the measured row.
         let i = inputs();
-        for &s in &[0.5_f32, 1.0, 1.5, 2.0, 3.0] {
-            let need = controls_bottom_row_px(&i, s);
+        for &pt in &[8.0f32, 12.0, 18.0, 24.0] {
+            let need = controls_bottom_row_px(&i, pt).max(controls_top_row_px(&i, pt));
             assert!(
-                toolbar_is_compact(need - 1.0, &i, s),
-                "must be compact at scale {s} when 1px short of {need}"
+                !toolbar_is_compact(need + 1.0, &i, pt),
+                "labels fit at {need} but were dropped (pt {pt})"
             );
             assert!(
-                !toolbar_is_compact(need * 2.0, &i, s),
-                "must not be compact at scale {s} with double the room"
+                toolbar_is_compact(need - 1.0, &i, pt),
+                "must be compact 1px short of {need} (pt {pt})"
             );
         }
     }
 
     #[test]
-    fn old_fixed_threshold_would_have_missed_the_bug() {
-        // Documents the failure band: at the default font the row needs more
-        // than the 760 the old rule used.
-        let need = controls_bottom_row_px(&inputs(), 1.0);
-        assert!(
-            need > 760.0,
-            "expected the row to exceed the old threshold, got {need}"
-        );
-        assert!(need < 1000.0, "sanity: measured ~854, got {need}");
-    }
-
-    #[test]
     fn default_window_keeps_its_labels() {
-        // DEFAULT_WINDOW_WIDTH is 900 and the plain labelled row needs ~871,
-        // so it fits. Pins the safety margin: if someone widens it enough to
-        // flip this, that is a visible regression in information density.
-        assert!(!toolbar_is_compact(900.0, &inputs(), 1.0));
-        // The reported failure width must still go to icons.
-        assert!(toolbar_is_compact(781.0, &inputs(), 1.0));
+        // DEFAULT_WINDOW_WIDTH is 900. With real measurement the labelled row
+        // fits comfortably, so a default-sized window must show text.
+        assert!(!toolbar_is_compact(900.0, &inputs(), PT));
     }
 
     #[test]
     fn icon_mode_is_strictly_narrower() {
         let i = inputs();
-        for &s in &[0.5_f32, 1.0, 2.0, 3.0] {
-            assert!(controls_icons_px(&i, s) < controls_bottom_row_px(&i, s));
+        for &pt in &[8.0f32, 12.0, 24.0] {
+            assert!(controls_icons_px(&i, pt) < controls_bottom_row_px(&i, pt));
         }
     }
 
@@ -256,25 +287,14 @@ mod tests {
             update_version_len: 5,
             ..base.clone()
         };
-        let w = |i: &ToolbarInputs| controls_bottom_row_px(i, 1.0);
+        let w = |i: &ToolbarInputs| controls_bottom_row_px(i, PT);
         assert!(w(&pill) > w(&base));
         assert!(w(&both) > w(&pill));
-        // Both showing pushes a default 900px window over.
-        assert!(w(&both) > 900.0, "got {}", w(&both));
-    }
-
-    #[test]
-    fn button_px_includes_unscaled_padding() {
-        // Padding is a raw constant in the UI and must not be scaled, or the
-        // estimate drifts badly at large font sizes.
-        let a = button_px("Save", 12.0, 10.0, 1.0);
-        let b = button_px("Save", 12.0, 10.0, 2.0);
-        assert!((b - a - text_px("Save", 12.0, 1.0)).abs() < 0.01);
     }
 
     #[test]
     fn info_bar_threshold_matches_old_behaviour_at_scale_one() {
-        // Exactly 760.0 at scale 1.0 => no visual change by default.
+        // Exactly 760.0 at scale 1.0 => no visual change by default...
         assert!(info_bar_is_compact(759.0, 1.0));
         assert!(!info_bar_is_compact(760.0, 1.0));
         // ...but it now moves with the font size, which 760.0 never did.

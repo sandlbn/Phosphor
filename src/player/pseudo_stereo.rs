@@ -32,14 +32,19 @@ pub enum DetuneStrength {
 impl DetuneStrength {
     /// Detune in cents. Documentation value; the hot path uses `ratio_q16`.
     ///
-    /// 4/8/16 spans the usable band: analogue-synth unison detune sits at
-    /// 3-10 cents, and past roughly 25 cents the ear stops hearing "wide" and
-    /// starts hearing "out of tune". At A4 these beat at about 1, 2 and 4 Hz.
+    /// Beat rate is `f * (2^(c/1200) - 1)`, so it scales with pitch — and SID
+    /// leads sit high. Chorus reads as *movement* at roughly 4-7 Hz; past that
+    /// it becomes warble. At a 1760 Hz lead these beat at 3.1 / 5.1 / 8.2 Hz.
+    ///
+    /// An earlier 4/8/16 ladder put Wide at 16 Hz there, which was audibly
+    /// rough. The band is now 3-8, inside the 5-10 cents that synth unison
+    /// and production practice use — and the chip-model asymmetry below
+    /// carries most of the width, so the detune only has to add movement.
     pub fn cents(self) -> u32 {
         match self {
-            Self::Subtle => 4,
-            Self::Medium => 8,
-            Self::Wide => 16,
+            Self::Subtle => 3,
+            Self::Medium => 5,
+            Self::Wide => 8,
         }
     }
 
@@ -55,9 +60,9 @@ impl DetuneStrength {
     /// indistinguishable for a widening effect, so this takes the free safety.
     pub fn ratio_q16(self) -> u32 {
         match self {
-            Self::Subtle => 65385, // 2^(-4/1200)
-            Self::Medium => 65234, // 2^(-8/1200)
-            Self::Wide => 64933,   // 2^(-16/1200)
+            Self::Subtle => 65423, // 2^(-3/1200)
+            Self::Medium => 65347, // 2^(-5/1200)
+            Self::Wide => 65234,   // 2^(-8/1200)
         }
     }
 
@@ -255,23 +260,28 @@ mod tests {
         // The headline regression. Detuning each byte independently is NOT the
         // same transform as detuning the 16-bit word: 0x1000 scaled as a word
         // is 0x0FDA, whereas scaling the bytes separately gives 0x0F00.
-        let mut p = PseudoStereo::new(DetuneStrength::Wide);
+        let s = DetuneStrength::Wide;
+        let mut p = PseudoStereo::new(s);
         emitted(&mut p, 0x00, 0x00);
         emitted(&mut p, 0x01, 0x10); // word = 0x1000
-        let expect = ((0x1000u32 * 64933 + 0x8000) >> 16) as u16;
-        assert_eq!(expect, 0x0FDA);
+                                     // Derived from the enum, not hardcoded, so retuning the presets can't
+                                     // leave this asserting a stale constant.
+        let expect = ((0x1000u32 * s.ratio_q16() + 0x8000) >> 16) as u16;
         assert_eq!(p.dst[0], [expect as u8, (expect >> 8) as u8]);
+        // The byte-wise transform would have given 0x0F00 — a different value.
+        assert_ne!(expect, 0x0F00);
     }
 
     #[test]
     fn hi_only_write_still_detunes_using_the_shadowed_lo() {
         // Seeded from the INIT dump, which is sent unmirrored.
-        let mut p = PseudoStereo::new(DetuneStrength::Medium);
+        let s = DetuneStrength::Medium;
+        let mut p = PseudoStereo::new(s);
         p.observe(0x00, 0x80);
         emitted(&mut p, 0x01, 0x10); // word = 0x1080, not 0x1000
-        let expect = ((0x1080u32 * 65234 + 0x8000) >> 16) as u16;
+        let expect = ((0x1080u32 * s.ratio_q16() + 0x8000) >> 16) as u16;
         assert_eq!(p.dst[0], [expect as u8, (expect >> 8) as u8]);
-        assert_ne!(expect, ((0x1000u32 * 65234 + 0x8000) >> 16) as u16);
+        assert_ne!(expect, ((0x1000u32 * s.ratio_q16() + 0x8000) >> 16) as u16);
     }
 
     #[test]
@@ -280,9 +290,9 @@ mod tests {
         // loudly if anyone flips the sign without adding a saturating clamp —
         // a wrapped 0xFFFF would drop the note by an octave with a click.
         for (s, want) in [
-            (DetuneStrength::Subtle, 0xFF68u16),
-            (DetuneStrength::Medium, 0xFED1),
-            (DetuneStrength::Wide, 0xFDA4),
+            (DetuneStrength::Subtle, 0xFF8Eu16),
+            (DetuneStrength::Medium, 0xFF42),
+            (DetuneStrength::Wide, 0xFED1),
         ] {
             let mut p = PseudoStereo::new(s);
             p.observe(0x00, 0xFF);
