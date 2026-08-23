@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// the full recursive sync crawls under this URL, AND `Songlengths.md5` +
 /// `STIL.txt` are refreshed from `<this>/DOCUMENTS/{Songlengths.md5,STIL.txt}`.
 
-pub const DEFAULT_HVSC_RSYNC_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music/";
+pub const DEFAULT_HVSC_MIRROR_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music/";
 
 /// Default window dimensions — used on first launch.
 const DEFAULT_WINDOW_WIDTH: f32 = 900.0;
@@ -37,15 +37,17 @@ pub struct Config {
     /// Path to last successfully loaded STIL.txt file.
     pub last_stil_file: Option<String>,
     /// Optional HVSC root directory — used to compute HVSC-relative paths for STIL lookup
-    /// AND as the destination for the in-app rsync sync.
+    /// AND as the destination for the in-app sync.
     pub hvsc_root: Option<String>,
-    /// rsync URL to pull HVSC from. Default is sidplay5's mirror, confirmed
-    /// working with our `arrsync-phosphor` fork.
-    pub hvsc_rsync_url: String,
+    /// Base URL of the HVSC mirror. Used for the `DOCUMENTS/` downloads
+    /// (STIL, Songlengths), the release-version check, and to derive the
+    /// archive URL the sync downloads.
+    pub hvsc_mirror_url: String,
     /// ISO-8601 timestamp of the last successful HVSC sync (display only).
     pub hvsc_last_sync: Option<String>,
-    /// Optional URL to a HVSC zip archive, used by the "Fast first-time
-    /// sync" path (see [`crate::hvsc_sync::HvscSyncHandle::start_from_zip`]).
+    /// Overrides the derived archive URL. Only needed for a mirror whose
+    /// archive layout isn't known (see
+    /// [`crate::hvsc_sync::HvscSyncHandle::start_from_zip`]).
     /// Empty / None = the button is disabled — HVSC's canonical zip URL
     /// changes per release, so we don't ship a default that might 404.
     pub hvsc_zip_url: Option<String>,
@@ -133,7 +135,7 @@ impl Default for Config {
             last_playlist_dir: None,
             last_stil_file: None,
             hvsc_root: None,
-            hvsc_rsync_url: DEFAULT_HVSC_RSYNC_URL.to_string(),
+            hvsc_mirror_url: DEFAULT_HVSC_MIRROR_URL.to_string(),
             hvsc_last_sync: None,
             hvsc_zip_url: None,
             browser_source: "local".to_string(),
@@ -272,10 +274,15 @@ impl Config {
                 if val != "null" {
                     config.hvsc_known_version = strip_json_string(val);
                 }
-            } else if let Some(rest) = line.strip_prefix("\"hvsc_rsync_url\"") {
+            } else if let Some(rest) = line
+                .strip_prefix("\"hvsc_mirror_url\"")
+                // Former name. Read so upgrading doesn't silently reset a
+                // custom mirror; only the new key is ever written back.
+                .or_else(|| line.strip_prefix("\"hvsc_rsync_url\""))
+            {
                 let val = rest.trim().trim_start_matches(':').trim();
                 if let Some(s) = strip_json_string(val) {
-                    config.hvsc_rsync_url = s;
+                    config.hvsc_mirror_url = s;
                 }
             } else if let Some(rest) = line.strip_prefix("\"hvsc_last_sync\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
@@ -430,7 +437,7 @@ impl Config {
                 "  \"last_stil_file\": {},\n",
                 "  \"hvsc_root\": {},\n",
                 "  \"hvsc_known_version\": {},\n",
-                "  \"hvsc_rsync_url\": \"{}\",\n",
+                "  \"hvsc_mirror_url\": \"{}\",\n",
                 "  \"hvsc_last_sync\": {},\n",
                 "  \"hvsc_zip_url\": {},\n",
                 "  \"browser_source\": \"{}\",\n",
@@ -467,7 +474,7 @@ impl Config {
             fmt_opt_str(&self.last_stil_file),
             fmt_opt_str(&self.hvsc_root),
             fmt_opt_str(&self.hvsc_known_version),
-            self.hvsc_rsync_url,
+            self.hvsc_mirror_url,
             fmt_opt_str(&self.hvsc_last_sync),
             fmt_opt_str(&self.hvsc_zip_url),
             self.browser_source,
@@ -621,5 +628,42 @@ pub fn apply_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
             eprintln!("[phosphor] Invalid proxy URL {url:?}: {e} — ignoring");
             builder
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_url_reads_both_current_and_former_key() {
+        // Current key.
+        let cfg = Config::parse_json("  \"hvsc_mirror_url\": \"https://a.example/HVSC/\",\n");
+        assert_eq!(cfg.hvsc_mirror_url, "https://a.example/HVSC/");
+
+        // Former key, so upgrading doesn't silently reset a custom mirror
+        // back to the default.
+        let cfg = Config::parse_json("  \"hvsc_rsync_url\": \"https://b.example/HVSC/\",\n");
+        assert_eq!(cfg.hvsc_mirror_url, "https://b.example/HVSC/");
+
+        // Neither present -> default.
+        let cfg = Config::parse_json("  \"window_width_saved\": 800,\n");
+        assert_eq!(cfg.hvsc_mirror_url, DEFAULT_HVSC_MIRROR_URL);
+    }
+
+    #[test]
+    fn mirror_url_round_trips_under_the_new_key() {
+        let mut cfg = Config::default();
+        cfg.hvsc_mirror_url = "https://c.example/HVSC/".to_string();
+        let json = cfg.to_json();
+        assert!(json.contains("\"hvsc_mirror_url\""), "writes the new key");
+        assert!(
+            !json.contains("\"hvsc_rsync_url\""),
+            "never writes the old key"
+        );
+        assert_eq!(
+            Config::parse_json(&json).hvsc_mirror_url,
+            "https://c.example/HVSC/"
+        );
     }
 }

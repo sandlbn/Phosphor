@@ -11,7 +11,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+
+    # Fails in seconds without needing a build, so it goes first.
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev
+
+    # This project pulls iced/wgpu plus C builds for LAME, libsidplayfp and
+    # SIDLite, so a cold build is slow. Keyed on the lockfile: dependency
+    # changes get a fresh cache, source-only changes reuse it.
+    - name: Cache cargo registry and build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: Build
       run: cargo build --verbose
+
+    # The suite is pure logic (search ranking, sort order, config migration,
+    # index-cache invalidation, toolbar width math) and writes only to the
+    # temp dir, so it needs no HVSC collection or display.
+    - name: Test
+      run: cargo test --verbose
+
+    # Advisory only: there are ~118 pre-existing clippy warnings, so gating on
+    # this would fail every run until someone does a cleanup pass. Kept visible
+    # so new lints are noticed; flip to `-D warnings` once the backlog is clear.
+    - name: Clippy (advisory)
+      run: cargo clippy --all-targets
+      continue-on-error: true

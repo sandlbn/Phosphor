@@ -1,5 +1,6 @@
 pub mod device_panel;
 pub mod font;
+pub mod metrics;
 pub mod right_click;
 pub mod sid_panel;
 pub mod visualizer;
@@ -35,6 +36,37 @@ pub struct HvscScroll {
     pub authors_h: f32,
     pub tunes_y: f32,
     pub tunes_h: f32,
+}
+
+/// Playlist table column widths. One source of truth for the header and the
+/// body rows — they must resolve identically or the columns visibly de-align,
+/// and they used to be two independent copies of the same seven numbers.
+///
+/// The fixed ones scale with the font: at a large `base_font_size` a 42 px
+/// "Type" cell clipped its own text.
+pub struct PlaylistCols {
+    pub heart: Length,
+    pub num: Length,
+    pub title: Length,
+    pub author: Length,
+    pub released: Length,
+    pub time: Length,
+    pub sid_type: Length,
+    pub sids: Length,
+}
+
+pub fn playlist_cols() -> PlaylistCols {
+    let s = font::scale();
+    PlaylistCols {
+        heart: Length::Fixed(22.0 * s),
+        num: Length::Fixed(50.0 * s),
+        title: Length::FillPortion(4),
+        author: Length::FillPortion(3),
+        released: Length::FillPortion(2),
+        time: Length::Fixed(55.0 * s),
+        sid_type: Length::Fixed(42.0 * s),
+        sids: Length::Fixed(45.0 * s),
+    }
 }
 
 /// Fixed scrollable IDs for the HVSC browser's two lists.
@@ -411,6 +443,8 @@ pub enum Message {
     /// Fires after the typing pause; carries the sequence number it was
     /// scheduled with so superseded keystrokes are ignored.
     HvscSearchDebounced(u64),
+    /// Author's tunes finished loading off-thread.
+    HvscAuthorTunesLoaded(u64, Vec<crate::hvsc_browser::HvscTune>),
     HvscAuthorsScrolled(iced::widget::scrollable::Viewport),
     HvscTunesScrolled(iced::widget::scrollable::Viewport),
 
@@ -486,17 +520,15 @@ pub enum Message {
     /// `<hvsc_root>/DOCUMENTS/` after the root changed — ready to install.
     HvscMetadataLoaded(Box<crate::HvscMetaLoad>),
 
-    // HVSC rsync (pulls the full tune tree)
-    HvscRsyncUrlChanged(String),
-    HvscRsyncStart,
-    HvscRsyncCancel,
-    /// Per-Tick drain — UI consumes the queued progress events here.
-    HvscRsyncPoll,
+    /// Mirror base URL. Still used for the DOCUMENTS/ downloads (STIL,
+    /// Songlengths) and the version check, and to derive the archive URL.
+    HvscMirrorUrlChanged(String),
+    HvscSyncCancel,
 
-    // HVSC zip sync — an alternative first-time-fast path that pulls a
-    // single archive instead of ~75k individual HTTP GETs. Uses the same
-    // `hvsc_sync` handle + progress event stream as the rsync path, so
-    // only one of the two can run at a time.
+    // HVSC sync — pulls the whole collection as one archive. The former
+    // per-file mirror crawl is gone: it issued ~75k individual GETs and a
+    // partial run left the tree looking complete while most author folders
+    // were empty.
     HvscZipUrlChanged(String),
     HvscZipSyncStart,
 
@@ -525,7 +557,9 @@ pub fn track_info_bar<'a>(
     // of device-config types.
     engine_suffix: Option<&str>,
 ) -> Element<'a, Message> {
-    let compact = window_width < 760.0;
+    // Affine, so it moves with the font size. Exactly 760.0 at scale 1.0, so
+    // the default layout is byte-identical to before.
+    let compact = metrics::info_bar_is_compact(window_width, font::scale());
     let title_size = if compact { 15.0_f32 } else { 18.0 };
     let author_size = if compact { 12.0_f32 } else { 14.0 };
     let extra_size = if compact { 10.0_f32 } else { 12.0 };
@@ -590,18 +624,27 @@ pub fn track_info_bar<'a>(
         PlayState::Stopped => "■",
     };
 
+    // None of these may wrap: `info_col` is the only Fill child in this row
+    // (the visualiser beside it is Fixed), so it absorbs every pixel of shrink.
+    // The `extra` metadata line is the worst — "PSID • 6581 • Song 1/3 • PAL •
+    // 12 writes/frame" is ~400px and would grow the header to three lines.
     let mut info_col = column![
-        text(format!("{state_icon}  {title}")).size(font::sized(title_size)),
+        text(format!("{state_icon}  {title}"))
+            .size(font::sized(title_size))
+            .wrapping(iced::widget::text::Wrapping::None),
         text(author)
             .size(font::sized(author_size))
-            .color(Color::from_rgb(0.6, 0.7, 0.8)),
+            .color(Color::from_rgb(0.6, 0.7, 0.8))
+            .wrapping(iced::widget::text::Wrapping::None),
         text(extra)
             .size(font::sized(extra_size))
-            .color(Color::from_rgb(0.5, 0.5, 0.6)),
+            .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .wrapping(iced::widget::text::Wrapping::None),
         row![
             text(format!("Engine: {engine_label}"))
                 .size(font::sized(extra_size))
-                .color(Color::from_rgb(0.4, 0.55, 0.45)),
+                .color(Color::from_rgb(0.4, 0.55, 0.45))
+                .wrapping(iced::widget::text::Wrapping::None),
             if !status.device_connected {
                 row![
                     Space::new().width(Length::Fixed(8.0)),
@@ -623,7 +666,8 @@ pub fn track_info_bar<'a>(
         info_col = info_col.push(
             text(format!("⚠ {err}"))
                 .size(font::sized(12.0))
-                .color(Color::from_rgb(1.0, 0.3, 0.3)),
+                .color(Color::from_rgb(1.0, 0.3, 0.3))
+                .wrapping(iced::widget::text::Wrapping::None),
         );
     }
 
@@ -815,7 +859,19 @@ pub fn controls_bar<'a>(
     // their browser. `None` = server not running → no pill.
     http_remote_url: Option<String>,
 ) -> Element<'a, Message> {
-    let compact = window_width < 760.0;
+    // Derived, not guessed. The labelled bottom row needs ~854 px at the
+    // default font — the old `< 760.0` left a band where it overflowed while
+    // still drawing full labels, which is what wrapped "⚙ Settings" onto two
+    // lines. The estimate also tracks font scale and the Remote / update
+    // pills, both of which a fixed number cannot.
+    let toolbar_inputs = metrics::ToolbarInputs {
+        repeat_label: playlist.repeat.label().to_string(),
+        shuffle_on: playlist.shuffle,
+        has_remote_pill: http_remote_url.is_some(),
+        has_update_badge: new_version.is_some(),
+        update_version_len: new_version.map(|v| v.version.len()).unwrap_or(0),
+    };
+    let compact = metrics::toolbar_is_compact(window_width, &toolbar_inputs, font::scale());
     let btn_size = if compact { 11.0_f32 } else { 12.0 };
     let btn_pad = if compact { 3_u16 } else { 4 };
     let bar_pad = if compact { 4_u16 } else { 6 };
@@ -826,54 +882,67 @@ pub fn controls_bar<'a>(
     };
 
     let small_button = |label: &'a str, msg: Message| -> Element<'a, Message> {
-        button(text(label).size(font::sized(btn_size)))
-            .on_press(msg)
-            .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
-            .style(|_theme: &Theme, st| {
-                let bg = match st {
-                    button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
-                    button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
-                    _ => Color::from_rgb(0.18, 0.19, 0.22),
-                };
-                button::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    text_color: Color::from_rgb(0.8, 0.82, 0.88),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        width: 1.0,
-                        color: Color::from_rgb(0.25, 0.27, 0.30),
-                    },
-                    ..Default::default()
-                }
-            })
-            .into()
+        // Never wrap: a label with a space in it ("⚙ Settings") would otherwise
+        // split across two lines the moment flex runs out of width, doubling the
+        // button's height and with it the whole row's. Must be set here, on the
+        // `text` builder — `with_tip` returns an opaque Element with no
+        // `.wrapping()`, and every toolbar button is wrapped in a tooltip.
+        button(
+            text(label)
+                .size(font::sized(btn_size))
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .on_press(msg)
+        .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+        .style(|_theme: &Theme, st| {
+            let bg = match st {
+                button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                _ => Color::from_rgb(0.18, 0.19, 0.22),
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                text_color: Color::from_rgb(0.8, 0.82, 0.88),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.25, 0.27, 0.30),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
     };
 
     // Accent variant for the Library entry-point: deep teal background +
     // brighter border so the "browse content" affordance stands out from
     // the surrounding utility toggles (recent/sid/device/settings).
     let accent_button = |label: &'a str, msg: Message| -> Element<'a, Message> {
-        button(text(label).size(font::sized(btn_size)))
-            .on_press(msg)
-            .padding(Padding::from([btn_pad, if compact { 8 } else { 12 }]))
-            .style(|_theme: &Theme, st| {
-                let bg = match st {
-                    button::Status::Hovered => Color::from_rgb(0.22, 0.32, 0.42),
-                    button::Status::Pressed => Color::from_rgb(0.12, 0.18, 0.24),
-                    _ => Color::from_rgb(0.16, 0.22, 0.32),
-                };
-                button::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    text_color: Color::from_rgb(0.92, 0.96, 1.0),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        width: 1.0,
-                        color: Color::from_rgb(0.40, 0.55, 0.70),
-                    },
-                    ..Default::default()
-                }
-            })
-            .into()
+        button(
+            text(label)
+                .size(font::sized(btn_size))
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .on_press(msg)
+        .padding(Padding::from([btn_pad, if compact { 8 } else { 12 }]))
+        .style(|_theme: &Theme, st| {
+            let bg = match st {
+                button::Status::Hovered => Color::from_rgb(0.22, 0.32, 0.42),
+                button::Status::Pressed => Color::from_rgb(0.12, 0.18, 0.24),
+                _ => Color::from_rgb(0.16, 0.22, 0.32),
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                text_color: Color::from_rgb(0.92, 0.96, 1.0),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.40, 0.55, 0.70),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
     };
 
     let sep = || -> Element<'a, Message> {
@@ -911,10 +980,13 @@ pub fn controls_bar<'a>(
 
     let subtune_controls = row![
         with_tip(
-            small_button("◄ tune", Message::PrevSubtune),
-            "Previous subtune"
+            small_button(if compact { "◄" } else { "◄ tune" }, Message::PrevSubtune),
+            "Previous subtune",
         ),
-        with_tip(small_button("tune ►", Message::NextSubtune), "Next subtune"),
+        with_tip(
+            small_button(if compact { "►" } else { "tune ►" }, Message::NextSubtune),
+            "Next subtune",
+        ),
     ]
     .spacing(4);
 
@@ -926,99 +998,112 @@ pub fn controls_bar<'a>(
     let mode_controls = row![
         with_tip(
             small_button(
-                if playlist.shuffle {
-                    "🔀 On"
-                } else {
-                    "🔀 Off"
+                match (compact, playlist.shuffle) {
+                    (true, _) => "🔀",
+                    (false, true) => "🔀 On",
+                    (false, false) => "🔀 Off",
                 },
                 Message::ToggleShuffle,
             ),
             shuffle_tip,
         ),
         with_tip(
-            small_button(playlist.repeat.label(), Message::CycleRepeat),
+            small_button(
+                if compact {
+                    playlist.repeat.icon()
+                } else {
+                    playlist.repeat.label()
+                },
+                Message::CycleRepeat,
+            ),
             "Cycle repeat mode (off → all → one)",
         ),
     ]
     .spacing(4);
 
-    let recent_btn: Element<'a, Message> =
-        button(text(if compact { "🕐" } else { "🕐 Recent" }).size(font::sized(btn_size)))
-            .on_press(Message::ShowRecentlyPlayed)
-            .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
-            .style(move |_theme: &Theme, st| {
-                let bg = if show_recently_played {
-                    match st {
-                        button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
-                        button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
-                        _ => Color::from_rgb(0.16, 0.25, 0.40),
-                    }
+    let recent_btn: Element<'a, Message> = button(
+        text(if compact { "🕐" } else { "🕐 Recent" })
+            .size(font::sized(btn_size))
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .on_press(Message::ShowRecentlyPlayed)
+    .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+    .style(move |_theme: &Theme, st| {
+        let bg = if show_recently_played {
+            match st {
+                button::Status::Hovered => Color::from_rgb(0.20, 0.30, 0.45),
+                button::Status::Pressed => Color::from_rgb(0.15, 0.22, 0.35),
+                _ => Color::from_rgb(0.16, 0.25, 0.40),
+            }
+        } else {
+            match st {
+                button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                _ => Color::from_rgb(0.18, 0.19, 0.22),
+            }
+        };
+        button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color: if show_recently_played {
+                Color::from_rgb(0.55, 0.80, 1.0)
+            } else {
+                Color::from_rgb(0.8, 0.82, 0.88)
+            },
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: if show_recently_played {
+                    Color::from_rgb(0.3, 0.45, 0.7)
                 } else {
-                    match st {
-                        button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
-                        button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
-                        _ => Color::from_rgb(0.18, 0.19, 0.22),
-                    }
-                };
-                button::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    text_color: if show_recently_played {
-                        Color::from_rgb(0.55, 0.80, 1.0)
-                    } else {
-                        Color::from_rgb(0.8, 0.82, 0.88)
-                    },
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        width: 1.0,
-                        color: if show_recently_played {
-                            Color::from_rgb(0.3, 0.45, 0.7)
-                        } else {
-                            Color::from_rgb(0.25, 0.27, 0.30)
-                        },
-                    },
-                    ..Default::default()
-                }
-            })
-            .into();
+                    Color::from_rgb(0.25, 0.27, 0.30)
+                },
+            },
+            ..Default::default()
+        }
+    })
+    .into();
 
-    let sid_btn: Element<'a, Message> =
-        button(text(if compact { "SID" } else { "SID" }).size(font::sized(btn_size)))
-            .on_press(Message::ToggleSidPanel)
-            .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
-            .style(move |_theme: &Theme, st| {
-                let bg = if show_sid_panel {
-                    match st {
-                        button::Status::Hovered => Color::from_rgb(0.15, 0.35, 0.25),
-                        button::Status::Pressed => Color::from_rgb(0.10, 0.28, 0.18),
-                        _ => Color::from_rgb(0.11, 0.30, 0.20),
-                    }
+    let sid_btn: Element<'a, Message> = button(
+        text("SID")
+            .size(font::sized(btn_size))
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .on_press(Message::ToggleSidPanel)
+    .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
+    .style(move |_theme: &Theme, st| {
+        let bg = if show_sid_panel {
+            match st {
+                button::Status::Hovered => Color::from_rgb(0.15, 0.35, 0.25),
+                button::Status::Pressed => Color::from_rgb(0.10, 0.28, 0.18),
+                _ => Color::from_rgb(0.11, 0.30, 0.20),
+            }
+        } else {
+            match st {
+                button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+                button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+                _ => Color::from_rgb(0.18, 0.19, 0.22),
+            }
+        };
+        button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color: if show_sid_panel {
+                Color::from_rgb(0.30, 0.85, 0.55)
+            } else {
+                Color::from_rgb(0.8, 0.82, 0.88)
+            },
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: if show_sid_panel {
+                    Color::from_rgb(0.20, 0.55, 0.35)
                 } else {
-                    match st {
-                        button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
-                        button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
-                        _ => Color::from_rgb(0.18, 0.19, 0.22),
-                    }
-                };
-                button::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    text_color: if show_sid_panel {
-                        Color::from_rgb(0.30, 0.85, 0.55)
-                    } else {
-                        Color::from_rgb(0.8, 0.82, 0.88)
-                    },
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        width: 1.0,
-                        color: if show_sid_panel {
-                            Color::from_rgb(0.20, 0.55, 0.35)
-                        } else {
-                            Color::from_rgb(0.25, 0.27, 0.30)
-                        },
-                    },
-                    ..Default::default()
-                }
-            })
-            .into();
+                    Color::from_rgb(0.25, 0.27, 0.30)
+                },
+            },
+            ..Default::default()
+        }
+    })
+    .into();
 
     // File-ops sub-group (add to playlist, open/save/clear).
     let file_ops = if compact {
@@ -1132,10 +1217,15 @@ pub fn controls_bar<'a>(
     };
 
     let update_badge = |version: &str| -> Element<'a, Message> {
-        button(
-            text(format!("⬆ {version}"))
-                .size(font::sized(if compact { 11.0 } else { 12.0 }))
-                .color(Color::from_rgb(0.1, 0.1, 0.12)),
+        let badge = button(
+            text(if compact {
+                "⬆".to_string()
+            } else {
+                format!("⬆ {version}")
+            })
+            .size(font::sized(if compact { 11.0 } else { 12.0 }))
+            .color(Color::from_rgb(0.1, 0.1, 0.12))
+            .wrapping(iced::widget::text::Wrapping::None),
         )
         .on_press(Message::OpenUpdateUrl)
         .padding(Padding::from([
@@ -1150,8 +1240,13 @@ pub fn controls_bar<'a>(
                 ..Default::default()
             },
             ..Default::default()
-        })
-        .into()
+        });
+        // The only toolbar control that had no tooltip. In icon-only mode the
+        // version number is no longer on screen, so it has to live here.
+        with_tip(
+            badge,
+            format!("Version {version} available — click to download"),
+        )
     };
 
     // Two rows, always — same logical split wide or narrow.
@@ -1183,9 +1278,10 @@ pub fn controls_bar<'a>(
         // just "● Remote"; the full URL still shows in the hover
         // tooltip and the click still opens it.
         let dot_btn: Element<'a, Message> = button(
-            text("● Remote")
+            text(if compact { "●" } else { "● Remote" })
                 .size(font::sized(if compact { 11.0 } else { 12.0 }))
-                .color(Color::from_rgb(0.55, 0.85, 0.65)),
+                .color(Color::from_rgb(0.55, 0.85, 0.65))
+                .wrapping(iced::widget::text::Wrapping::None),
         )
         .on_press(Message::OpenUrl(url_owned))
         .padding(Padding::from([btn_pad, if compact { 6 } else { 10 }]))
@@ -1343,6 +1439,7 @@ pub fn search_bar<'a>(
         // filter chip (no heart there either).
         let btn: Element<'a, Message> = button(
             text("▶ Play liked")
+                .wrapping(iced::widget::text::Wrapping::None)
                 .size(font::sized(12.0))
                 .color(Color::from_rgb(0.85, 0.62, 0.72)),
         )
@@ -1384,7 +1481,10 @@ pub fn search_bar<'a>(
             Space::new().width(Length::Fixed(8.0)),
             load_liked_btn,
             Space::new().width(Length::Fixed(8.0)),
-            text(count_text).size(font::sized(12.0)).color(count_color)
+            text(count_text)
+                .size(font::sized(12.0))
+                .color(count_color)
+                .wrapping(iced::widget::text::Wrapping::None)
         ]
         .spacing(4)
         .align_y(Alignment::Center)
@@ -1453,40 +1553,49 @@ pub fn playlist_view<'a>(
         } else {
             Color::from_rgb(0.5, 0.5, 0.6)
         };
-        button(text(display).size(font::sized(11.0)).color(text_color))
-            .on_press(Message::SortBy(col))
-            .padding(Padding::from([2, 4]))
-            .style(|_theme: &Theme, st| button::Style {
-                background: match st {
-                    button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
-                        1.0, 1.0, 1.0, 0.06,
-                    ))),
-                    _ => None,
-                },
-                text_color: Color::WHITE,
-                border: iced::Border {
-                    radius: 2.0.into(),
-                    ..Default::default()
-                },
+        button(
+            text(display)
+                .size(font::sized(11.0))
+                .color(text_color)
+                // "Released" sits in FillPortion(2), which collapses fast once
+                // the fixed columns have taken their share — it would wrap and
+                // double the header's height.
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .on_press(Message::SortBy(col))
+        .padding(Padding::from([2, 4]))
+        .style(|_theme: &Theme, st| button::Style {
+            background: match st {
+                button::Status::Hovered => Some(iced::Background::Color(Color::from_rgba(
+                    1.0, 1.0, 1.0, 0.06,
+                ))),
+                _ => None,
+            },
+            text_color: Color::WHITE,
+            border: iced::Border {
+                radius: 2.0.into(),
                 ..Default::default()
-            })
-            .into()
+            },
+            ..Default::default()
+        })
+        .into()
     };
 
     // ── Header (lives outside the scrollable so it never scrolls away) ───────
+    let hcols = playlist_cols();
     let header = container(
         row![
             text("♥")
                 .size(font::sized(11.0))
                 .color(Color::from_rgb(0.5, 0.5, 0.6))
-                .width(Length::Fixed(22.0)),
-            container(header_btn("#", SortColumn::Index)).width(Length::Fixed(50.0)),
-            container(header_btn("Title", SortColumn::Title)).width(Length::FillPortion(4)),
-            container(header_btn("Author", SortColumn::Author)).width(Length::FillPortion(3)),
-            container(header_btn("Released", SortColumn::Released)).width(Length::FillPortion(2)),
-            container(header_btn("Time", SortColumn::Duration)).width(Length::Fixed(55.0)),
-            container(header_btn("Type", SortColumn::SidType)).width(Length::Fixed(42.0)),
-            container(header_btn("SIDs", SortColumn::NumSids)).width(Length::Fixed(45.0)),
+                .width(hcols.heart),
+            container(header_btn("#", SortColumn::Index)).width(hcols.num),
+            container(header_btn("Title", SortColumn::Title)).width(hcols.title),
+            container(header_btn("Author", SortColumn::Author)).width(hcols.author),
+            container(header_btn("Released", SortColumn::Released)).width(hcols.released),
+            container(header_btn("Time", SortColumn::Duration)).width(hcols.time),
+            container(header_btn("Type", SortColumn::SidType)).width(hcols.sid_type),
+            container(header_btn("SIDs", SortColumn::NumSids)).width(hcols.sids),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -1724,22 +1833,27 @@ pub fn recently_played_view<'a>(
         text("#")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(Length::Fixed(40.0)),
         text("Title")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(Length::FillPortion(4)),
         text("Author")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(Length::FillPortion(3)),
         text("Released")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(Length::FillPortion(2)),
         text("Played")
             .size(font::sized(11.0))
             .color(Color::from_rgb(0.5, 0.5, 0.6))
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(Length::Fixed(110.0)),
     ]
     .spacing(8)
@@ -1992,6 +2106,7 @@ fn playlist_row_content<'a>(
     sids: String,
     is_current: bool,
 ) -> Element<'a, Message> {
+    let cols = playlist_cols();
     let size: f32 = 13.0;
     let color = if is_current {
         Color::from_rgb(0.35, 0.85, 0.55)
@@ -2045,17 +2160,17 @@ fn playlist_row_content<'a>(
             Length::FillPortion(4),
         )
     } else {
-        nowrap_text(title, color, Length::FillPortion(4))
+        nowrap_text(title, color, cols.title)
     };
 
     row![
-        nowrap_text(format!("{indicator}{num:>3}"), color, Length::Fixed(50.0)),
+        nowrap_text(format!("{indicator}{num:>3}"), color, cols.num),
         title_cell,
-        nowrap_text(author, color, Length::FillPortion(3)),
-        nowrap_text(released, color, Length::FillPortion(2)),
-        nowrap_text(time, color, Length::Fixed(55.0)),
-        nowrap_text(sid_type, type_color, Length::Fixed(42.0)),
-        nowrap_text(sids, color, Length::Fixed(45.0)),
+        nowrap_text(author, color, cols.author),
+        nowrap_text(released, color, cols.released),
+        nowrap_text(time, color, cols.time),
+        nowrap_text(sid_type, type_color, cols.sid_type),
+        nowrap_text(sids, color, cols.sids),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
@@ -2083,6 +2198,7 @@ pub fn browser_view<'a>(
     hvsc_sync_status: &'a str,
     session_mode: &'a crate::SessionMode,
     scroll: HvscScroll,
+    window_width: f32,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::BrowserSource;
 
@@ -2122,6 +2238,7 @@ pub fn browser_view<'a>(
             hvsc_sync_in_progress,
             hvsc_sync_status,
             scroll,
+            window_width,
         ),
         BrowserSource::Assembly64 => assembly64_browser_view(a64),
         BrowserSource::PublishedPlaylists => {
@@ -2781,6 +2898,7 @@ pub fn hvsc_browser_view<'a>(
     sync_in_progress: bool,
     sync_status: &'a str,
     scroll: HvscScroll,
+    window_width: f32,
 ) -> Element<'a, Message> {
     use crate::hvsc_browser::HvscCategory;
 
@@ -2799,7 +2917,7 @@ pub fn hvsc_browser_view<'a>(
         .padding(Padding::from([4, 8]))
         .into()
     } else {
-        tool_button("⬇ Sync HVSC now", Message::HvscRsyncStart)
+        tool_button("⬇ Sync HVSC now", Message::HvscZipSyncStart)
     };
 
     // ── Empty state: no hvsc_root set ──────────────────────────────────────
@@ -2887,9 +3005,9 @@ pub fn hvsc_browser_view<'a>(
     let banner_button: Element<'a, Message> = if sync_in_progress {
         Space::new().width(Length::Fixed(0.0)).into()
     } else if update_available {
-        tool_button("⬇ Sync HVSC now", Message::HvscRsyncStart)
+        tool_button("⬇ Sync HVSC now", Message::HvscZipSyncStart)
     } else {
-        tool_button("⟳ Re-sync HVSC", Message::HvscRsyncStart)
+        tool_button("⟳ Re-sync HVSC", Message::HvscZipSyncStart)
     };
 
     let update_banner: Option<Element<'a, Message>> = Some(
@@ -2950,7 +3068,7 @@ pub fn hvsc_browser_view<'a>(
     }
     let mut items: Vec<AuthorItem> = Vec::with_capacity(filtered_authors.len() + 32);
     let mut last_letter: Option<char> = None;
-    for &idx in &filtered_authors {
+    for &idx in filtered_authors {
         let a = &browser.authors()[idx];
         if Some(a.letter) != last_letter {
             last_letter = Some(a.letter);
@@ -3066,7 +3184,12 @@ pub fn hvsc_browser_view<'a>(
     ]
     .spacing(6)
     .padding(Padding::from([8, 8]))
-    .width(Length::Fixed(320.0));
+    // Was a hard 320 px: it neither scaled with the font nor shrank, so on a
+    // narrow window it ate ~40% of the width and clipped author names at large
+    // font sizes.
+    .width(Length::Fixed(
+        (320.0 * font::scale()).min(window_width * 0.38).max(180.0),
+    ));
 
     // When the search box has text, prefer the flat global tune search
     // over the per-author view — unless the "this author only" scope
@@ -3451,7 +3574,7 @@ pub fn settings_panel<'a>(
     // Draft HTTP proxy URL — empty string = "no proxy". Applied to all
     // outbound requests once the user clicks Apply.
     proxy_url_text: &'a str,
-    // `hvsc_sync_active` true while a HVSC rsync sync is running (swaps
+    // `hvsc_sync_active` true while an HVSC sync is running (swaps
     // Sync/Cancel button + reveals progress bar).
     hvsc_sync_active: bool,
     // Status line for the HVSC sync section.
@@ -3962,7 +4085,7 @@ pub fn settings_panel<'a>(
     ]
     .spacing(6);
 
-    // ── HVSC rsync sync (experimental) ──────────────────────────
+    // ── HVSC sync ───────────────────────────────────────────────
     let hvsc_color = if hvsc_sync_status.contains("Error")
         || hvsc_sync_status.contains("fail")
         || hvsc_sync_status.contains("Cancelled")
@@ -3985,19 +4108,19 @@ pub fn settings_panel<'a>(
         Space::new().into()
     };
     let hvsc_sync_button: Element<'a, Message> = if hvsc_sync_active {
-        tool_button("✗ Cancel sync", Message::HvscRsyncCancel)
+        tool_button("✗ Cancel sync", Message::HvscSyncCancel)
     } else {
-        tool_button("⬇ Sync HVSC now", Message::HvscRsyncStart)
+        tool_button("⬇ Sync HVSC now", Message::HvscZipSyncStart)
     };
     let hvsc_section = column![
         text("HVSC tunes (HTTPS mirror):")
             .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         text_input(
-            "HTTPS URL of an HVSC mirror's directory index",
-            &config.hvsc_rsync_url
+            "HTTPS URL of an HVSC mirror, e.g. https://hvsc.brona.dk/HVSC/C64Music/",
+            &config.hvsc_mirror_url
         )
-        .on_input(Message::HvscRsyncUrlChanged)
+        .on_input(Message::HvscMirrorUrlChanged)
         .size(font::sized(12.0))
         .padding(Padding::from([6, 10]))
         .width(Length::Fill)
@@ -4027,58 +4150,25 @@ pub fn settings_panel<'a>(
     ]
     .spacing(6);
 
-    // ── HVSC "fast first-time sync" via a single zip archive ────
-    // Rationale: the recursive HTTPS crawl above issues one GET per
-    // file (~75k of them) against community-run mirrors that respond at
-    // a few KB/s. A first-time sync can take hours. Downloading a single
-    // ~500 MB zip is orders of magnitude faster.
-    //
-    // Empty URL by default (HVSC's canonical zip URL moves per release
-    // — no safe default). Button disabled until the user pastes one.
-    // Effective URL = user's override if set, else auto-derived from the
-    // rsync mirror + last-known HVSC version. Showing the derived URL in
-    // the input (as the actual value, not just a placeholder) lets users
-    // see what will be fetched before they click Sync.
+    // ── HVSC archive URL ────────────────────────────────────────
+    // Override for a mirror whose archive layout we don't know; otherwise
+    // derived from the mirror + current release. Shown as the field's value
+    // rather than a placeholder so the exact URL that "Sync HVSC now" will
+    // fetch is visible before clicking it. There is deliberately no sync
+    // button here — the one above this section already does it.
     let hvsc_zip_url_str = config
         .hvsc_zip_url
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
             crate::hvsc_sync::default_hvsc_zip_url(
-                &config.hvsc_rsync_url,
+                &config.hvsc_mirror_url,
                 config.hvsc_known_version.as_deref(),
             )
         })
         .unwrap_or_default();
-    let has_zip_url = !hvsc_zip_url_str.trim().is_empty();
-    let zip_button_label = if hvsc_sync_active {
-        // If ANY sync is running, defer to the rsync section's cancel button.
-        "⚡ Fast sync (archive) — sync in progress"
-    } else if has_zip_url {
-        "⚡ Fast sync (archive)"
-    } else {
-        "⚡ Fast sync (archive) — paste URL above"
-    };
-    let zip_button: Element<'a, Message> = if has_zip_url && !hvsc_sync_active {
-        tool_button(zip_button_label, Message::HvscZipSyncStart)
-    } else {
-        // Disabled look — same shape but no on_press.
-        button(text(zip_button_label).size(font::sized(12.0)))
-            .padding(Padding::from([6, 12]))
-            .style(|_t: &Theme, _st| button::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.16, 0.17, 0.20))),
-                text_color: Color::from_rgb(0.45, 0.47, 0.52),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: Color::from_rgb(0.25, 0.27, 0.30),
-                },
-                ..Default::default()
-            })
-            .into()
-    };
     let hvsc_zip_section = column![
-        text("Fast first-time sync (archive):")
+        text("HVSC archive URL (optional):")
             .size(font::sized(14.0))
             .color(Color::from_rgb(0.75, 0.77, 0.82)),
         text_input(
@@ -4102,18 +4192,15 @@ pub fn settings_panel<'a>(
             selection: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
         }),
         text(
-            "Downloads the whole tree in one archive, extracts into the HVSC \
-             root above (any C64Music/ prefix is stripped). Much faster than \
-             the file-by-file HTTPS sync for a cold user. Files already \
-             present with the same size are skipped. \
-             Supported: .zip (deflate), .7z (LZMA / LZMA2 / PPMD). \
-             The default URL is auto-derived from your mirror host + last-\
-             known HVSC version — edit it if the version is stale or you \
-             prefer a different mirror."
+            "What \u{2b07} Sync HVSC now downloads. Auto-derived from your mirror \
+             and the current HVSC release — leave it alone unless your mirror \
+             stores archives elsewhere. Extracts into the HVSC root above (any \
+             C64Music/ prefix is stripped); files already present at the same \
+             size are skipped. Supported: .zip (deflate), .7z (LZMA / LZMA2 / \
+             PPMD)."
         )
         .size(font::sized(11.0))
         .color(Color::from_rgb(0.55, 0.57, 0.62)),
-        zip_button,
     ]
     .spacing(6);
 
@@ -4543,7 +4630,12 @@ pub fn stil_overlay<'a>(text_content: &'a str, subtune: u16) -> Element<'a, Mess
 /// Wrap `content` so hovering shows a small `tip` bubble above it.
 /// Used on transport / mode buttons in both mini and big player so a
 /// user new to the layout can discover what each icon does.
-fn with_tip<'a>(content: impl Into<Element<'a, Message>>, tip: &'a str) -> Element<'a, Message> {
+/// Wrap a widget in a hover tooltip. `tip` takes anything text-like so a
+/// caller with an owned `String` doesn't have to leak it to satisfy `&'a str`.
+fn with_tip<'a>(
+    content: impl Into<Element<'a, Message>>,
+    tip: impl iced::widget::text::IntoFragment<'a>,
+) -> Element<'a, Message> {
     let bubble = container(
         text(tip)
             .size(font::sized(11.0))
@@ -4574,24 +4666,28 @@ fn tool_button<'a>(
     label: impl iced::widget::text::IntoFragment<'a>,
     msg: Message,
 ) -> Element<'a, Message> {
-    button(text(label).size(font::sized(12.0)))
-        .on_press(msg)
-        .padding(Padding::from([4, 10]))
-        .style(|_theme: &Theme, st| button::Style {
-            background: Some(iced::Background::Color(match st {
-                button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
-                button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
-                _ => Color::from_rgb(0.18, 0.19, 0.22),
-            })),
-            text_color: Color::from_rgb(0.8, 0.82, 0.88),
-            border: iced::Border {
-                radius: 3.0.into(),
-                width: 1.0,
-                color: Color::from_rgb(0.25, 0.27, 0.30),
-            },
-            ..Default::default()
-        })
-        .into()
+    button(
+        text(label)
+            .size(font::sized(12.0))
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .on_press(msg)
+    .padding(Padding::from([4, 10]))
+    .style(|_theme: &Theme, st| button::Style {
+        background: Some(iced::Background::Color(match st {
+            button::Status::Hovered => Color::from_rgb(0.25, 0.27, 0.32),
+            button::Status::Pressed => Color::from_rgb(0.18, 0.20, 0.24),
+            _ => Color::from_rgb(0.18, 0.19, 0.22),
+        })),
+        text_color: Color::from_rgb(0.8, 0.82, 0.88),
+        border: iced::Border {
+            radius: 3.0.into(),
+            width: 1.0,
+            color: Color::from_rgb(0.25, 0.27, 0.30),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 /// Format a `Duration` as `m:ss` (e.g. `3:07`).

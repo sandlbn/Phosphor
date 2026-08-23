@@ -177,6 +177,16 @@ impl RepeatMode {
             Self::Single => "🔂 One",
         }
     }
+
+    /// Glyph alone, for the toolbar's icon-only mode. Each label starts with
+    /// its icon; a test asserts the two stay in step.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Off => "⮔",
+            Self::All => "🔁",
+            Self::Single => "🔂",
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1478,4 +1488,24 @@ pub fn parse_startup(cli_args: Vec<PathBuf>, progress: LoadingProgress) -> Vec<P
     }
 
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeat_icon_agrees_with_label() {
+        // The toolbar shows `icon()` when compact and `label()` when not; if
+        // they ever drift, the button silently changes meaning at one width.
+        for m in [RepeatMode::Off, RepeatMode::All, RepeatMode::Single] {
+            assert!(
+                m.label().starts_with(m.icon()),
+                "{:?}: label {:?} must start with icon {:?}",
+                m,
+                m.label(),
+                m.icon()
+            );
+        }
+    }
 }

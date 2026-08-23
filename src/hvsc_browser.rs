@@ -231,6 +231,9 @@ pub struct HvscBrowser {
     /// index changes — `view()` runs ~30x/second and must not rescan 60k
     /// entries each time.
     cache: SearchCache,
+    /// Same treatment for the author column: it was re-filtering all ~1850
+    /// authors every frame, two `to_lowercase` allocations each.
+    author_cache: Option<(String, usize, Vec<usize>)>,
 }
 
 /// Memoised global-search result. `key` is everything the result depends on.
@@ -305,6 +308,7 @@ impl HvscBrowser {
             self.selected_tune = None;
             self.hovered_row = None;
             self.cache = SearchCache::default();
+            self.author_cache = None;
         }
     }
 
@@ -322,6 +326,7 @@ impl HvscBrowser {
             self.selected_tune = None;
             self.hovered_row = None;
             self.cache = SearchCache::default();
+            self.author_cache = None;
         }
     }
 
@@ -626,6 +631,35 @@ pub fn hvsc_sort_cmp(
     }
 }
 
+/// Walk one author's folder and parse every tune. Blocking — run off-thread.
+pub fn load_author_tunes(
+    author: HvscAuthor,
+    root: Option<PathBuf>,
+    stil: Option<StilDb>,
+    songlength: Option<SonglengthDb>,
+) -> Vec<HvscTune> {
+    let mut tunes = Vec::new();
+    for dirent in WalkDir::new(&author.path)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let p = dirent.path();
+        if !p.is_file() || !is_sid_or_mus(p) {
+            continue;
+        }
+        let entry = match PlaylistEntry::from_path(p) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let entry = apply_songlength(entry, songlength.as_ref());
+        let has_stil = stil_has_entry(&author.path, p, stil.as_ref(), root.as_deref());
+        tunes.push(HvscTune { entry, has_stil });
+    }
+    tunes.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
+    tunes
+}
+
 /// Off-thread flat-index builder. Walks every `.sid`/`.mus` file under
 /// `<root>/<category>/`, parses each SID header (via
 /// `PlaylistEntry::from_path`), applies the optional songlength lookup
@@ -908,12 +942,43 @@ impl HvscBrowser {
             }
         }
         self.authors_loaded = true;
+        // Seed the filter cache here so `view()` never reads an empty slice
+        // before the first user interaction.
+        self.recompute_authors();
         Ok(())
     }
 
     /// Walk the selected author's folder, build a `HvscTune` per `.sid`/
     /// `.mus` file. Applies songlength durations and STIL ✓ markers from
     /// the provided DBs (both optional). Typically completes in tens of ms.
+    /// Mark an author selected and return the work needed to load its tunes,
+    /// or `None` if there is nothing to load. The caller runs
+    /// `load_author_tunes` off the UI thread and hands the result back to
+    /// `install_author_tunes`.
+    ///
+    /// Reading and MD5-ing a big author's files takes ~21 ms warm on a local
+    /// disk and far longer on a cold or network-backed one, which is a visible
+    /// stall when it happens inside `update`.
+    pub fn begin_select_author(&mut self, idx: usize) -> Option<(HvscAuthor, u64)> {
+        self.selected_author = Some(idx);
+        self.tunes.clear();
+        self.selected_tune = None;
+        self.hovered_row = None;
+        self.authors
+            .get(idx)
+            .cloned()
+            .map(|a| (a, self.flat_index_version))
+    }
+
+    /// Install tunes produced by `load_author_tunes`. Dropped if the user has
+    /// moved on (different root/category) since the load started.
+    pub fn install_author_tunes(&mut self, version: u64, tunes: Vec<HvscTune>) {
+        if version != self.flat_index_version {
+            return;
+        }
+        self.tunes = tunes;
+    }
+
     pub fn select_author(
         &mut self,
         idx: usize,
@@ -954,20 +1019,38 @@ impl HvscBrowser {
     /// Indices into `authors` matching the *author* filter box. Deliberately
     /// independent of `search`: sharing one string meant typing a tune name
     /// emptied the author column.
-    pub fn filtered_authors(&self) -> Vec<usize> {
-        if self.author_filter.trim().is_empty() {
-            return (0..self.authors.len()).collect();
-        }
+    /// Cached author-column filter. Call `recompute_authors` first; this is a
+    /// read for `view()`.
+    pub fn filtered_authors(&self) -> &[usize] {
+        self.author_cache
+            .as_ref()
+            .map(|(_, _, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Refresh the author filter if the query or the author list changed.
+    /// Cheap to call every update; the key comparison is the fast path.
+    pub fn recompute_authors(&mut self) {
         let needle = self.author_filter.trim().to_lowercase();
-        self.authors
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| {
-                a.raw_name.to_lowercase().contains(&needle)
-                    || a.display_name.to_lowercase().contains(&needle)
-            })
-            .map(|(i, _)| i)
-            .collect()
+        if let Some((q, n, _)) = &self.author_cache {
+            if q == &needle && *n == self.authors.len() {
+                return;
+            }
+        }
+        let out: Vec<usize> = if needle.is_empty() {
+            (0..self.authors.len()).collect()
+        } else {
+            self.authors
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    a.raw_name.to_lowercase().contains(&needle)
+                        || a.display_name.to_lowercase().contains(&needle)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        self.author_cache = Some((needle, self.authors.len(), out));
     }
 
     /// Indices into `tunes` matching the search query — title, author,
@@ -1150,6 +1233,26 @@ mod tests {
         }
     }
 
+    fn tune(title: &str) -> HvscTune {
+        HvscTune {
+            entry: crate::playlist::PlaylistEntry {
+                path: PathBuf::from(format!("/hvsc/{title}.sid")),
+                title: title.to_string(),
+                author: String::new(),
+                released: String::new(),
+                songs: 1,
+                selected_song: 1,
+                is_pal: true,
+                num_sids: 1,
+                is_rsid: false,
+                md5: None,
+                duration_secs: None,
+                has_wds: false,
+            },
+            has_stil: false,
+        }
+    }
+
     fn score(query: &str, e: &HvscIndexEntry) -> Option<u32> {
         let mut m = Matcher::new(Config::DEFAULT);
         let pat = HvscQuery::parse(query);
@@ -1277,13 +1380,79 @@ mod tests {
                 path: PathBuf::from("/hvsc/G/Galway_Martin"),
             },
         ];
+        // `load_authors_if_needed` seeds this in production; the test builds
+        // `authors` directly, so it has to prime the cache itself.
+        b.recompute_authors();
+
         // Searching for a tune must not empty the author column — the whole
         // point of splitting the two boxes.
         b.set_search("commando".into());
+        b.recompute_authors();
         assert_eq!(b.filtered_authors().len(), 2);
         // The author box still filters on its own terms.
         b.set_author_filter("hubbard".into());
+        b.recompute_authors();
         assert_eq!(b.filtered_authors(), vec![0]);
+    }
+
+    #[test]
+    fn author_filter_is_cached_and_invalidates() {
+        let mut b = HvscBrowser::default();
+        b.authors = vec![
+            HvscAuthor {
+                raw_name: "Hubbard_Rob".into(),
+                display_name: "Hubbard, Rob".into(),
+                letter: 'H',
+                path: PathBuf::from("/hvsc/H/Hubbard_Rob"),
+            },
+            HvscAuthor {
+                raw_name: "Galway_Martin".into(),
+                display_name: "Galway, Martin".into(),
+                letter: 'G',
+                path: PathBuf::from("/hvsc/G/Galway_Martin"),
+            },
+        ];
+        b.recompute_authors();
+        assert_eq!(b.filtered_authors().len(), 2);
+
+        // Mutating behind the cache is invisible until something in the key
+        // changes — proving view() reads a cache rather than re-filtering
+        // ~1850 authors every frame.
+        b.authors.push(HvscAuthor {
+            raw_name: "Daglish_Ben".into(),
+            display_name: "Daglish, Ben".into(),
+            letter: 'D',
+            path: PathBuf::from("/hvsc/D/Daglish_Ben"),
+        });
+        // Length is part of the key, so this one *does* invalidate.
+        b.recompute_authors();
+        assert_eq!(b.filtered_authors().len(), 3);
+
+        b.set_author_filter("hubbard".into());
+        b.recompute_authors();
+        assert_eq!(b.filtered_authors(), vec![0]);
+    }
+
+    #[test]
+    fn stale_author_load_is_discarded() {
+        // Clicking author A then switching category before A's files finish
+        // loading must not dump A's tunes into the new category's view.
+        let mut b = HvscBrowser::default();
+        b.authors = vec![HvscAuthor {
+            raw_name: "A".into(),
+            display_name: "A".into(),
+            letter: 'A',
+            path: PathBuf::from("/hvsc/A"),
+        }];
+        let (_, version) = b.begin_select_author(0).expect("author exists");
+        b.set_category(HvscCategory::Demos); // bumps the version
+        b.install_author_tunes(version, vec![tune("Stale")]);
+        assert!(b.tunes().is_empty(), "stale load must be dropped");
+
+        // A load stamped with the current version still installs.
+        let current = b.flat_index_version();
+        b.install_author_tunes(current, vec![tune("Fresh")]);
+        assert_eq!(b.tunes().len(), 1);
     }
 
     #[test]

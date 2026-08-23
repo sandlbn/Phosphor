@@ -428,7 +428,7 @@ struct App {
     show_stil_overlay: bool,
     /// Status text shown below the STIL download button in settings.
     stil_status: String,
-    /// HVSC rsync sync state. `Some` while a sync is in progress; dropped
+    /// HVSC sync state. `Some` while a sync is in progress; dropped
     /// to None on completion or cancel.
     hvsc_sync: Option<hvsc_sync::HvscSyncHandle>,
     /// Most recent status line for the HVSC sync section.
@@ -595,8 +595,8 @@ impl App {
 
         // Snapshot fields needed for auto-download before config moves into app.
         // Both Songlengths.md5 and STIL.txt are fetched as DOCUMENTS/*.* relative
-        // to the single hvsc_rsync_url — one source of truth.
-        let auto_hvsc_base = config.hvsc_rsync_url.clone();
+        // to the single hvsc_mirror_url — one source of truth.
+        let auto_hvsc_base = config.hvsc_mirror_url.clone();
         let auto_last_sl_file = config.last_songlength_file.clone();
         let auto_last_stil_file = config.last_stil_file.clone();
         let initial_show_welcome = !config.has_seen_welcome;
@@ -1780,7 +1780,7 @@ impl App {
 
             Message::DownloadSonglength => {
                 self.download_status = "Downloading...".to_string();
-                let url = self.config.hvsc_rsync_url.clone();
+                let url = self.config.hvsc_mirror_url.clone();
                 return Task::perform(
                     config::download_songlength(url),
                     Message::SonglengthDownloaded,
@@ -2201,7 +2201,7 @@ impl App {
                     self.auto_download_status =
                         format!("⬆ {} — updating databases…", info.description());
                     self.pending_auto_downloads = 2;
-                    let base = self.config.hvsc_rsync_url.clone();
+                    let base = self.config.hvsc_mirror_url.clone();
                     let base2 = base.clone();
                     return Task::batch([
                         Task::perform(
@@ -2271,7 +2271,7 @@ impl App {
                 self.config.has_seen_welcome = true;
                 self.config.save();
                 // Reuse the existing sync toggle handler.
-                return iced::Task::done(Message::HvscRsyncStart);
+                return iced::Task::done(Message::HvscZipSyncStart);
             }
             Message::WelcomeOpenLibrary => {
                 self.show_welcome = false;
@@ -2368,7 +2368,12 @@ impl App {
                 let seq = self.hvsc_search_seq;
                 return Task::perform(
                     async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+                        // Measured: scoring the whole 21k-entry index takes ~6 ms.
+                        // A long debounce would be pure added latency — it was
+                        // 160 ms, i.e. 25x the work it was avoiding, and that is
+                        // what made search feel sluggish. Just enough to collapse
+                        // a burst of keystrokes.
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                         seq
                     },
                     Message::HvscSearchDebounced,
@@ -2386,6 +2391,7 @@ impl App {
 
             Message::HvscBrowserAuthorFilterChanged(q) => {
                 self.hvsc_browser.set_author_filter(q);
+                self.hvsc_browser.recompute_authors();
             }
 
             Message::HvscBrowserSelectTune(idx) => {
@@ -2441,11 +2447,23 @@ impl App {
             }
 
             Message::HvscBrowserAuthorSelected(idx) => {
-                self.hvsc_browser.select_author(
-                    idx,
-                    self.stil_db.as_ref(),
-                    self.songlength_db.as_ref(),
+                // The folder walk reads and MD5s every file, so it runs
+                // off-thread; the row highlights immediately and the tunes
+                // arrive via HvscAuthorTunesLoaded.
+                let Some((author, version)) = self.hvsc_browser.begin_select_author(idx) else {
+                    return Task::none();
+                };
+                let root = self.config.hvsc_root.clone().map(PathBuf::from);
+                let stil = self.stil_db.clone();
+                let songlength = self.songlength_db.clone();
+                return Task::perform(
+                    async move { hvsc_browser::load_author_tunes(author, root, stil, songlength) },
+                    move |tunes| Message::HvscAuthorTunesLoaded(version, tunes),
                 );
+            }
+
+            Message::HvscAuthorTunesLoaded(version, tunes) => {
+                self.hvsc_browser.install_author_tunes(version, tunes);
             }
 
             Message::HvscBrowserAddAllFromAuthor => {
@@ -3264,61 +3282,19 @@ impl App {
                 }
             }
 
-            Message::HvscRsyncUrlChanged(url) => {
+            Message::HvscMirrorUrlChanged(url) => {
                 // Trim — a trailing space (easy to introduce by copy-paste)
                 // breaks every URL we derive from this base. Strip here so
                 // the saved config stays clean.
-                self.config.hvsc_rsync_url = url.trim().to_string();
+                self.config.hvsc_mirror_url = url.trim().to_string();
                 self.config.save();
             }
 
-            Message::HvscRsyncStart => {
-                if self.hvsc_sync.is_some() {
-                    // Already running — ignore.
-                } else {
-                    // Pick destination: hvsc_root if set, else platform default.
-                    let dest = match self
-                        .config
-                        .hvsc_root
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(PathBuf::from)
-                        .or_else(hvsc_sync::default_hvsc_root)
-                    {
-                        Some(p) => p,
-                        None => {
-                            self.hvsc_sync_status =
-                                "Cannot determine destination — set HVSC root manually."
-                                    .to_string();
-                            return Task::none();
-                        }
-                    };
-                    let url = self.config.hvsc_rsync_url.clone();
-                    match hvsc_sync::HvscSyncHandle::start(&url, &dest) {
-                        Ok(handle) => {
-                            // Persist the destination so it survives restarts.
-                            self.config.hvsc_root = Some(dest.to_string_lossy().into_owned());
-                            self.config.save();
-                            self.hvsc_sync = Some(handle);
-                            self.hvsc_sync_status = "Connecting…".to_string();
-                            self.hvsc_sync_progress = None;
-                        }
-                        Err(e) => {
-                            self.hvsc_sync_status = format!("Error: {e}");
-                        }
-                    }
-                }
-            }
-
-            Message::HvscRsyncCancel => {
+            Message::HvscSyncCancel => {
                 if let Some(h) = self.hvsc_sync.as_ref() {
                     h.cancel();
                     self.hvsc_sync_status = "Cancelling…".to_string();
                 }
-            }
-
-            Message::HvscRsyncPoll => {
-                // No-op — actual drain happens in poll_status() each Tick.
             }
 
             Message::HvscZipUrlChanged(url) => {
@@ -3328,7 +3304,7 @@ impl App {
                 // overrides beat derivation, pinning the archive to this
                 // release forever. Matching the derived URL means "no override".
                 let derived = hvsc_sync::default_hvsc_zip_url(
-                    &self.config.hvsc_rsync_url,
+                    &self.config.hvsc_mirror_url,
                     self.config.hvsc_known_version.as_deref(),
                 );
                 self.config.hvsc_zip_url =
@@ -3342,7 +3318,7 @@ impl App {
 
             Message::HvscZipSyncStart => {
                 if self.hvsc_sync.is_some() {
-                    // Another sync (rsync or zip) is already running — ignore.
+                    // A sync is already running — ignore.
                 } else {
                     // Same "user override wins, else derive from mirror
                     // host + known version" resolution the UI uses.
@@ -3353,16 +3329,19 @@ impl App {
                         .filter(|s| !s.trim().is_empty())
                         .or_else(|| {
                             hvsc_sync::default_hvsc_zip_url(
-                                &self.config.hvsc_rsync_url,
+                                &self.config.hvsc_mirror_url,
                                 self.config.hvsc_known_version.as_deref(),
                             )
                         })
                         .unwrap_or_default();
                     if url.trim().is_empty() {
-                        self.hvsc_sync_status =
-                            "No archive URL set and none could be derived from your \
-                             HVSC mirror — paste one under Fast first-time sync."
-                                .to_string();
+                        // Only brona.dk's archive layout is known. Say so plainly
+                        // and point at the field, rather than failing silently.
+                        self.hvsc_sync_status = format!(
+                            "Can't derive an archive URL for {}. Paste a .7z or .zip \
+                             link under Settings → Library → HVSC archive URL.",
+                            self.config.hvsc_mirror_url.trim()
+                        );
                         return Task::none();
                     }
                     let dest = match self
@@ -3398,7 +3377,7 @@ impl App {
 
             Message::DownloadStil => {
                 self.stil_status = "Downloading…".to_string();
-                let url = self.config.hvsc_rsync_url.clone();
+                let url = self.config.hvsc_mirror_url.clone();
                 return Task::perform(stil::download_stil(url), Message::StilDownloaded);
             }
 
@@ -3757,6 +3736,7 @@ impl App {
                     tunes_y: self.hvsc_tunes_scroll_y,
                     tunes_h: self.hvsc_tunes_viewport_h,
                 },
+                self.window_width,
             );
             column![
                 info_bar,
@@ -4200,7 +4180,7 @@ impl App {
         }
     }
 
-    /// After a successful HVSC rsync, re-point the Songlength and STIL
+    /// After a successful HVSC sync, re-point the Songlength and STIL
     /// databases at the freshly synced copies under `<hvsc_root>/DOCUMENTS/`
     /// when (a) they're currently unset, or (b) they point outside the new
     /// HVSC root. Then reload both DBs and refresh the now-playing entry.
@@ -4399,7 +4379,7 @@ impl App {
             }
         }
 
-        // Drain HVSC rsync sync events, if a sync is in flight. Same
+        // Drain HVSC sync events, if a sync is in flight. Same
         // try_recv-loop pattern as status_rx — fires at 33ms cadence.
         if let Some(handle) = self.hvsc_sync.as_ref() {
             let mut done: Option<Result<(), String>> = None;
@@ -4450,8 +4430,7 @@ impl App {
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
                         // Simple ISO-8601 from epoch — avoids pulling in chrono
-                        // at this layer (we already have it transitively via
-                        // arrsync-phosphor, but keep the boundary clean).
+                        // just to stamp one field.
                         self.config.hvsc_last_sync = Some(format_iso8601(now));
                         self.config.save();
 
@@ -5112,10 +5091,10 @@ impl App {
                     tasks.push(Task::done(Message::PrevSubtune));
                 }
                 remote::RemoteCmd::HvscSyncStart => {
-                    tasks.push(Task::done(Message::HvscRsyncStart));
+                    tasks.push(Task::done(Message::HvscZipSyncStart));
                 }
                 remote::RemoteCmd::HvscSyncCancel => {
-                    tasks.push(Task::done(Message::HvscRsyncCancel));
+                    tasks.push(Task::done(Message::HvscSyncCancel));
                 }
                 remote::RemoteCmd::ToggleSkipRsid => {
                     tasks.push(Task::done(Message::ToggleSkipRsid));

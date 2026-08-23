@@ -875,7 +875,7 @@ pub fn start_server(
                     }
 
                     // ── API: HVSC sync trigger ────────────────────────────
-                    // Kicks the same rsync the desktop's Settings →
+                    // Kicks the same sync the desktop's Settings →
                     // Library → Sync button uses. Progress polls into
                     // `status.hvsc_sync_active` / `hvsc_sync_progress`.
                     ("POST", "/api/library/hvsc/sync/start") => {
@@ -1650,7 +1650,7 @@ const WEB_UI: &str = r##"<!DOCTYPE html>
     <div id="lib-hv-crumb" class="lib-back" onclick="hvBack()" style="display:none;">&#8592; Back to authors</div>
     <div id="hv-sync-row" style="display:flex;gap:6px;align-items:center;padding:6px 0;font-size:12px;color:#8090a0;">
       <button class="tb-btn" id="hv-sync-btn" onclick="toggleHvscSync()"
-        title="Trigger an rsync of the High Voltage SID Collection from hvsc.brona.dk">&#8595; Sync HVSC</button>
+        title="Download the High Voltage SID Collection archive from hvsc.brona.dk">&#8595; Sync HVSC</button>
       <span id="hv-sync-status"></span>
     </div>
     <div class="lib-list" id="lib-hv-list"></div>
