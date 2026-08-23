@@ -105,6 +105,14 @@ pub enum DeviceConfigCmd {
     MidiSaveState,
     /// MIDI state: reset to factory MIDI state.
     MidiResetState,
+    /// Replace the entire on-device config in one shot (write + refresh).
+    /// Used by INI import to push a parsed config back to the device
+    /// without threading each field through a separate `Edit` variant.
+    LoadConfig(usbsid_pico_config::DeviceConfig),
+    /// Read the FPGASID diagnostic buffer at `addr` (base SID register
+    /// address, e.g. `0x00` for SID1). Reply arrives as
+    /// [`ui::Message::DeviceConfigFpgaSidResult`].
+    ReadFpgaSidDiag(u8),
 }
 
 /// One discrete edit a Device-tab control can dispatch. Each variant maps
@@ -139,6 +147,9 @@ pub enum DeviceConfigEdit {
     // ── PCB v1.5+ flags ────────────────────────────────────────────
     NeedConfirmation(bool),
     DisableChangeDetect(bool),
+    /// v1.5+: preset auto-detection (byte 4 bit 7). The paired
+    /// `last_preset` field is READ-ONLY and never appears here.
+    PresetAutoDetect(bool),
 }
 
 /// Status updates sent from player thread → GUI.

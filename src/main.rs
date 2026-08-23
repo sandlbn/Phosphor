@@ -1612,6 +1612,9 @@ impl App {
                     C::MidiLoadState => "Loading MIDI state".into(),
                     C::MidiSaveState => "Saving MIDI state".into(),
                     C::MidiResetState => "Resetting MIDI state".into(),
+                    C::ReadFpgaSidDiag(addr) => {
+                        format!("Reading FPGASID diag @ 0x{addr:02X}…")
+                    }
                     other => format!("Sending {other:?}…"),
                 };
                 self.send_cmd(player::PlayerCmd::DeviceConfig(cmd));
@@ -1626,6 +1629,57 @@ impl App {
                     self.device_cfg_status = format!("Error: {e}");
                 }
             },
+
+            Message::DeviceConfigImportIni => {
+                // Need the current on-device config as the "base" — INI
+                // only covers a subset of fields; anything absent (FMOpl
+                // sidno, v1.5+ flags, read-only protocol toggles) is
+                // preserved from what's on-device right now.
+                let Some(base) = self.device_cfg.as_ref().map(|s| s.config) else {
+                    self.device_cfg_status =
+                        "Refresh the Device tab first — INI import needs a current config to merge over.".into();
+                    return iced::Task::none();
+                };
+                self.device_cfg_status = "Waiting on file picker…".into();
+                return iced::Task::perform(pick_and_read_ini(), move |picked| match picked {
+                    Some((path, contents)) => {
+                        let cfg = usbsid_pico_config::read_ini(&contents, &base);
+                        Message::DeviceConfigStatusThenAction(
+                            format!("Applying {} …", path.display()),
+                            player::DeviceConfigCmd::LoadConfig(cfg),
+                        )
+                    }
+                    None => Message::None,
+                });
+            }
+
+            Message::DeviceConfigExportIni => {
+                let Some(snap) = self.device_cfg.as_ref() else {
+                    self.device_cfg_status =
+                        "Nothing to export — refresh the Device tab first.".into();
+                    return iced::Task::none();
+                };
+                let cfg = snap.config;
+                let fw = snap.firmware_version.clone();
+                self.device_cfg_status = "Waiting on file picker…".into();
+                return iced::Task::perform(
+                    save_ini_dialog(cfg, fw),
+                    Message::DeviceConfigExportResult,
+                );
+            }
+
+            Message::DeviceConfigStatusThenAction(status, cmd) => {
+                self.device_cfg_status = status;
+                self.send_cmd(player::PlayerCmd::DeviceConfig(cmd));
+            }
+
+            Message::DeviceConfigExportResult(res) => {
+                self.device_cfg_status = match res {
+                    Ok(Some(path)) => format!("Exported to {}", path.display()),
+                    Ok(None) => "Export cancelled.".into(),
+                    Err(e) => format!("Export failed: {e}"),
+                };
+            }
 
             Message::ToggleSkipRsid => {
                 self.config.skip_rsid = !self.config.skip_rsid;
@@ -5506,6 +5560,45 @@ async fn pick_hvsc_folder(start_dir: Option<String>) -> Option<PathBuf> {
         }
     }
     d.pick_folder().await.map(|h| h.path().to_path_buf())
+}
+
+/// Native file picker for USBSID-Pico INI import — returns the picked
+/// path plus its contents, or `None` if the user cancelled. Any read
+/// error also collapses to `None` (the UI shows a generic
+/// "cancelled" — a hard failure here is essentially indistinguishable
+/// from the user backing out of the dialog).
+async fn pick_and_read_ini() -> Option<(PathBuf, String)> {
+    let handle = rfd::AsyncFileDialog::new()
+        .set_title("Import USBSID-Pico config (INI)")
+        .add_filter("INI", &["ini", "INI"])
+        .pick_file()
+        .await?;
+    let path = handle.path().to_path_buf();
+    let contents = std::fs::read_to_string(&path).ok()?;
+    Some((path, contents))
+}
+
+/// Native save dialog for USBSID-Pico INI export. Serialises `cfg` to
+/// the Configtool-compatible INI shape and writes it. `Ok(None)` on
+/// user cancel; `Ok(Some(path))` on successful write; `Err` on I/O
+/// failure (permissions, disk full, …).
+async fn save_ini_dialog(
+    cfg: usbsid_pico_config::DeviceConfig,
+    fw_version: String,
+) -> Result<Option<PathBuf>, String> {
+    let Some(handle) = rfd::AsyncFileDialog::new()
+        .set_title("Export USBSID-Pico config (INI)")
+        .set_file_name("usbsid-pico-config.ini")
+        .add_filter("INI", &["ini", "INI"])
+        .save_file()
+        .await
+    else {
+        return Ok(None);
+    };
+    let path = handle.path().to_path_buf();
+    let contents = usbsid_pico_config::write_ini(&cfg, &fw_version);
+    std::fs::write(&path, contents).map_err(|e| e.to_string())?;
+    Ok(Some(path))
 }
 
 /// STIL + Songlength databases parsed off the UI thread from
