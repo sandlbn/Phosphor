@@ -1361,6 +1361,10 @@ fn stop_playback_inner(
             // writes can land *after* mute and re-trigger sustained voices.
             thread::sleep(Duration::from_millis(20));
             br.mute();
+            // Release lazily-created SID2/3/4 instances on the software
+            // engines. USB engines no-op this (see note in the tune
+            // startup block).
+            #[allow(deprecated)]
             br.set_stereo(0);
             br.reset();
             thread::sleep(Duration::from_millis(50));
@@ -1546,7 +1550,6 @@ fn setup_playback(
 
     let num_sids = sid_bases.len();
     let is_multi = num_sids > 1;
-    let use_stereo = true;
     // force_stereo: treat 2SID tunes as mono (mirror SID1 to both channels).
     // Only applies to exactly 2-SID tunes.
     let force_mono_2sid = force_stereo && num_sids == 2;
@@ -1622,17 +1625,24 @@ fn setup_playback(
         br.set_sid_model(header.sid_model);
         thread::sleep(Duration::from_millis(50));
 
-        if use_stereo {
-            // Tell the device how many SIDs are active:
-            //   mono tunes in stereo mode → set_stereo(1) for mirror
-            //   multi-SID tunes → set_stereo(num_sids - 1)
-            let active_sids = if mono_mode { 2 } else { num_sids };
-            br.set_stereo((active_sids - 1) as i32);
-        } else {
-            br.set_stereo(0);
-        }
-
-        let active_sids = if use_stereo && mono_mode { 2 } else { num_sids };
+        // Tell the backend how many SIDs will receive writes. Two roles
+        // by engine:
+        //   * software engines (emulated / sidlite) use this to lazy-
+        //     create SID2/3/4 chip instances — without it, mirror_mono
+        //     writes to SID2 registers land nowhere.
+        //   * USB engines (USBSID-Pico direct + bridge) treat it as a
+        //     no-op. The v1.3 SET_AUDIO 0x89 opcode this used to send
+        //     fights the flash-persistent `stereo_enabled` config and
+        //     accepts only 0/1; extra values were undefined behaviour.
+        //     Stereo routing on USBSID-Pico is now controlled solely by
+        //     `DeviceConfig::stereo_enabled` (Device tab → Audio
+        //     routing → Stereo).
+        // Mono tunes still write to both SID1 + SID2 via `mirror_mono`
+        // in `build_cycled`, so unmute both — otherwise pseudo-stereo's
+        // SID2 detuned mirror stays silent.
+        let active_sids = if mono_mode { 2 } else { num_sids };
+        #[allow(deprecated)]
+        br.set_stereo((active_sids - 1) as i32);
         for i in 0..active_sids {
             let vol_reg = (i as u8) * SID_REG_SIZE + SID_VOL_REG;
             br.write(vol_reg, 0x0F);

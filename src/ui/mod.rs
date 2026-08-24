@@ -321,6 +321,12 @@ pub enum Message {
     /// Fires when the export save-dialog closes. Ok(Some) → wrote file;
     /// Ok(None) → user cancelled; Err → I/O error.
     DeviceConfigExportResult(Result<Option<std::path::PathBuf>, String>),
+    /// Session-only: force the four audio-routing prereqs for
+    /// pseudo-stereo (stereo on, mirrored/mixed off, socket 2 enabled)
+    /// by writing + applying — no flash save. Handler pulls the current
+    /// snapshot, mutates only those four fields, and dispatches
+    /// `DeviceConfigCmd::LoadConfig`.
+    DeviceConfigureForPseudoStereo,
 
     // Settings
     ToggleSettings,
@@ -3920,19 +3926,87 @@ pub fn settings_panel<'a>(
             .color(Color::from_rgb(0.85, 0.65, 0.30)),
         );
     } else if let Some(snap) = device_cfg {
-        if snap.config.mirrored || !snap.config.stereo_enabled {
-            let which = if snap.config.mirrored {
-                "Mirrored is on, so the second chip copies the first"
-            } else {
-                "Stereo is off, so both chips sum to one channel"
-            };
+        // Pseudo-stereo needs FOUR device settings all in the right
+        // state for the detune to be audible as a stereo image:
+        //   * Stereo output on (else L+R sum to mono, effect becomes chorus)
+        //   * Mirrored off (else socket 2 copies socket 1 and ignores our
+        //     detuned writes)
+        //   * Mixed off (else channels sum on-device)
+        //   * Socket 2 enabled (else our SID2 writes land on a dead socket)
+        let cfg = &snap.config;
+        let missing_stereo = !cfg.stereo_enabled;
+        let is_mirrored = cfg.mirrored;
+        let is_mixed = cfg.mixed;
+        let socket2_off = !cfg.socket2.enabled;
+        let any_missing = missing_stereo || is_mirrored || is_mixed || socket2_off;
+
+        if any_missing {
+            let warn_color = Color::from_rgb(0.95, 0.35, 0.35);
             pseudo_section = pseudo_section.push(
-                text(format!(
-                    "Your USBSID-Pico won't reproduce this: {which}. Change it under \
-                     Device \u{2192} Audio routing."
-                ))
+                text(
+                    "Your USBSID-Pico can't reproduce pseudo-stereo yet — the following \
+                     Audio-routing settings need to change:",
+                )
                 .size(font::sized(11.0))
-                .color(Color::from_rgb(0.85, 0.65, 0.30)),
+                .color(warn_color),
+            );
+            if missing_stereo {
+                pseudo_section = pseudo_section.push(
+                    text("  \u{2022} Stereo (vs Mono) \u{2192} Enable")
+                        .size(font::sized(11.0))
+                        .color(warn_color),
+                );
+            }
+            if is_mirrored {
+                pseudo_section = pseudo_section.push(
+                    text("  \u{2022} Mirrored \u{2192} Disable")
+                        .size(font::sized(11.0))
+                        .color(warn_color),
+                );
+            }
+            if is_mixed {
+                pseudo_section = pseudo_section.push(
+                    text("  \u{2022} Mixed \u{2192} Disable")
+                        .size(font::sized(11.0))
+                        .color(warn_color),
+                );
+            }
+            if socket2_off {
+                pseudo_section = pseudo_section.push(
+                    text("  \u{2022} Socket Two \u{2192} Enable (with a SID chip)")
+                        .size(font::sized(11.0))
+                        .color(warn_color),
+                );
+            }
+            pseudo_section = pseudo_section.push(
+                button(
+                    text("\u{2699} Configure USBSID-Pico for pseudo-stereo (this session)")
+                        .size(font::sized(12.0)),
+                )
+                .on_press(Message::DeviceConfigureForPseudoStereo)
+                .padding(Padding::from([6, 12]))
+                .style(|_theme: &Theme, st| button::Style {
+                    background: Some(iced::Background::Color(match st {
+                        button::Status::Hovered => Color::from_rgb(0.30, 0.35, 0.45),
+                        button::Status::Pressed => Color::from_rgb(0.22, 0.27, 0.35),
+                        _ => Color::from_rgb(0.25, 0.30, 0.40),
+                    })),
+                    text_color: Color::from_rgb(0.90, 0.92, 0.96),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.35, 0.42, 0.55),
+                    },
+                    ..Default::default()
+                }),
+            );
+            pseudo_section = pseudo_section.push(
+                text(
+                    "Writes to RAM only — the device forgets these on power-cycle. \
+                     Use Device \u{2192} \u{1F4BE} Save to flash to persist.",
+                )
+                .size(font::sized(11.0))
+                .color(Color::from_rgb(0.55, 0.57, 0.62)),
             );
         }
     }

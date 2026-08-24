@@ -109,8 +109,11 @@ impl SidDevice for DirectDevice {
         self.dev.reset();
     }
 
-    fn set_stereo(&mut self, mode: i32) {
-        self.dev.set_stereo(mode);
+    #[allow(deprecated)]
+    fn set_stereo(&mut self, _mode: i32) {
+        // Intentional no-op — see `SidDevice::set_stereo` doc. Stereo
+        // routing on USBSID-Pico is controlled by the flash-persistent
+        // `DeviceConfig::stereo_enabled`, not this transient opcode.
     }
 
     fn write(&mut self, reg: u8, val: u8) {
