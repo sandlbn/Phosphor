@@ -613,6 +613,7 @@ impl SidDevice for U64Device {
         self.connected
     }
 
+    #[allow(deprecated)]
     fn set_stereo(&mut self, _mode: i32) {
         // U64 handles multi-SID natively.
     }

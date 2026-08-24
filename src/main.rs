@@ -1681,6 +1681,26 @@ impl App {
                 };
             }
 
+            Message::DeviceConfigureForPseudoStereo => {
+                // Take the current snapshot, flip just the four fields
+                // pseudo-stereo needs, then push the whole config back
+                // via LoadConfig (write + apply + refresh, no flash).
+                let Some(snap) = self.device_cfg.as_ref() else {
+                    self.device_cfg_status =
+                        "Refresh the Device tab first — no live config to modify.".into();
+                    return iced::Task::none();
+                };
+                let mut new_cfg = snap.config;
+                new_cfg.stereo_enabled = true;
+                new_cfg.mirrored = false;
+                new_cfg.mixed = false;
+                new_cfg.socket2.enabled = true;
+                self.device_cfg_status = "Applying pseudo-stereo prereqs (session)…".into();
+                self.send_cmd(player::PlayerCmd::DeviceConfig(
+                    player::DeviceConfigCmd::LoadConfig(new_cfg),
+                ));
+            }
+
             Message::ToggleSkipRsid => {
                 self.config.skip_rsid = !self.config.skip_rsid;
                 self.config.save();
@@ -1693,6 +1713,18 @@ impl App {
             Message::TogglePseudoStereo => {
                 self.config.pseudo_stereo_enabled = !self.config.pseudo_stereo_enabled;
                 self.config.save();
+                // Freshen the DeviceConfig snapshot so the Settings
+                // pseudo-stereo section reflects reality — the user may
+                // have changed Audio-routing knobs since we last read.
+                // Only fires when turning ON: an OFF toggle doesn't need
+                // to know device state.
+                if self.config.pseudo_stereo_enabled
+                    && matches!(self.config.output_engine.as_str(), "usb" | "auto")
+                {
+                    self.send_cmd(player::PlayerCmd::DeviceConfig(
+                        player::DeviceConfigCmd::Refresh,
+                    ));
+                }
                 self.restart_current_track_if_playing();
             }
 
@@ -6119,13 +6151,22 @@ fn main() -> iced::Result {
         .font(ICON_FONT_MATH)
         .subscription(App::subscription)
         .theme(App::theme)
-        .window_size((
-            config_for_window.window_width_saved,
-            config_for_window.window_height_saved,
-        ))
         .window({
+            // NOTE: `size` MUST be set inside this Settings literal — the
+            // application builder's `.window(...)` fully overwrites the
+            // per-field setters (`.window_size(...)` etc.) that came
+            // before it (see iced 0.14 `application::window` doc:
+            // "Overwrites any previous window::Settings"). Previously we
+            // had `.window_size((w,h)).window(Settings { .. })` which
+            // silently reset the size to Settings::default() (1024×768),
+            // so every launch opened at 1024×768 and iced's first Resized
+            // event overwrote the saved user size back to that default.
             #[allow(unused_mut)]
             let mut s = iced::window::Settings {
+                size: iced::Size::new(
+                    config_for_window.window_width_saved,
+                    config_for_window.window_height_saved,
+                ),
                 icon: Some(icon),
                 position: match (config_for_window.window_x, config_for_window.window_y) {
                     (Some(x), Some(y)) => {

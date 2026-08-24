@@ -787,6 +787,7 @@ impl SidDevice for EmulatedDevice {
         self.prefill_silence();
     }
 
+    #[allow(deprecated)]
     fn set_stereo(&mut self, mode: i32) {
         if mode >= 1 && self.sid2.is_none() {
             self.sid2 = Some(self.make_sid());

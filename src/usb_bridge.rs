@@ -152,9 +152,11 @@ impl SidDevice for BridgeDevice {
         let _ = self.read_response();
     }
 
-    fn set_stereo(&mut self, mode: i32) {
-        self.send_cmd(&[CMD_STEREO, mode as u8]);
-        let _ = self.read_response();
+    #[allow(deprecated)]
+    fn set_stereo(&mut self, _mode: i32) {
+        // Intentional no-op — see `SidDevice::set_stereo` doc. Stereo
+        // routing on USBSID-Pico is controlled by the flash-persistent
+        // `DeviceConfig::stereo_enabled`, not this transient opcode.
     }
 
     fn write(&mut self, reg: u8, val: u8) {
