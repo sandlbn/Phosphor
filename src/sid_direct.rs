@@ -181,6 +181,18 @@ impl Drop for DirectDevice {
 /// session this `DirectDevice` already owns. The Phosphor playback path
 /// and the config path share a single libusb connection — the OS would
 /// reject a parallel session on the same device.
+impl DirectDevice {
+    /// Un-stall the bulk-IN endpoint after a WinUSB Pipe error (config reads
+    /// only; playback is OUT-only). No-op / compiled out on Linux/macOS.
+    #[inline]
+    fn clear_in_halt_windows(&self) {
+        #[cfg(windows)]
+        {
+            self.dev.clear_in_halt();
+        }
+    }
+}
+
 impl Transport for DirectDevice {
     fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         self.dev
@@ -189,9 +201,15 @@ impl Transport for DirectDevice {
     }
 
     fn recv(&mut self, len: usize) -> Result<Vec<u8>, TransportError> {
-        self.dev
-            .recv_raw(len)
-            .map_err(|e| TransportError::Io(format!("recv_raw: {e}")))
+        match self.dev.recv_raw(len) {
+            Ok(buf) => Ok(buf),
+            Err(e) => {
+                // On Windows, a Pipe error halts the IN endpoint — clear it so
+                // the caller's retry reads on a healthy pipe.
+                self.clear_in_halt_windows();
+                Err(TransportError::Io(format!("recv_raw: {e}")))
+            }
+        }
     }
 
     fn drain(&mut self) -> Result<(), TransportError> {
@@ -203,7 +221,12 @@ impl Transport for DirectDevice {
             match self.dev.recv_raw_timeout(64, 10) {
                 Ok(buf) if buf.is_empty() => return Ok(()),
                 Ok(_) => continue,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    // A stalled pipe here would poison the following
+                    // READ_CONFIG — clear it (Windows-only).
+                    self.clear_in_halt_windows();
+                    return Ok(());
+                }
             }
         }
         Ok(())
