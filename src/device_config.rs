@@ -178,6 +178,22 @@ pub fn run<T: Transport>(
             refresh(&mut dev).map(Some)
         }
 
+        DeviceConfigCmd::EditMulti(edits) => {
+            // Read fresh so a stale snapshot doesn't clobber fields the
+            // firmware has updated since (e.g. auto-detected chip types),
+            // apply each edit against that fresh state, write once.
+            let mut cfg = dev
+                .read_config_lenient()
+                .map_err(|e| format!("read_config: {e}"))?;
+            for edit in edits {
+                apply_edit(&mut cfg, *edit);
+            }
+            dev.write_config(&cfg)
+                .map_err(|e| format!("write_config: {e}"))?;
+            dev.apply().map_err(|e| format!("apply: {e}"))?;
+            refresh(&mut dev).map(Some)
+        }
+
         DeviceConfigCmd::ReadFpgaSidDiag(addr) => {
             let diag = dev
                 .read_fpgasid_diag(*addr)
@@ -251,9 +267,20 @@ fn refresh<T: Transport>(dev: &mut Device<T>) -> Result<DeviceConfigSnapshot, St
         .map_err(|e| format!("read_pcb_version: {e}"))?;
     let pcb_version_raw = usbsid_pico_config::parse_pcb_version(&pcb_version).unwrap_or(0);
     let capabilities = usbsid_pico_config::fw_capabilities(pcb_version_raw);
-    let config = dev
+    let mut config = dev
         .read_config_lenient()
         .map_err(|e| format!("read_config: {e}"))?;
+    // v1.5+ boards keep sockets unpowered until CONFIG_ACK (0xFA) is
+    // sent, and every fresh read reports `need_confirmation = true`
+    // until then. Fire ACK once, wait for the regulators to settle,
+    // re-read so the snapshot reflects live chip types.
+    if config.need_confirmation {
+        let _ = dev.confirm_config();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if let Ok(refreshed) = dev.read_config_lenient() {
+            config = refreshed;
+        }
+    }
     Ok(DeviceConfigSnapshot {
         firmware_version,
         pcb_version,

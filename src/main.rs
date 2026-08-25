@@ -1689,22 +1689,19 @@ impl App {
             }
 
             Message::DeviceConfigureForPseudoStereo => {
-                // Take the current snapshot, flip just the four fields
-                // pseudo-stereo needs, then push the whole config back
-                // via LoadConfig (write + apply + refresh, no flash).
-                let Some(snap) = self.device_cfg.as_ref() else {
-                    self.device_cfg_status =
-                        "Refresh the Device tab first — no live config to modify.".into();
-                    return iced::Task::none();
-                };
-                let mut new_cfg = snap.config;
-                new_cfg.stereo_enabled = true;
-                new_cfg.mirrored = false;
-                new_cfg.mixed = false;
-                new_cfg.socket2.enabled = true;
+                // Send four targeted Edits via EditMulti — the worker
+                // re-reads the on-device config first, so we don't
+                // clobber auto-detected chip_type / SID kinds that the
+                // GUI snapshot may not have picked up yet.
+                use player::DeviceConfigEdit as E;
                 self.device_cfg_status = "Applying pseudo-stereo prereqs (session)…".into();
                 self.send_cmd(player::PlayerCmd::DeviceConfig(
-                    player::DeviceConfigCmd::LoadConfig(new_cfg),
+                    player::DeviceConfigCmd::EditMulti(vec![
+                        E::StereoEnabled(true),
+                        E::Mirrored(false),
+                        E::Mixed(false),
+                        E::SocketEnabled(2, true),
+                    ]),
                 ));
             }
 

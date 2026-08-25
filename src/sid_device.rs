@@ -10,21 +10,11 @@ pub trait SidDevice: Send {
     fn init(&mut self) -> Result<(), String>;
     fn set_clock_rate(&mut self, is_pal: bool);
     fn reset(&mut self);
-    /// Signal how many SIDs will receive writes this session. Semantics
-    /// are engine-specific:
-    /// * Software engines (emulated / sidlite) lazy-create SID2/3/4
-    ///   instances for `mode >= 1..=3`; `mode == 0` drops them.
-    /// * USBSID-Pico direct + bridge treat this as a no-op — stereo
-    ///   routing is controlled by the flash-persistent
-    ///   `DeviceConfig::stereo_enabled` instead.
-    /// * ASID / U64 native engines ignore it entirely.
-    ///
-    /// Deprecated as a public API: callers should not depend on the
-    /// runtime toggle for stereo output. Internal use by the player to
-    /// spin up software SID instances is fine.
-    #[deprecated(
-        note = "Semantics vary by engine; not a durable stereo control. Use DeviceConfig::stereo_enabled for USBSID-Pico."
-    )]
+    /// Signal SID chip count. Software engines lazy-create SID2/3/4
+    /// (`mode >= 1..=3`) or drop them (`mode == 0`); USB / ASID / U64
+    /// engines no-op. Not a durable stereo control — use
+    /// `DeviceConfig::stereo_enabled` for USBSID-Pico routing.
+    #[deprecated(note = "Engine-specific semantics; not a durable stereo control.")]
     fn set_stereo(&mut self, mode: i32);
     fn write(&mut self, reg: u8, val: u8);
 
