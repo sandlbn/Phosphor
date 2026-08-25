@@ -99,7 +99,7 @@ Features that go beyond a basic player: full sub-tune navigation, multi-SID (1/2
   <div class="feature">
     <div class="icon">🔧</div>
     <h3>USBSID-Pico config</h3>
-    <p>Chip routing, clock rate, LED/RGB, MIDI, FMopl, presets, save-to-flash - all inside Phosphor.</p>
+    <p>Chip routing, clock rate, LED/RGB, MIDI, FMopl, presets, save-to-flash - all inside Phosphor. PCB revision (v1.3 / v1.4 / v1.5) auto-detected; firmware ≥ 0.7.7 supported; INI import/export compatible with the upstream Configtool.</p>
   </div>
 
   <div class="feature">
@@ -117,7 +117,7 @@ Features that go beyond a basic player: full sub-tune navigation, multi-SID (1/2
   <div class="feature">
     <div class="icon">📅</div>
     <h3>HVSC + STIL + Songlengths</h3>
-    <p>One-click HVSC sync over HTTPS, automatic song-length lookup, STIL metadata overlay with composer comments.</p>
+    <p>One-click HVSC sync over HTTPS <em>or</em> a fast first-time bootstrap that pulls the whole tree as one <code>.zip</code> / <code>.7z</code> archive (deflate / LZMA / LZMA2 / PPMD, extracted in-process). Automatic song-length lookup and STIL metadata overlay with composer comments.</p>
   </div>
 
   <div class="feature">
@@ -172,6 +172,12 @@ Features that go beyond a basic player: full sub-tune navigation, multi-SID (1/2
     <div class="icon">📱</div>
     <h3>Browser audio streaming</h3>
     <p>The web UI can also <em>play</em> the current SID output as a live MP3 through the browser's <code>&lt;audio&gt;</code> element. Click 🔊 <strong>Listen</strong> and any device on the LAN - phone, tablet, another laptop - hears what the desktop is playing. Works with the reSID and SIDLite engines.</p>
+  </div>
+
+  <div class="feature">
+    <div class="icon">🎧</div>
+    <h3>Pseudo-stereo</h3>
+    <p>Widens a mono (1-SID) tune by mirroring SID1 to SID2 with a few-cents detune so the two chips beat across the stereo field. Three width presets (Subtle / Medium / Wide). Works on reSID, SIDLite, and USBSID-Pico; on USBSID-Pico the Settings panel checks your Audio-routing knobs and offers a one-click session-only fix if the device isn't set up for stereo separation.</p>
   </div>
 
   <div class="feature">

@@ -27,7 +27,7 @@ https://github.com/sandlbn/Phosphor/releases
 - **📚 Library panel** — browse Local HVSC, search Assembly64 live, and load curated Playlists synced from the Phosphor repo
 - **Rich HVSC search** — global search across the whole category shows title, released year, subsong count, duration, and STIL ✓ marker for every hit, not just the filename
 - **🎲 Surprise me** — one-click random tune from your synced HVSC tree or from the currently-loaded playlist (source is configurable in Settings)
-- **USBSID-Pico device config** — built-in Device panel (🔧 button) for chip routing, clock rate, presets, and save-to-flash, all without leaving Phosphor
+- **USBSID-Pico device config** — built-in Device panel (🔧 button) for chip routing, clock rate, presets, and save-to-flash, all without leaving Phosphor; PCB revision (v1.3 / v1.4 / v1.5) auto-detected and the UI hides toggles the connected board can't use. Firmware ≥ 0.7.7 supported, with INI import / export compatible with the upstream Configtool
 - **HTTP remote control** — built-in web server for controlling playback from any browser on the network (phone, tablet, another PC)
 - **Browser audio streaming** — the same web UI can also **play** the current SID output as a live MP3 through the browser's `<audio>` element. Click 🔊 Listen and any device on the LAN — phone, laptop, another room's tablet — hears what the desktop is playing. Works with the reSID and SIDLite engines; the USB / U64 hardware paths are analog and can't be tapped
 - **HTTP proxy support** — single-field setting for `http://` / `https://` / `socks5://`, applied to all outbound requests
@@ -41,6 +41,7 @@ https://github.com/sandlbn/Phosphor/releases
 - **HVSC STIL** — song info overlay (cover titles, original artists, composer comments) via the ⓘ button; downloaded or loaded from a local STIL.txt
 - **MUS file support** *(beta)* — Compute's Gazette SIDplayer format with stereo (MUS+STR), PETSCII lyrics display (WDS), and real-time karaoke mode synchronized via FLAG commands
 - **Multi-SID support** — PSID/RSID, 1SID/2SID/3SID tunes, PAL/NTSC
+- **Pseudo-stereo** — widens a mono (1-SID) tune by mirroring SID1 onto SID2 with a few-cents detune so the two chips beat across the stereo field. Works across all engines (reSID, SIDLite, USBSID-Pico, U64 is warned as unsupported). Three width presets (Subtle / Medium / Wide). On USBSID-Pico the Settings pseudo-stereo panel checks your Audio-routing knobs and offers a one-click session-only fix if the device isn't configured for stereo separation
 - **Sub-tune navigation** — step through all sub-tunes within a SID file
 - **SID register panel** — real-time scrolling tracker view (note, waveform, ADSR per voice) plus live register readout for all active SID chips
 - **U64 audio streaming** — stream SID audio from the Ultimate 64 back to the host machine over UDP
@@ -196,6 +197,10 @@ make arch_install       # makepkg -si
 Use `make arch_pkg` to produce `dist/phosphor-<version>-1-x86_64.pkg.tar.zst`
 without installing it. The PKGBUILD lives in [packaging/arch/](packaging/arch/).
 
+Not on Arch? `make linux_arch_docker` builds the exact same `.pkg.tar.zst`
+inside a container (works on macOS / any host with Docker) — same idea as
+`make linux_deb_docker` for the `.deb`.
+
 #### Debian / Ubuntu
 
 Grab the `.deb` from [Releases](https://github.com/sandlbn/Phosphor/releases),
@@ -256,6 +261,8 @@ Phosphor can load two HVSC databases from Settings (⚙):
 **STIL** — the SID Tune Information List maps each SID file to the original songs it covers, the performing artists, and curator comments. Once loaded, a ⓘ button appears next to the ♥ heart whenever info is available for the current tune.
 
 For the most accurate STIL lookups, set the **HVSC root directory** in Settings to the root of your local HVSC tree (e.g. `/home/user/C64Music`). Without it Phosphor falls back to matching by filename, which works for most collections but can be ambiguous when multiple composers share a filename.
+
+**Fast first-time sync** — for a fresh install, Settings → Library → *Fast first-time sync (archive)* pulls the whole HVSC tree as one `.zip` or `.7z` (deflate / LZMA / LZMA2 / PPMD supported, extracted in-process) — dramatically faster than the file-by-file HTTPS crawl. The default URL is auto-derived from your rsync mirror + last-known HVSC version; the file-by-file button remains the best choice for incremental updates once a full tree is on disk.
 
 ## U64 Audio Streaming
 
