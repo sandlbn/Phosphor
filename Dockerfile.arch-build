@@ -1,0 +1,62 @@
+# Reproducible Arch Linux x86_64 build environment for Phosphor.
+# Used by `make linux_arch_docker` to produce a .pkg.tar.zst from any
+# host (notably macOS) without needing an Arch VM.
+#
+# Build the image once:
+#   docker build -f Dockerfile.arch-build -t phosphor-arch-build .
+#
+# Run a build (from the repo root):
+#   docker run --rm -v "$PWD":/src phosphor-arch-build
+#
+# The image contains a `builder` user with passwordless sudo. The
+# entrypoint fixes its UID/GID at runtime to match whatever owns the
+# mounted /src, so the resulting .pkg.tar.zst lands owned by the host
+# user rather than by root or by the container's baked-in uid.
+
+# Platform is picked up from `docker build --platform=linux/amd64` on
+# the command line rather than baked in here (Docker's linter dislikes
+# constant --platform values on FROM). BuildKit exposes it as
+# TARGETPLATFORM automatically.
+FROM archlinux:base-devel
+
+# pacman 6.1 wraps downloads in a landlock + seccomp sandbox that
+# tries to drop to the `alpm` user. Docker's default seccomp profile
+# blocks the syscalls that sandbox relies on, so the download fails
+# with "switching to sandbox user 'alpm' failed". `DisableSandbox` is
+# the explicit escape hatch documented in `pacman.conf(5)` for exactly
+# this container use-case.
+RUN echo 'DisableSandbox' >> /etc/pacman.conf
+
+# --needed = don't reinstall packages base-devel already covers.
+# We pin nothing here on purpose: makepkg + rustc bump together with
+# the Arch release cadence, and pinning would immediately go stale.
+RUN pacman -Syu --noconfirm --needed \
+    && pacman -S --noconfirm --needed \
+        rust \
+        git \
+        alsa-lib \
+        libusb \
+        systemd-libs \
+        pkgconf \
+    && pacman -Scc --noconfirm
+
+# makepkg refuses to run as root. Create a builder user with a
+# throwaway UID (1500 — deliberately outside the usual host range
+# 1000/501, so it's easy to spot in `ps` if something goes wrong).
+# The entrypoint remaps it to the host UID at runtime.
+RUN useradd -m -u 1500 builder \
+    && echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+
+WORKDIR /src
+
+# Inline entrypoint keeps the image self-contained (no separate
+# script file to ship alongside the Dockerfile). Bash -c because
+# ENTRYPOINT arg parsing doesn't do shell interpolation.
+ENTRYPOINT ["bash", "-c", "\
+  HOST_UID=$(stat -c %u /src) && HOST_GID=$(stat -c %g /src) && \
+  if [ \"$HOST_UID\" != \"0\" ]; then \
+    usermod -u \"$HOST_UID\" builder 2>/dev/null || true; \
+    groupmod -g \"$HOST_GID\" builder 2>/dev/null || true; \
+    chown builder:builder /home/builder; \
+  fi && \
+  exec sudo -u builder -H bash -c 'cd /src/packaging/arch && makepkg -f'"]

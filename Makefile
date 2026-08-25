@@ -15,7 +15,11 @@ LIN_OUT := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64.deb
 DOCKER_IMAGE := phosphor-linux-build
 DOCKERFILE   := Dockerfile.linux-build
 
-.PHONY: help clean dist linux_deb linux_deb_docker linux_image macos_pkg arch_pkg arch_install
+ARCH_DOCKER_IMAGE := phosphor-arch-build
+ARCH_DOCKERFILE   := Dockerfile.arch-build
+
+.PHONY: help clean dist linux_deb linux_deb_docker linux_image macos_pkg \
+        arch_pkg arch_install linux_arch_docker linux_arch_image
 
 help:
 	@echo "Targets:"
@@ -24,6 +28,8 @@ help:
 	@echo "  make arch_install      - build and install the Arch package (needs sudo)"
 	@echo "  make linux_deb_docker  - build Linux x86_64 .deb via Docker (works on macOS too)"
 	@echo "  make linux_image       - (re)build the Docker image only"
+	@echo "  make linux_arch_docker - build Arch .pkg.tar.zst via Docker (works on macOS too)"
+	@echo "  make linux_arch_image  - (re)build the Arch Docker image only"
 	@echo "  make macos_pkg         - rename/copy macOS pkg"
 	@echo "  make dist              - build for current OS"
 	@echo "  make clean"
@@ -95,6 +101,28 @@ arch_pkg:
 arch_install:
 	@command -v makepkg >/dev/null || { echo "makepkg not found — Arch/pacman only"; exit 1; }
 	cd $(ARCH_DIR) && makepkg -si
+
+# -----------------------
+# Arch Linux via Docker (works on macOS / any host with Docker)
+# -----------------------
+# Same idea as `linux_deb_docker`: run the Arch build inside a container
+# so we can produce .pkg.tar.zst artefacts from a non-Arch host. The
+# image bakes in `base-devel` + rust and a builder user; the entrypoint
+# remaps its UID at runtime to match /src's owner so the resulting
+# .pkg.tar.zst lands host-owned. Build artefacts go to ./target-arch
+# (the PKGBUILD's `_target`) to keep the host's own target/ cache clean.
+linux_arch_image:
+	docker build --platform linux/amd64 -f $(ARCH_DOCKERFILE) -t $(ARCH_DOCKER_IMAGE) .
+
+linux_arch_docker: linux_arch_image
+	@mkdir -p $(DIST_DIR)
+	docker run --rm \
+	  --platform linux/amd64 \
+	  -v "$(CURDIR)":/src \
+	  $(ARCH_DOCKER_IMAGE)
+	@PKG_PATH=$$(ls -1t $(ARCH_DIR)/*.pkg.tar.zst | head -n 1); \
+	cp "$$PKG_PATH" "$(DIST_DIR)/"; \
+	echo "Built: $(DIST_DIR)/$$(basename $$PKG_PATH)"
 
 # -----------------------
 # macOS
