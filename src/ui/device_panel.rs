@@ -18,6 +18,7 @@ use crate::player::{DeviceConfigCmd, DeviceConfigEdit};
 pub fn device_panel<'a>(
     snapshot: Option<&'a DeviceConfigSnapshot>,
     status: &'a str,
+    needs_confirm: bool,
 ) -> Element<'a, Message> {
     let header = row![
         text("USBSID-Pico Device")
@@ -39,7 +40,7 @@ pub fn device_panel<'a>(
         });
 
     let body: Element<'a, Message> = match snapshot {
-        Some(snap) => build_loaded(snap),
+        Some(snap) => build_loaded(snap, needs_confirm),
         None => container(
             text("No device data loaded. Click ↻ Refresh to read the device.")
                 .size(font::sized(13.0))
@@ -64,7 +65,7 @@ pub fn device_panel<'a>(
         .into()
 }
 
-fn build_loaded<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+fn build_loaded<'a>(snap: &'a DeviceConfigSnapshot, needs_confirm: bool) -> Element<'a, Message> {
     let mut col = column![
         section_about(snap),
         section_clock(snap),
@@ -91,7 +92,7 @@ fn build_loaded<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
     // Hidden entirely on older PCBs so a v1.3 user isn't shown toggles
     // whose SET_CONFIG opcode the firmware would reject.
     if snap.capabilities.presets_v15 {
-        col = col.push(section_advanced(snap));
+        col = col.push(section_advanced(snap, needs_confirm));
     }
     col.push(section_presets(snap))
         .push(section_ini_io())
@@ -562,7 +563,10 @@ fn rgb_sid_picker<'a>(current: i8) -> Element<'a, Message> {
     r.into()
 }
 
-fn section_advanced<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> {
+fn section_advanced<'a>(
+    snap: &'a DeviceConfigSnapshot,
+    needs_confirm: bool,
+) -> Element<'a, Message> {
     // Caller has already checked `snap.capabilities.presets_v15`; this
     // section is exclusively the v1.5+ toggles.
     let cfg = &snap.config;
@@ -583,16 +587,42 @@ fn section_advanced<'a>(snap: &'a DeviceConfigSnapshot) -> Element<'a, Message> 
     ]
     .spacing(4);
     if cfg.need_confirmation {
+        // When a config change is pending (e.g. after SID detection), accent
+        // the button and add a note so it's obvious the sockets are waiting on
+        // a CONFIG_ACK. Otherwise the plain button (no pending change).
+        let confirm_msg = Message::DeviceConfigAction(DeviceConfigCmd::Confirm);
+        let confirm_btn: Element<'a, Message> = if needs_confirm {
+            button(text("✓ Confirm config").size(font::sized(12.0)))
+                .on_press(confirm_msg)
+                .padding(Padding::from([4, 10]))
+                .style(|_t: &Theme, st: button::Status| button::Style {
+                    background: Some(iced::Background::Color(match st {
+                        button::Status::Hovered => Color::from_rgb(0.98, 0.70, 0.25),
+                        _ => Color::from_rgb(0.88, 0.58, 0.12),
+                    })),
+                    text_color: Color::from_rgb(0.10, 0.08, 0.02),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.98, 0.74, 0.35),
+                    },
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            small_button("✓ Confirm config", confirm_msg)
+        };
+        if needs_confirm {
+            col = col.push(
+                text("⚠ Config changed — confirm to power the SID sockets")
+                    .size(font::sized(12.0))
+                    .color(Color::from_rgb(0.98, 0.75, 0.30)),
+            );
+        }
         col = col.push(
-            row![
-                Space::new().width(Length::Fixed(180.0)),
-                small_button(
-                    "✓ Confirm config",
-                    Message::DeviceConfigAction(DeviceConfigCmd::Confirm)
-                ),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+            row![Space::new().width(Length::Fixed(180.0)), confirm_btn]
+                .spacing(8)
+                .align_y(Alignment::Center),
         );
     }
     col.into()

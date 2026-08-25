@@ -274,6 +274,11 @@ struct App {
     /// One-line status banner shown above the panel (e.g. "Reading…",
     /// "Saved!", "Error: …").
     device_cfg_status: String,
+    /// v1.5+ boards keep the SID sockets unpowered until a `CONFIG_ACK`.
+    /// Set when a config op returns a *changed* config that still
+    /// `need_confirmation` (e.g. after SID detection) — the panel then
+    /// accents the "✓ Confirm config" button. Cleared on confirm.
+    device_config_needs_confirm: bool,
     /// Channel the player thread sends DeviceConfigEvent results on.
     device_cfg_rx: crossbeam_channel::Receiver<player::DeviceConfigEvent>,
     /// Have we already auto-fetched USB device info for the engine-label
@@ -621,6 +626,7 @@ impl App {
             show_device_config: false,
             device_cfg: None,
             device_cfg_status: String::new(),
+            device_config_needs_confirm: false,
             usb_info_fetched: false,
             device_cfg_rx,
             default_length_text,
@@ -1597,6 +1603,10 @@ impl App {
 
             Message::DeviceConfigAction(cmd) => {
                 use player::DeviceConfigCmd as C;
+                if matches!(cmd, C::Confirm) {
+                    // User is acting on the pending change — drop the accent.
+                    self.device_config_needs_confirm = false;
+                }
                 self.device_cfg_status = match &cmd {
                     C::Confirm => "Confirming config…".into(),
                     C::DetectSids => "Detecting SIDs…".into(),
@@ -1621,10 +1631,7 @@ impl App {
             }
 
             Message::DeviceConfigResult(result) => match result {
-                Ok(snap) => {
-                    self.device_cfg = Some(snap);
-                    self.device_cfg_status = "Loaded.".into();
-                }
+                Ok(snap) => self.apply_device_snapshot(snap),
                 Err(e) => {
                     self.device_cfg_status = format!("Error: {e}");
                 }
@@ -3700,8 +3707,11 @@ impl App {
 
         // Build the main content area
         let main_content: Element<'_, Message> = if self.show_device_config {
-            let panel =
-                ui::device_panel::device_panel(self.device_cfg.as_ref(), &self.device_cfg_status);
+            let panel = ui::device_panel::device_panel(
+                self.device_cfg.as_ref(),
+                &self.device_cfg_status,
+                self.device_config_needs_confirm,
+            );
             column![
                 info_bar,
                 progress,
@@ -4090,6 +4100,24 @@ impl App {
         }
     }
 
+    /// Store a fresh device-config snapshot. For v1.5 boards, when the config
+    /// actually *changed* and still needs a `CONFIG_ACK` (e.g. SID detection
+    /// altered the sockets), surface the Device panel and flag the Confirm
+    /// button — gated on a real change so it never re-opens right after the
+    /// user confirms (`need_confirmation` is a persistent setting).
+    fn apply_device_snapshot(&mut self, snap: ui::DeviceConfigSnapshot) {
+        let changed = self
+            .device_cfg
+            .as_ref()
+            .is_some_and(|prev| prev.config != snap.config);
+        if changed && snap.config.need_confirmation {
+            self.device_config_needs_confirm = true;
+            self.show_device_config = true;
+        }
+        self.device_cfg = Some(snap);
+        self.device_cfg_status = "Loaded.".into();
+    }
+
     fn play_track(&mut self, idx: usize) {
         if let Some(entry) = self.playlist.entries.get(idx) {
             if self.config.skip_rsid && entry.is_rsid {
@@ -4461,10 +4489,7 @@ impl App {
         // device_cfg + device_cfg_status.
         while let Ok(event) = self.device_cfg_rx.try_recv() {
             match event {
-                Ok(snap) => {
-                    self.device_cfg = Some(snap);
-                    self.device_cfg_status = "Loaded.".into();
-                }
+                Ok(snap) => self.apply_device_snapshot(snap),
                 Err(e) => {
                     self.device_cfg_status = format!("Error: {e}");
                 }
