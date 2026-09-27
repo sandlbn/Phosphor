@@ -1,6 +1,8 @@
 pub mod device_panel;
 pub mod font;
+pub mod knob;
 pub mod metrics;
+pub mod pedalboard_panel;
 pub mod right_click;
 pub mod sid_panel;
 pub mod visualizer;
@@ -295,6 +297,8 @@ pub enum Message {
 
     // Device config (USBSID-Pico)
     ToggleDeviceConfig,
+    /// Pedalboard (effects) tab actions.
+    Pedal(pedalboard_panel::PedalMsg),
     DeviceConfigRefresh,
     DeviceConfigApplyPreset(usbsid_pico_config::Preset),
     DeviceConfigSetClock(usbsid_pico_config::ClockRate),
@@ -1238,6 +1242,10 @@ pub fn controls_bar<'a>(
                 small_button("🔧", Message::ToggleDeviceConfig),
                 "USB SID Pico device configuration"
             ),
+            with_tip(
+                small_button("🎛", Message::Pedal(pedalboard_panel::PedalMsg::Toggle)),
+                "Pedalboard — effects for the software engines"
+            ),
             with_tip(small_button("⚙", Message::ToggleSettings), "Settings"),
         ]
         .spacing(3)
@@ -1248,6 +1256,10 @@ pub fn controls_bar<'a>(
             with_tip(
                 small_button("🔧 Device", Message::ToggleDeviceConfig),
                 "USB SID Pico device configuration"
+            ),
+            with_tip(
+                small_button("🎛 FX", Message::Pedal(pedalboard_panel::PedalMsg::Toggle)),
+                "Pedalboard — effects for the software engines"
             ),
             with_tip(
                 small_button("⚙ Settings", Message::ToggleSettings),
