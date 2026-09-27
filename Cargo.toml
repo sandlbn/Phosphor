@@ -1,6 +1,6 @@
 [package]
 name = "phosphor"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "Phosphor — a SID player for USBSID-Pico / Ultimate 64"
 
@@ -21,6 +21,8 @@ usbsid-pico-config = { version = "0.2", default-features = false, features = ["f
 # Software SID emulation
 resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
 cpal = "0.15"
+# Pedalboard effects for the software engines (pure Rust).
+fundsp = "0.23"
 
 # SIDLite emulation from libsidplayfp
 sidlite-sys = "0.1.1"
@@ -125,3 +127,13 @@ assets = [
 # Maintainer scripts to refresh desktop/icon caches so the menu entry shows up
 # without requiring a logout. Falls back silently if the helper tools aren't installed.
 maintainer-scripts = "packaging/debian"
+
+# `cargo run` builds were unoptimised, which made real-time DSP (pedalboard
+# reverb, reSID) fall behind the player's frame clock. Optimise all
+# dependencies fully (compiled once, then cached) and our own crate lightly
+# so per-sample loops inline while incremental rebuilds stay quick.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

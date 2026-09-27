@@ -303,6 +303,8 @@ pub struct EmulatedDevice {
     carry2: Vec<i16>,
     carry3: Vec<i16>,
     carry4: Vec<i16>,
+    /// Per-SID + master effect chains and the stereo mix.
+    mixer: crate::dsp::LaneMixer,
 }
 
 impl EmulatedDevice {
@@ -364,6 +366,7 @@ impl EmulatedDevice {
             carry2: Vec::new(),
             carry3: Vec::new(),
             carry4: Vec::new(),
+            mixer: crate::dsp::LaneMixer::new(sample_rate as f64),
         })
     }
 
@@ -600,40 +603,22 @@ impl EmulatedDevice {
             }
         }
 
-        // Build the mixed pairs in a local vec so we can push them into
-        // both the local ring buffer (for cpal) and the global audio
-        // stream tap (for the browser MP3 endpoint) in one pass.
-        let mut buf = self.audio_buf.lock().unwrap();
-        let room = MAX_BUFFER_SAMPLES.saturating_sub(buf.len());
+        // Mix outside the ring-buffer lock: with effects active the mix
+        // does real DSP work and must not stall the cpal callback. Room
+        // only grows while we're unlocked (the callback just pops).
+        let room = MAX_BUFFER_SAMPLES.saturating_sub(self.audio_buf.lock().unwrap().len());
         let mix_count = count.min(room);
         let mut mixed: Vec<(i16, i16)> = Vec::with_capacity(mix_count);
-
-        for i in 0..mix_count {
-            let left = all1[i];
-            let right = if self.sid2.is_some() {
-                all2[i]
-            } else {
-                left // mono: mirror SID1 to right channel
-            };
-
-            // SID3/SID4 centre-mixed at half volume
-            let mut centre: i16 = 0;
-            if self.sid3.is_some() {
-                centre = centre.saturating_add(all3[i] / 2);
-            }
-            if self.sid4.is_some() {
-                centre = centre.saturating_add(all4[i] / 2);
-            }
-
-            let pair = if centre != 0 {
-                (left.saturating_add(centre), right.saturating_add(centre))
-            } else {
-                (left, right)
-            };
-            buf.push_back(pair);
-            mixed.push(pair);
+        if mix_count > 0 {
+            let chips = [
+                Some(&all1[..]),
+                self.sid2.is_some().then_some(&all2[..]),
+                self.sid3.is_some().then_some(&all3[..]),
+                self.sid4.is_some().then_some(&all4[..]),
+            ];
+            self.mixer.mix(chips, mix_count, &mut mixed);
+            self.audio_buf.lock().unwrap().extend(mixed.iter().copied());
         }
-        drop(buf);
 
         // Fan the same samples out to the /api/stream.mp3 tap. Fast-path
         // bails out immediately when no browsers are listening — cost
@@ -731,6 +716,10 @@ impl SidDevice for EmulatedDevice {
             self.cycles_per_frame,
             self.sample_rate,
         );
+    }
+
+    fn set_pedalboard(&mut self, board: crate::dsp::LiveBoard) {
+        self.mixer.set_board(board);
     }
 
     fn set_sid_model(&mut self, model: u8) {

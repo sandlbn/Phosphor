@@ -48,6 +48,12 @@ pub trait SidDevice: Send {
     /// which sounds muffled on 8580-composed material.
     fn set_sid_model(&mut self, _model: u8) {}
 
+    /// Install a pedalboard (effect chains). Knob / bypass changes flow
+    /// through the board's shared atomics; this is only called when the
+    /// chain topology changes. Default no-op — hardware engines output
+    /// analog audio Phosphor can't process.
+    fn set_pedalboard(&mut self, _board: crate::dsp::LiveBoard) {}
+
     /// Send a complete SID file for native playback on real hardware.
     ///
     /// Returns `Ok(true)` if the engine handles playback natively

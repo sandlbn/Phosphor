@@ -209,6 +209,8 @@ pub struct SidLiteDevice {
     audio_shutdown: Arc<AtomicBool>,
 
     frame_counter: u64,
+    /// Per-SID + master effect chains and the stereo mix.
+    mixer: crate::dsp::LaneMixer,
 }
 
 impl SidLiteDevice {
@@ -257,6 +259,7 @@ impl SidLiteDevice {
             audio_buf,
             audio_shutdown,
             frame_counter: 0,
+            mixer: crate::dsp::LaneMixer::new(effective_rate as f64),
         })
     }
 
@@ -336,40 +339,34 @@ impl SidLiteDevice {
         }
 
         let filtered1: Vec<i16> = s1.iter().map(|&s| self.ext1.clock(s)).collect();
-        let filtered2: Vec<i16> = s2.iter().map(|&s| self.ext2.clock(s)).collect();
-        let filtered3: Vec<i16> = s3.iter().map(|&s| self.ext3.clock(s)).collect();
-        let filtered4: Vec<i16> = s4.iter().map(|&s| self.ext4.clock(s)).collect();
+        let mut filtered2: Vec<i16> = s2.iter().map(|&s| self.ext2.clock(s)).collect();
+        let mut filtered3: Vec<i16> = s3.iter().map(|&s| self.ext3.clock(s)).collect();
+        let mut filtered4: Vec<i16> = s4.iter().map(|&s| self.ext4.clock(s)).collect();
 
-        let mut buf = self.audio_buf.lock().unwrap();
-        let room = MAX_BUFFER_SAMPLES.saturating_sub(buf.len());
+        // Mix outside the ring-buffer lock (effects do real DSP work).
+        let room = MAX_BUFFER_SAMPLES.saturating_sub(self.audio_buf.lock().unwrap().len());
         let count = filtered1.len().min(room);
         let mut mixed: Vec<(i16, i16)> = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let left = filtered1[i];
-            let right = if !filtered2.is_empty() {
-                *filtered2.get(i).unwrap_or(&0)
-            } else {
-                left
-            };
-
-            let mut centre: i16 = 0;
-            if !filtered3.is_empty() {
-                centre = centre.saturating_add(*filtered3.get(i).unwrap_or(&0) / 2);
+        if count > 0 {
+            // A chip is "present" when it produced samples; pad a short
+            // one with silence, as the old per-index `unwrap_or(&0)` did.
+            for f in [&mut filtered2, &mut filtered3, &mut filtered4] {
+                if !f.is_empty() && f.len() < count {
+                    f.resize(count, 0);
+                }
             }
-            if !filtered4.is_empty() {
-                centre = centre.saturating_add(*filtered4.get(i).unwrap_or(&0) / 2);
+            fn present(f: &[i16]) -> Option<&[i16]> {
+                (!f.is_empty()).then_some(f)
             }
-
-            let pair = if centre != 0 {
-                (left.saturating_add(centre), right.saturating_add(centre))
-            } else {
-                (left, right)
-            };
-            buf.push_back(pair);
-            mixed.push(pair);
+            let chips = [
+                Some(&filtered1[..]),
+                present(&filtered2),
+                present(&filtered3),
+                present(&filtered4),
+            ];
+            self.mixer.mix(chips, count, &mut mixed);
+            self.audio_buf.lock().unwrap().extend(mixed.iter().copied());
         }
-        drop(buf);
 
         // Also fan out to the /api/stream.mp3 tap. Fast-path bails when
         // no browsers are listening.
@@ -386,6 +383,10 @@ impl SidLiteDevice {
 impl SidDevice for SidLiteDevice {
     fn init(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn set_pedalboard(&mut self, board: crate::dsp::LiveBoard) {
+        self.mixer.set_board(board);
     }
 
     fn set_clock_rate(&mut self, is_pal: bool) {

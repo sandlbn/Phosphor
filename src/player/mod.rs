@@ -58,6 +58,9 @@ pub enum PlayerCmd {
     /// other engines). The result is shipped back via the response channel
     /// that's already part of the GUI's command dispatch.
     DeviceConfig(DeviceConfigCmd),
+    /// Install a pedalboard on the software engines (topology changes
+    /// only — knob moves go through the board's shared atomics).
+    SetPedalboard(crate::dsp::LiveBoard),
     Quit,
 }
 
@@ -743,6 +746,10 @@ fn ensure_hardware(
     }
     let mut br = create_engine(engine_name, u64_address, u64_password, macos_usb_mode)?;
     br.init()?;
+    // A freshly (re)created engine starts dry — re-apply the pedalboard.
+    if let Some(board) = crate::dsp::active() {
+        br.set_pedalboard(board);
+    }
     *bridge = Some(br);
     Ok(())
 }
@@ -1278,6 +1285,13 @@ fn handle_cmd(
             *macos_usb_mode = mode;
             *state = PlayState::Stopped;
             send_status(state, play_ctx, last_error, status_tx);
+        }
+
+        PlayerCmd::SetPedalboard(board) => {
+            crate::dsp::set_active(board.clone());
+            if let Some(br) = bridge.as_mut() {
+                br.set_pedalboard(board);
+            }
         }
 
         PlayerCmd::DeviceConfig(op) => {

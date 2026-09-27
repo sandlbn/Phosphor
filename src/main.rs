@@ -8,6 +8,7 @@ mod c64_emu;
 mod config;
 mod debug_log;
 mod device_config;
+mod dsp;
 mod favorites;
 mod heard_db;
 mod petscii;
@@ -268,6 +269,15 @@ struct App {
     settings_tab: ui::SettingsTab,
     /// Whether the USBSID-Pico Device Config panel is currently visible.
     show_device_config: bool,
+    /// Pedalboard (effects) tab.
+    show_pedalboard: bool,
+    pedalboard: dsp::LiveBoard,
+    pedalboard_store: dsp::presets::PedalboardStore,
+    pedal_selected: Option<u64>,
+    pedal_picker: Option<usize>,
+    pedal_preset_name: String,
+    /// Pending debounced save of `pedalboard.json` (knob drags fire often).
+    pedal_save_due: Option<std::time::Instant>,
     /// Cached state for the Device Config panel. `None` means we haven't
     /// successfully read the device yet.
     device_cfg: Option<ui::DeviceConfigSnapshot>,
@@ -606,6 +616,11 @@ impl App {
         let auto_last_stil_file = config.last_stil_file.clone();
         let initial_show_welcome = !config.has_seen_welcome;
 
+        let pedalboard_store = dsp::presets::PedalboardStore::load();
+        let pedalboard = dsp::LiveBoard::from_spec(pedalboard_store.active.clone());
+        let _ = cmd_tx.try_send(player::PlayerCmd::SetPedalboard(pedalboard.clone()));
+        let pedal_preset_name = pedalboard_store.active_name.clone().unwrap_or_default();
+
         let app = Self {
             cmd_tx,
             status_rx,
@@ -624,6 +639,13 @@ impl App {
             show_settings: false,
             settings_tab: ui::SettingsTab::General,
             show_device_config: false,
+            show_pedalboard: false,
+            pedalboard,
+            pedalboard_store,
+            pedal_selected: None,
+            pedal_picker: None,
+            pedal_preset_name,
+            pedal_save_due: None,
             device_cfg: None,
             device_cfg_status: String::new(),
             device_config_needs_confirm: false,
@@ -1524,6 +1546,7 @@ impl App {
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
                     self.show_device_config = false;
+                    self.show_pedalboard = false;
                     self.show_hvsc_browser = false;
                     // Reset the tab to General each time the panel is opened
                     // — the tab strip is a quick swap, and re-opening is
@@ -1541,6 +1564,7 @@ impl App {
                 self.show_device_config = !self.show_device_config;
                 if self.show_device_config {
                     self.show_settings = false;
+                    self.show_pedalboard = false;
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
                     self.show_hvsc_browser = false;
@@ -1551,6 +1575,8 @@ impl App {
                     ));
                 }
             }
+
+            Message::Pedal(p) => self.handle_pedal(p),
 
             Message::DeviceConfigRefresh => {
                 self.device_cfg_status = "Reading device…".into();
@@ -2134,6 +2160,13 @@ impl App {
 
             // ── Tick ──────────────────────────────────────────────────────
             Message::Tick => {
+                if self
+                    .pedal_save_due
+                    .is_some_and(|t| t.elapsed() >= Duration::from_millis(800))
+                {
+                    self.pedal_save_due = None;
+                    self.pedalboard_store.save();
+                }
                 self.tick = self.tick.wrapping_add(1);
                 self.poll_status();
 
@@ -2446,6 +2479,7 @@ impl App {
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
                     self.show_device_config = false;
+                    self.show_pedalboard = false;
                     // Re-sync root in case it changed since last open.
                     self.hvsc_browser.set_root(
                         self.config
@@ -3703,7 +3737,35 @@ impl App {
         let progress = ui::progress_bar(&self.status, current_duration);
 
         // Build the main content area
-        let main_content: Element<'_, Message> = if self.show_device_config {
+        let main_content: Element<'_, Message> = if self.show_pedalboard {
+            let panel = ui::pedalboard_panel::pedalboard_panel(ui::pedalboard_panel::PedalView {
+                board: &self.pedalboard,
+                store: &self.pedalboard_store,
+                selected: self.pedal_selected,
+                picker: self.pedal_picker,
+                preset_name: &self.pedal_preset_name,
+                engine_supported: match self.config.output_engine.as_str() {
+                    "emulated" | "sidlite" => Some(true),
+                    "auto" => None,
+                    _ => Some(false),
+                },
+                active_sids: self
+                    .status
+                    .track_info
+                    .as_ref()
+                    .map(|i| i.num_sids)
+                    .unwrap_or(1),
+            });
+            column![
+                info_bar,
+                progress,
+                rule::horizontal(1),
+                controls,
+                rule::horizontal(1),
+                panel
+            ]
+            .into()
+        } else if self.show_device_config {
             let panel = ui::device_panel::device_panel(
                 self.device_cfg.as_ref(),
                 &self.device_cfg_status,
@@ -4091,6 +4153,101 @@ impl App {
     /// the UI's blocking `send` was the last thing that could hang it. In
     /// normal operation the channel is never full, so this behaves exactly
     /// like a blocking send, with no dropped commands.
+    fn handle_pedal(&mut self, p: ui::pedalboard_panel::PedalMsg) {
+        use ui::pedalboard_panel::PedalMsg as P;
+        let was_neutral = self.pedalboard.spec().is_neutral();
+        let mut topology = false;
+        let mut changed = true;
+        match p {
+            P::Toggle => {
+                changed = false;
+                self.show_pedalboard = !self.show_pedalboard;
+                if self.show_pedalboard {
+                    self.context_menu = None;
+                    self.show_settings = false;
+                    self.show_device_config = false;
+                    self.show_recently_played = false;
+                    self.show_sid_panel = false;
+                    self.show_hvsc_browser = false;
+                }
+            }
+            P::Select(id) => {
+                changed = false;
+                self.pedal_selected = Some(id);
+            }
+            P::OpenPicker(lane) => {
+                changed = false;
+                self.pedal_picker = Some(lane);
+            }
+            P::ClosePicker => {
+                changed = false;
+                self.pedal_picker = None;
+            }
+            P::Add(lane, kind) => {
+                self.pedal_selected = Some(self.pedalboard.add_block(lane, kind));
+                self.pedal_picker = None;
+                topology = true;
+            }
+            P::Remove(id) => {
+                self.pedalboard.remove_block(id);
+                if self.pedal_selected == Some(id) {
+                    self.pedal_selected = None;
+                }
+                topology = true;
+            }
+            P::Move(id, dir) => {
+                self.pedalboard.move_block(id, dir);
+                topology = true;
+            }
+            P::Bypass(id, b) => self.pedalboard.set_bypass(id, b),
+            P::BypassAll(b) => self.pedalboard.set_bypass_all(b),
+            P::Param(id, i, v) => self.pedalboard.set_param(id, i, v),
+            P::LaneGain(lane, db) => self.pedalboard.set_lane_gain_db(lane, db),
+            P::LanePan(lane, pan) => self.pedalboard.set_lane_pan(lane, pan),
+            P::PresetPicked(name) => {
+                if let Some(preset) = self
+                    .pedalboard_store
+                    .all()
+                    .into_iter()
+                    .find(|p| p.name == name)
+                {
+                    self.pedalboard.load(preset.board);
+                    self.pedalboard_store.active_name = Some(name.clone());
+                    self.pedal_preset_name = name;
+                    self.pedal_selected = None;
+                    self.pedal_picker = None;
+                    topology = true;
+                }
+            }
+            P::PresetNameChanged(name) => {
+                changed = false;
+                self.pedal_preset_name = name;
+            }
+            P::SavePreset => {
+                let name = self.pedal_preset_name.trim().to_string();
+                if !name.is_empty() {
+                    self.pedalboard_store
+                        .upsert(&name, self.pedalboard.spec().clone());
+                    self.pedalboard_store.active_name = Some(name);
+                }
+            }
+            P::DeletePreset => {
+                if let Some(name) = self.pedalboard_store.active_name.take() {
+                    self.pedalboard_store.remove(&name);
+                }
+            }
+        }
+        // Gain / pan leaving (or returning to) neutral switches the mixer
+        // between the integer fast path and the f32 path — resend.
+        if topology || was_neutral != self.pedalboard.spec().is_neutral() {
+            self.send_cmd(player::PlayerCmd::SetPedalboard(self.pedalboard.clone()));
+        }
+        if changed {
+            self.pedalboard_store.active = self.pedalboard.spec().clone();
+            self.pedal_save_due = Some(std::time::Instant::now());
+        }
+    }
+
     fn send_cmd(&self, cmd: player::PlayerCmd) {
         if let Err(e) = self.cmd_tx.try_send(cmd) {
             crate::dlog!("send_cmd DROPPED (player thread stalled?): {e:?}");
