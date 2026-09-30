@@ -404,7 +404,9 @@ pub enum Message {
 
     // Window
     WindowResized(iced::window::Id, f32, f32),
-    WindowMoved(i32, i32),
+    WindowMoved(iced::window::Id, i32, i32),
+    WindowCloseRequested(iced::window::Id),
+    WindowClosed(iced::window::Id),
 
     // Visualiser
     /// Toggle between Bar and Scope display modes.

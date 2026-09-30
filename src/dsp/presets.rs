@@ -13,6 +13,28 @@ pub struct NamedPreset {
     pub board: PedalboardSpec,
 }
 
+/// Detached FX window geometry, restored at launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FxWindowState {
+    pub detached: bool,
+    pub width: f32,
+    pub height: f32,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+}
+
+impl Default for FxWindowState {
+    fn default() -> Self {
+        Self {
+            detached: false,
+            width: 960.0,
+            height: 640.0,
+            x: None,
+            y: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PedalboardStore {
     /// Board in use (restored at launch).
@@ -23,6 +45,8 @@ pub struct PedalboardStore {
     pub active_name: Option<String>,
     #[serde(default)]
     pub presets: Vec<NamedPreset>,
+    #[serde(default)]
+    pub window: FxWindowState,
 }
 
 fn path() -> Option<PathBuf> {
@@ -170,6 +194,13 @@ mod tests {
         st.active = factory()[1].board.clone();
         st.active_name = Some("Hall".into());
         st.upsert("Mine", factory()[4].board.clone());
+        st.window = FxWindowState {
+            detached: true,
+            width: 800.0,
+            height: 500.0,
+            x: Some(10),
+            y: None,
+        };
         let json = serde_json::to_string(&st).unwrap();
         let back: PedalboardStore = serde_json::from_str(&json).unwrap();
         assert_eq!(back, st);
