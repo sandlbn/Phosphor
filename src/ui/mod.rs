@@ -4,6 +4,7 @@ pub mod knob;
 pub mod metrics;
 pub mod pedalboard_panel;
 pub mod right_click;
+pub mod rocker;
 pub mod sid_panel;
 pub mod visualizer;
 

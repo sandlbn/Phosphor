@@ -54,6 +54,8 @@ pub struct PedalView<'a> {
     pub engine_supported: Option<bool>,
     /// SID chips used by the current tune (lanes beyond are dimmed).
     pub active_sids: usize,
+    /// Playback running (the meter freezes on Stop, so the rocker needs this).
+    pub playing: bool,
 }
 
 const MUTED: Color = Color {
@@ -260,7 +262,14 @@ pub fn pedalboard_panel<'a>(v: PedalView<'a>) -> Element<'a, Message> {
 
     // ── Editor ──────────────────────────────────────────────────────────
     body = body.push(iced::widget::rule::horizontal(1));
-    body = body.push(editor(&v));
+    body = body.push(
+        row![
+            container(editor(&v)).width(Length::Fill),
+            super::rocker::rocker(v.board.meters[MASTER].value(), v.playing),
+        ]
+        .spacing(12)
+        .align_y(Alignment::End),
+    );
 
     container(scrollable(body.padding(Padding::from([16, 24]))))
         .width(Length::Fill)

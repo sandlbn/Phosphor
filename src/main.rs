@@ -4226,6 +4226,7 @@ impl App {
                 .as_ref()
                 .map(|i| i.num_sids)
                 .unwrap_or(1),
+            playing: self.status.state == PlayState::Playing,
         })
     }
 
