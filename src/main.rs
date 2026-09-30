@@ -278,6 +278,10 @@ struct App {
     pedal_preset_name: String,
     /// Pending debounced save of `pedalboard.json` (knob drags fire often).
     pedal_save_due: Option<std::time::Instant>,
+    /// Detached Pedalboard window, when open.
+    fx_window_id: Option<iced::window::Id>,
+    /// Main window settings, cloned for the FX window (icon, Linux app id).
+    window_template: iced::window::Settings,
     /// Cached state for the Device Config panel. `None` means we haven't
     /// successfully read the device yet.
     device_cfg: Option<ui::DeviceConfigSnapshot>,
@@ -489,7 +493,7 @@ struct App {
 }
 
 impl App {
-    fn boot() -> (Self, Task<Message>) {
+    fn boot(main_settings: iced::window::Settings) -> (Self, Task<Message>) {
         let mut config = Config::load();
         // Snapshot hvsc_root for the browser model — `config` moves into
         // the struct literal below, so we can't reach it from there.
@@ -646,6 +650,8 @@ impl App {
             pedal_picker: None,
             pedal_preset_name,
             pedal_save_due: None,
+            fx_window_id: None,
+            window_template: main_settings.clone(),
             device_cfg: None,
             device_cfg_status: String::new(),
             device_config_needs_confirm: false,
@@ -887,7 +893,54 @@ impl App {
             }
         }
 
+        // Multi-window app (iced::daemon): open the main window ourselves,
+        // then restore a detached Pedalboard window if one was open at quit.
+        let (main_id, open_main) = iced::window::open(main_settings);
+        app.window_id = Some(main_id);
+        tasks.push(open_main.map(|_| Message::Noop));
+        if app.pedalboard_store.window.detached {
+            tasks.push(app.open_fx_window());
+        }
+
         (app, Task::batch(tasks))
+    }
+
+    /// Open the Pedalboard in its own window at the remembered geometry.
+    fn open_fx_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.fx_window_id {
+            return iced::window::gain_focus(id);
+        }
+        let geo = &self.pedalboard_store.window;
+        let mut s = self.window_template.clone();
+        s.size = iced::Size::new(geo.width.max(640.0), geo.height.max(420.0));
+        s.min_size = Some(iced::Size::new(640.0, 420.0));
+        s.position = match (geo.x, geo.y) {
+            (Some(x), Some(y)) => {
+                iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))
+            }
+            _ => iced::window::Position::Default,
+        };
+        // Closing the FX window means "dock it back", so we handle the
+        // request ourselves (see WindowCloseRequested). Quitting the app
+        // doesn't send a close request, so the detached state survives.
+        s.exit_on_close_request = false;
+        let (id, task) = iced::window::open(s);
+        self.fx_window_id = Some(id);
+        self.show_pedalboard = false;
+        self.pedalboard_store.window.detached = true;
+        self.pedal_save_due = Some(std::time::Instant::now());
+        task.map(|_| Message::Noop)
+    }
+
+    /// Close the detached window and show the Pedalboard inline again.
+    fn dock_fx_window(&mut self, show_inline: bool) -> Task<Message> {
+        self.pedalboard_store.window.detached = false;
+        self.pedal_save_due = Some(std::time::Instant::now());
+        self.show_pedalboard = show_inline;
+        match self.fx_window_id.take() {
+            Some(id) => iced::window::close(id),
+            None => Task::none(),
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -1576,7 +1629,7 @@ impl App {
                 }
             }
 
-            Message::Pedal(p) => self.handle_pedal(p),
+            Message::Pedal(p) => return self.handle_pedal(p),
 
             Message::DeviceConfigRefresh => {
                 self.device_cfg_status = "Reading device…".into();
@@ -2285,8 +2338,38 @@ impl App {
             }
 
             // ── Window ────────────────────────────────────────────────────
-            Message::WindowResized(wid, w, h) => {
-                self.window_id = Some(wid);
+            Message::WindowResized(wid, w, h) if Some(wid) == self.fx_window_id => {
+                self.pedalboard_store.window.width = w;
+                self.pedalboard_store.window.height = h;
+                self.pedal_save_due = Some(std::time::Instant::now());
+            }
+
+            Message::WindowMoved(wid, x, y) if Some(wid) == self.fx_window_id => {
+                self.pedalboard_store.window.x = Some(x);
+                self.pedalboard_store.window.y = Some(y);
+                self.pedal_save_due = Some(std::time::Instant::now());
+            }
+
+            Message::WindowResized(wid, _, _) | Message::WindowMoved(wid, _, _)
+                if Some(wid) != self.window_id => {}
+
+            Message::WindowCloseRequested(wid) if Some(wid) == self.fx_window_id => {
+                return self.dock_fx_window(false);
+            }
+            Message::WindowCloseRequested(_) => {}
+
+            Message::WindowClosed(wid) => {
+                if Some(wid) == self.fx_window_id {
+                    self.fx_window_id = None;
+                } else if Some(wid) == self.window_id {
+                    // A daemon doesn't quit on its own; the main window
+                    // going away ends the app (and any detached window).
+                    self.pedalboard_store.save();
+                    return iced::exit();
+                }
+            }
+
+            Message::WindowResized(_wid, w, h) => {
                 self.window_width = w;
                 self.window_height = h;
                 // Don't overwrite saved size while in mini mode — we want to
@@ -2298,7 +2381,7 @@ impl App {
                 }
             }
 
-            Message::WindowMoved(x, y) => {
+            Message::WindowMoved(_wid, x, y) => {
                 self.config.window_x = Some(x);
                 self.config.window_y = Some(y);
                 self.config.save();
@@ -3738,24 +3821,7 @@ impl App {
 
         // Build the main content area
         let main_content: Element<'_, Message> = if self.show_pedalboard {
-            let panel = ui::pedalboard_panel::pedalboard_panel(ui::pedalboard_panel::PedalView {
-                board: &self.pedalboard,
-                store: &self.pedalboard_store,
-                selected: self.pedal_selected,
-                picker: self.pedal_picker,
-                preset_name: &self.pedal_preset_name,
-                engine_supported: match self.config.output_engine.as_str() {
-                    "emulated" | "sidlite" => Some(true),
-                    "auto" => None,
-                    _ => Some(false),
-                },
-                active_sids: self
-                    .status
-                    .track_info
-                    .as_ref()
-                    .map(|i| i.num_sids)
-                    .unwrap_or(1),
-            });
+            let panel = self.pedalboard_view(false);
             column![
                 info_bar,
                 progress,
@@ -4022,6 +4088,10 @@ impl App {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
             }
+            iced::Event::Window(iced::window::Event::CloseRequested) => {
+                Some(Message::WindowCloseRequested(id))
+            }
+            iced::Event::Window(iced::window::Event::Closed) => Some(Message::WindowClosed(id)),
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(id, size.width, size.height))
             }
@@ -4029,7 +4099,7 @@ impl App {
                 // Piggyback window ID capture on the Moved event —
                 // this fires at startup when the saved position is restored.
                 // We'll handle both WindowMoved and store the ID.
-                Some(Message::WindowMoved(point.x as i32, point.y as i32))
+                Some(Message::WindowMoved(id, point.x as i32, point.y as i32))
             }
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 use iced::event::Status;
@@ -4117,8 +4187,47 @@ impl App {
         Subscription::batch([tick, window_events])
     }
 
-    fn theme(&self) -> Theme {
+    fn theme(&self, _id: iced::window::Id) -> Theme {
         Theme::Dark
+    }
+
+    fn title(&self, id: iced::window::Id) -> String {
+        if Some(id) == self.fx_window_id {
+            "Phosphor — Pedalboard".to_string()
+        } else {
+            format!("Phosphor v{}", env!("CARGO_PKG_VERSION"))
+        }
+    }
+
+    /// Multi-window dispatch: the detached Pedalboard, or the main UI.
+    fn view_window(&self, id: iced::window::Id) -> Element<'_, Message> {
+        if Some(id) == self.fx_window_id {
+            return self.pedalboard_view(true);
+        }
+        self.view()
+    }
+
+    fn pedalboard_view(&self, detached: bool) -> Element<'_, Message> {
+        ui::pedalboard_panel::pedalboard_panel(ui::pedalboard_panel::PedalView {
+            board: &self.pedalboard,
+            detached,
+            store: &self.pedalboard_store,
+            selected: self.pedal_selected,
+            picker: self.pedal_picker,
+            preset_name: &self.pedal_preset_name,
+            engine_supported: match self.config.output_engine.as_str() {
+                "emulated" | "sidlite" => Some(true),
+                "auto" => None,
+                _ => Some(false),
+            },
+            active_sids: self
+                .status
+                .track_info
+                .as_ref()
+                .map(|i| i.num_sids)
+                .unwrap_or(1),
+            playing: self.status.state == PlayState::Playing,
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -4153,12 +4262,17 @@ impl App {
     /// the UI's blocking `send` was the last thing that could hang it. In
     /// normal operation the channel is never full, so this behaves exactly
     /// like a blocking send, with no dropped commands.
-    fn handle_pedal(&mut self, p: ui::pedalboard_panel::PedalMsg) {
+    fn handle_pedal(&mut self, p: ui::pedalboard_panel::PedalMsg) -> Task<Message> {
         use ui::pedalboard_panel::PedalMsg as P;
         let was_neutral = self.pedalboard.spec().is_neutral();
         let mut topology = false;
         let mut changed = true;
         match p {
+            P::Detach => return self.open_fx_window(),
+            P::Attach => return self.dock_fx_window(true),
+            P::Toggle if self.fx_window_id.is_some() => {
+                return iced::window::gain_focus(self.fx_window_id.unwrap());
+            }
             P::Toggle => {
                 changed = false;
                 self.show_pedalboard = !self.show_pedalboard;
@@ -4246,6 +4360,7 @@ impl App {
             self.pedalboard_store.active = self.pedalboard.spec().clone();
             self.pedal_save_due = Some(std::time::Instant::now());
         }
+        Task::none()
     }
 
     fn send_cmd(&self, cmd: player::PlayerCmd) {
@@ -6323,50 +6438,53 @@ fn main() -> iced::Result {
         }
     }
 
-    iced::application(App::boot, App::update, App::view)
-        .title(|_: &App| format!("Phosphor v{}", env!("CARGO_PKG_VERSION")))
-        .font(ICON_FONT_EMOJI)
-        .font(ICON_FONT_SYMBOLS2)
-        .font(ICON_FONT_MATH)
-        .subscription(App::subscription)
-        .theme(App::theme)
-        .window({
-            // NOTE: `size` MUST be set inside this Settings literal — the
-            // application builder's `.window(...)` fully overwrites the
-            // per-field setters (`.window_size(...)` etc.) that came
-            // before it (see iced 0.14 `application::window` doc:
-            // "Overwrites any previous window::Settings"). Previously we
-            // had `.window_size((w,h)).window(Settings { .. })` which
-            // silently reset the size to Settings::default() (1024×768),
-            // so every launch opened at 1024×768 and iced's first Resized
-            // event overwrote the saved user size back to that default.
-            #[allow(unused_mut)]
-            let mut s = iced::window::Settings {
-                size: iced::Size::new(
-                    config_for_window.window_width_saved,
-                    config_for_window.window_height_saved,
-                ),
-                icon: Some(icon),
-                position: match (config_for_window.window_x, config_for_window.window_y) {
-                    (Some(x), Some(y)) => {
-                        iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))
-                    }
-                    _ => iced::window::Position::Default,
-                },
+    // Built here (not in boot) so it can use the icon and the config loaded
+    // above; boot() opens the main window from it and keeps a copy as the
+    // template for the detached Pedalboard window.
+    let main_settings = {
+        // NOTE: `size` MUST be set inside this Settings literal, not via
+        // a separate builder setter — an earlier `.window_size(..)` +
+        // `.window(Settings { .. })` combo silently reset every launch
+        // to 1024×768 and overwrote the user's saved size.
+        #[allow(unused_mut)]
+        let mut s = iced::window::Settings {
+            size: iced::Size::new(
+                config_for_window.window_width_saved,
+                config_for_window.window_height_saved,
+            ),
+            icon: Some(icon),
+            position: match (config_for_window.window_x, config_for_window.window_y) {
+                (Some(x), Some(y)) => {
+                    iced::window::Position::Specific(iced::Point::new(x as f32, y as f32))
+                }
+                _ => iced::window::Position::Default,
+            },
+            ..Default::default()
+        };
+        // Pin the X11 WM_CLASS / Wayland app_id so KDE (and other desktops
+        // that key icons off the .desktop file rather than _NET_WM_ICON)
+        // can match the running window to packaging/phosphor.desktop's
+        // StartupWMClass=phosphor and pull the title-bar icon from there.
+        #[cfg(target_os = "linux")]
+        {
+            s.platform_specific = iced::window::settings::PlatformSpecific {
+                application_id: "phosphor".to_string(),
                 ..Default::default()
             };
-            // Pin the X11 WM_CLASS / Wayland app_id so KDE (and other desktops
-            // that key icons off the .desktop file rather than _NET_WM_ICON)
-            // can match the running window to packaging/phosphor.desktop's
-            // StartupWMClass=phosphor and pull the title-bar icon from there.
-            #[cfg(target_os = "linux")]
-            {
-                s.platform_specific = iced::window::settings::PlatformSpecific {
-                    application_id: "phosphor".to_string(),
-                    ..Default::default()
-                };
-            }
-            s
-        })
-        .run()
+        }
+        s
+    };
+
+    iced::daemon(
+        move || App::boot(main_settings.clone()),
+        App::update,
+        App::view_window,
+    )
+    .title(App::title)
+    .font(ICON_FONT_EMOJI)
+    .font(ICON_FONT_SYMBOLS2)
+    .font(ICON_FONT_MATH)
+    .subscription(App::subscription)
+    .theme(App::theme)
+    .run()
 }

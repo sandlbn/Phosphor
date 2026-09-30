@@ -4,6 +4,7 @@ pub mod knob;
 pub mod metrics;
 pub mod pedalboard_panel;
 pub mod right_click;
+pub mod rocker;
 pub mod sid_panel;
 pub mod visualizer;
 
@@ -404,7 +405,9 @@ pub enum Message {
 
     // Window
     WindowResized(iced::window::Id, f32, f32),
-    WindowMoved(i32, i32),
+    WindowMoved(iced::window::Id, i32, i32),
+    WindowCloseRequested(iced::window::Id),
+    WindowClosed(iced::window::Id),
 
     // Visualiser
     /// Toggle between Bar and Scope display modes.

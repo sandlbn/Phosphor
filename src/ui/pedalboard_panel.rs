@@ -18,6 +18,8 @@ use crate::dsp::{BlockKind, Category, LiveBoard, ParamDef, MASTER, SID_LANES};
 #[derive(Debug, Clone)]
 pub enum PedalMsg {
     Toggle,
+    Detach,
+    Attach,
     Select(u64),
     OpenPicker(usize),
     ClosePicker,
@@ -41,6 +43,8 @@ fn m(p: PedalMsg) -> Message {
 
 pub struct PedalView<'a> {
     pub board: &'a LiveBoard,
+    /// Rendered in its own window (Attach instead of Detach / Close).
+    pub detached: bool,
     pub store: &'a PedalboardStore,
     pub selected: Option<u64>,
     pub picker: Option<usize>,
@@ -50,6 +54,8 @@ pub struct PedalView<'a> {
     pub engine_supported: Option<bool>,
     /// SID chips used by the current tune (lanes beyond are dimmed).
     pub active_sids: usize,
+    /// Playback running (the meter freezes on Stop, so the rocker needs this).
+    pub playing: bool,
 }
 
 const MUTED: Color = Color {
@@ -212,10 +218,16 @@ pub fn pedalboard_panel<'a>(v: PedalView<'a>) -> Element<'a, Message> {
             },
             Some(m(PedalMsg::BypassAll(!spec.bypass_all))),
         ),
-        btn("✕ Close", Some(m(PedalMsg::Toggle))),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    let header = if v.detached {
+        header.push(btn("⇤ Attach", Some(m(PedalMsg::Attach))))
+    } else {
+        header
+            .push(btn("⧉ Detach", Some(m(PedalMsg::Detach))))
+            .push(btn("✕ Close", Some(m(PedalMsg::Toggle))))
+    };
 
     let mut body = column![header].spacing(10);
 
@@ -250,7 +262,14 @@ pub fn pedalboard_panel<'a>(v: PedalView<'a>) -> Element<'a, Message> {
 
     // ── Editor ──────────────────────────────────────────────────────────
     body = body.push(iced::widget::rule::horizontal(1));
-    body = body.push(editor(&v));
+    body = body.push(
+        row![
+            container(editor(&v)).width(Length::Fill),
+            super::rocker::rocker(v.board.meters[MASTER].value(), v.playing),
+        ]
+        .spacing(12)
+        .align_y(Alignment::End),
+    );
 
     container(scrollable(body.padding(Padding::from([16, 24]))))
         .width(Length::Fill)
