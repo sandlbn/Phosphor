@@ -54,7 +54,11 @@ fn build_airplay() {
             .define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW")
             .define(
                 "CMAKE_MSVC_RUNTIME_LIBRARY",
-                if static_crt { "MultiThreaded" } else { "MultiThreadedDLL" },
+                if static_crt {
+                    "MultiThreaded"
+                } else {
+                    "MultiThreadedDLL"
+                },
             );
     }
     let dst = cfg.build();
