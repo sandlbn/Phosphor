@@ -111,8 +111,10 @@ pub fn controls_top_row_px(inputs: &ToolbarInputs, scale: f32) -> f32 {
         inputs.repeat_label.as_str()
     };
     let mode = group_px(&[shuffle, repeat], PT, PAD_H, scale);
+    // Worst-case label ("Casting" while a cast is running).
+    let audio_out = group_px(&["🎛 FX", "📡 Casting"], PT, PAD_H, scale);
 
-    transport + subtune + mode + SEP_PX * 2.0 + ROW_SPACING * 4.0 + BAR_PAD_H * 2.0
+    transport + subtune + mode + audio_out + SEP_PX * 3.0 + ROW_SPACING * 6.0 + BAR_PAD_H * 2.0
 }
 
 /// Headroom before switching, absorbing estimator error.

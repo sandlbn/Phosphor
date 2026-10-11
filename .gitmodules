@@ -1,0 +1,3 @@
+[submodule "vendor/airplay2-sender-cpp"]
+	path = vendor/airplay2-sender-cpp
+	url = https://github.com/akustikrausch/airplay2-sender-cpp.git

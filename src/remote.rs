@@ -342,11 +342,70 @@ pub fn start_server(
                         let _ = request.respond(resp);
                     }
 
+                    // ── Artwork shown by Cast receivers with a screen ────
+                    ("GET", "/api/cast-art.png") => {
+                        let resp = tiny_http::Response::from_data(
+                            &include_bytes!("../assets/phosphor.png")[..],
+                        )
+                        .with_header("Content-Type: image/png".parse::<tiny_http::Header>().unwrap())
+                        .with_header(
+                            "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap(),
+                        );
+                        let _ = request.respond(resp);
+                    }
+
                     // ── API: audio stream (MP3 to <audio> tag) ───────────
                     // Opens a subscriber and hands it to tiny_http as
                     // the response body. The subscriber implements
                     // `Read`, so tiny_http drives an infinite chunked
                     // response until the browser closes the connection.
+                    ("HEAD", p) if stream_mime(p).is_some() => {
+                        // Players often probe the URL with HEAD before
+                        // streaming; a 404 here makes them give up.
+                        let mut resp = tiny_http::Response::empty(200);
+                        let head = stream_head(stream_mime(p).unwrap_or("audio/mpeg"));
+                        for h in head.lines().skip(1).filter(|l| !l.is_empty()) {
+                            if let Ok(h) = h.parse::<tiny_http::Header>() {
+                                resp.add_header(h);
+                            }
+                        }
+                        let _ = request.respond(resp);
+                    }
+
+                    // ── API: lossless FLAC stream (Cast / DLNA option) ──
+                    ("GET", p) if stream_mime(p) == Some("audio/flac") => {
+                        let enabled = state.lock().map(|s| s.stream_enabled).unwrap_or(false);
+                        if !enabled {
+                            respond_error(request, 503, "Audio streaming disabled — enable in Settings → Network");
+                            return;
+                        }
+                        if is_kicked(request.remote_addr().map(|a| a.ip())) {
+                            respond_error(request, 503, "casting to this device was stopped");
+                            return;
+                        }
+                        eprintln!("[remote] /api/stream.flac subscribe");
+                        let peer = StreamPeer::new(&request);
+                        let spawned = std::thread::Builder::new()
+                            .name("phosphor-flac".into())
+                            .spawn(move || {
+                                let _peer = peer;
+                                use std::io::Write as _;
+                                let mut w = request.into_writer();
+                                let res = w
+                                    .write_all(stream_head("audio/flac").as_bytes())
+                                    .and_then(|_| {
+                                        crate::flac_stream::serve(&mut w, &|| !is_kicked(_peer.0))
+                                    });
+                                if let Err(e) = res {
+                                    crate::dlog!("[remote] flac stream ended: {e}");
+                                }
+                                eprintln!("[remote] /api/stream.flac disconnect");
+                            });
+                        if let Err(e) = spawned {
+                            eprintln!("[remote] flac stream thread spawn failed: {e}");
+                        }
+                    }
+
                     ("GET", p) if p == "/api/stream.mp3" || p.starts_with("/api/stream.mp3?") => {
                         // Gate on config.http_stream_enabled. When the
                         // user hasn't opted in, return 503 so the URL
@@ -383,44 +442,40 @@ pub fn start_server(
                             "[remote] /api/stream.mp3 subscribe (range={})",
                             range_header.as_deref().unwrap_or("none"),
                         );
+                        if is_kicked(request.remote_addr().map(|a| a.ip())) {
+                            respond_error(request, 503, "casting to this device was stopped");
+                            return;
+                        }
+                        let peer = StreamPeer::new(&request);
                         let handled = std::thread::Builder::new()
                             .name("phosphor-stream".into())
                             .spawn(move || {
-                                let reader = crate::audio_stream::subscribe();
-                                let mut headers: Vec<tiny_http::Header> = Vec::new();
-                                headers.push(
-                                    "Content-Type: audio/mpeg"
-                                        .parse::<tiny_http::Header>()
-                                        .unwrap(),
-                                );
-                                headers.push(
-                                    "Cache-Control: no-cache, no-store, must-revalidate"
-                                        .parse::<tiny_http::Header>()
-                                        .unwrap(),
-                                );
-                                headers.push(
-                                    "Pragma: no-cache"
-                                        .parse::<tiny_http::Header>()
-                                        .unwrap(),
-                                );
-                                headers.push(
-                                    "Accept-Ranges: none"
-                                        .parse::<tiny_http::Header>()
-                                        .unwrap(),
-                                );
-                                headers.push(
-                                    "Access-Control-Allow-Origin: *"
-                                        .parse::<tiny_http::Header>()
-                                        .unwrap(),
-                                );
-                                let resp = tiny_http::Response::new(
-                                    tiny_http::StatusCode(200),
-                                    headers,
-                                    reader,
-                                    None,
-                                    None,
-                                );
-                                let _ = request.respond(resp);
+                                let _peer = peer;
+                                // Icecast-style response: raw socket, no
+                                // chunked encoding, ends when the client
+                                // hangs up. Cast receivers, Android
+                                // players and older UPnP renderers cope
+                                // with this far better than with an
+                                // endless chunked HTTP/1.1 body;
+                                // browsers handle both.
+                                use std::io::{Read as _, Write as _};
+                                let mut reader = crate::audio_stream::subscribe();
+                                let mut w = request.into_writer();
+                                let mut buf = vec![0u8; 16 * 1024];
+                                let sent = w
+                                    .write_all(stream_head("audio/mpeg").as_bytes())
+                                    .and_then(|_| w.flush())
+                                    .and_then(|_| loop {
+                                        let n = reader.read(&mut buf)?;
+                                        if n == 0 || is_kicked(_peer.0) {
+                                            break Ok(());
+                                        }
+                                        w.write_all(&buf[..n])?;
+                                        w.flush()?;
+                                    });
+                                if let Err(e) = sent {
+                                    crate::dlog!("[remote] stream ended: {e}");
+                                }
                                 eprintln!("[remote] /api/stream.mp3 disconnect");
                             });
                         if let Err(e) = handled {
@@ -1035,6 +1090,103 @@ pub fn start_server(
         })
         .expect("Failed to spawn HTTP server thread");
     Some(server)
+}
+
+/// Devices currently pulling a live stream from us, by IP (count of open
+/// connections). Casting uses this as ground truth that a speaker is
+/// actually playing, independent of its control-protocol replies.
+fn stream_peers() -> &'static Mutex<std::collections::HashMap<std::net::IpAddr, usize>> {
+    static PEERS: std::sync::OnceLock<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+        std::sync::OnceLock::new();
+    PEERS.get_or_init(Default::default)
+}
+
+/// RAII marker: registered while a stream connection is open.
+struct StreamPeer(Option<std::net::IpAddr>);
+
+impl StreamPeer {
+    fn new(request: &tiny_http::Request) -> Self {
+        let ip = request.remote_addr().map(|a| a.ip());
+        if let (Some(ip), Ok(mut m)) = (ip, stream_peers().lock()) {
+            *m.entry(ip).or_insert(0) += 1;
+        }
+        Self(ip)
+    }
+}
+
+impl Drop for StreamPeer {
+    fn drop(&mut self) {
+        if let (Some(ip), Ok(mut m)) = (self.0, stream_peers().lock()) {
+            if let Some(n) = m.get_mut(&ip) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&ip);
+                }
+            }
+        }
+    }
+}
+
+/// Speakers told to stop casting: their stream is cut and reconnects are
+/// refused until a new cast to them starts. A backstop for renderers that
+/// ignore (or never get) the Stop command.
+fn kicked_peers() -> &'static Mutex<std::collections::HashSet<std::net::IpAddr>> {
+    static KICKED: std::sync::OnceLock<Mutex<std::collections::HashSet<std::net::IpAddr>>> =
+        std::sync::OnceLock::new();
+    KICKED.get_or_init(Default::default)
+}
+
+pub fn kick_stream(ip: std::net::IpAddr) {
+    if let Ok(mut k) = kicked_peers().lock() {
+        k.insert(ip);
+    }
+}
+
+pub fn unkick_stream(ip: std::net::IpAddr) {
+    if let Ok(mut k) = kicked_peers().lock() {
+        k.remove(&ip);
+    }
+}
+
+fn is_kicked(ip: Option<std::net::IpAddr>) -> bool {
+    ip.is_some_and(|ip| {
+        kicked_peers()
+            .lock()
+            .map(|k| k.contains(&ip))
+            .unwrap_or(false)
+    })
+}
+
+/// Is `ip` currently pulling one of our live streams?
+pub fn is_streaming_to(ip: std::net::IpAddr) -> bool {
+    stream_peers()
+        .lock()
+        .map(|m| m.contains_key(&ip))
+        .unwrap_or(false)
+}
+
+/// Status line + headers for a live audio stream (also reused by HEAD).
+fn stream_head(mime: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: {mime}\r\n\
+         Cache-Control: no-cache, no-store, must-revalidate\r\n\
+         Pragma: no-cache\r\n\
+         Accept-Ranges: none\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n"
+    )
+}
+
+/// `/api/stream.mp3` or `/api/stream.flac` (query string allowed) → mime.
+fn stream_mime(path: &str) -> Option<&'static str> {
+    let p = path.split('?').next().unwrap_or(path);
+    match p {
+        "/api/stream.mp3" => Some("audio/mpeg"),
+        "/api/stream.flac" => Some("audio/flac"),
+        _ => None,
+    }
 }
 
 fn respond_json(request: tiny_http::Request, json: &str) {
@@ -2810,3 +2962,94 @@ loadPlaylist(false);
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod stream_http_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    fn request(port: u16, req: &str, want: usize) -> Vec<u8> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        while out.len() < want {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stream_supports_head_and_is_close_delimited() {
+        let port = 18_364;
+        let state = Arc::new(Mutex::new(SharedRemoteState::default()));
+        state.lock().unwrap().stream_enabled = true;
+        let (tx, _rx) = crossbeam_channel::bounded(4);
+        let server = start_server(port, state, tx).expect("bind test port");
+
+        let head = String::from_utf8_lossy(&request(
+            port,
+            "HEAD /api/stream.mp3 HTTP/1.1\r\nHost: x\r\n\r\n",
+            1,
+        ))
+        .to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "HEAD: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: audio/mpeg"),
+            "HEAD: {head}"
+        );
+
+        let body = request(
+            port,
+            "GET /api/stream.mp3 HTTP/1.1\r\nHost: x\r\nRange: bytes=0-\r\n\r\n",
+            8192,
+        );
+        let split = body
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header end");
+        let hdr = String::from_utf8_lossy(&body[..split]).to_ascii_lowercase();
+        assert!(hdr.starts_with("http/1.1 200"), "{hdr}");
+        assert!(
+            !hdr.contains("transfer-encoding"),
+            "must not be chunked: {hdr}"
+        );
+        assert!(hdr.contains("connection: close"), "{hdr}");
+        let audio = &body[split + 4..];
+        // MPEG audio frame sync: 11 set bits.
+        let synced = audio
+            .windows(2)
+            .any(|w| w[0] == 0xFF && w[1] & 0xE0 == 0xE0);
+        assert!(synced, "no MP3 frame sync in {} body bytes", audio.len());
+
+        let head = String::from_utf8_lossy(&request(
+            port,
+            "HEAD /api/stream.flac HTTP/1.1\r\nHost: x\r\n\r\n",
+            1,
+        ))
+        .to_string();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: audio/flac"),
+            "HEAD flac: {head}"
+        );
+        let body = request(
+            port,
+            "GET /api/stream.flac HTTP/1.1\r\nHost: x\r\n\r\n",
+            300,
+        );
+        let split = body
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("flac header end");
+        assert_eq!(&body[split + 4..split + 8], b"fLaC");
+        server.unblock();
+    }
+}
