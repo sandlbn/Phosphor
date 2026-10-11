@@ -38,10 +38,26 @@ fn build_airplay() {
              (or build with --no-default-features --features usb)"
         );
     }
-    let dst = cmake::Config::new("native/airplay")
-        .profile("Release")
-        .build_target("phosphor_airplay")
-        .build();
+    // Match Rust's C runtime. Windows builds use `+crt-static`
+    // (.cargo/config.toml) so phosphor.exe needs no VC++ redistributable;
+    // the C++ side must then use /MT too, or the link fails with LNK2038
+    // RuntimeLibrary mismatches. CMP0091 makes CMAKE_MSVC_RUNTIME_LIBRARY
+    // apply to fetched sub-projects (Mbed TLS) that declare an older
+    // cmake_minimum_required.
+    let static_crt = std::env::var("CARGO_CFG_TARGET_FEATURE")
+        .map(|f| f.split(',').any(|x| x == "crt-static"))
+        .unwrap_or(false);
+    let mut cfg = cmake::Config::new("native/airplay");
+    cfg.profile("Release").build_target("phosphor_airplay");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        cfg.static_crt(static_crt)
+            .define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW")
+            .define(
+                "CMAKE_MSVC_RUNTIME_LIBRARY",
+                if static_crt { "MultiThreaded" } else { "MultiThreadedDLL" },
+            );
+    }
+    let dst = cfg.build();
     let b = dst.join("build");
     // Multi-config generators (MSVC) put libraries in a per-config subdir.
     for dir in [
