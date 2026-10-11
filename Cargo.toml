@@ -5,8 +5,11 @@ edition = "2021"
 description = "Phosphor — a SID player for USBSID-Pico / Ultimate 64"
 
 [features]
-default = ["usb"]
+default = ["usb", "airplay"]
 usb = []
+# AirPlay sender (vendored C++ airplay2-sender-cpp). Needs CMake + a C++20
+# compiler at build time; turn off with --no-default-features --features usb.
+airplay = []
 
 [dependencies]
 # GUI
@@ -23,6 +26,13 @@ resid-rs = { git = "https://github.com/sandlbn/resid-rs", optional = false }
 cpal = "0.15"
 # Pedalboard effects for the software engines (pure Rust).
 fundsp = "0.23"
+# Casting to network speakers: device discovery (mDNS) + Google Cast sender.
+mdns-sd = "0.21"
+rust_cast = "0.21"
+# UPnP/DLNA renderers (Sonos, smart TVs).
+rupnp = { version = "3", features = ["full_device_spec"] }
+# Lossless FLAC variant of the live stream (pure Rust).
+flacenc = "0.5"
 
 # SIDLite emulation from libsidplayfp
 sidlite-sys = "0.1.1"
@@ -137,3 +147,6 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[build-dependencies]
+cmake = "0.1"

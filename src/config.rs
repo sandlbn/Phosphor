@@ -90,6 +90,13 @@ pub struct Config {
     /// How far to detune: "subtle" | "medium" | "wide". Only consulted when
     /// `pseudo_stereo_enabled` is true and the tune is 1SID.
     pub pseudo_stereo_strength: String,
+    /// Silence the computer's own speakers while casting to a network
+    /// speaker (the cast stream is tapped before local volume).
+    pub cast_mute_local: bool,
+    /// Friendly name of the last device cast to, for one-click reconnect.
+    pub cast_last_device: Option<String>,
+    /// Cast / DLNA speakers pull lossless FLAC instead of 256 kbps MP3.
+    pub cast_lossless: bool,
     /// Restart the USB device when loading a new SID file (macOS only).
     pub restart_usb_on_load: bool,
     /// macOS USB transport mode: "bridge" (default — talk to the root-owned
@@ -156,6 +163,9 @@ impl Default for Config {
             force_stereo_2sid: false,
             pseudo_stereo_enabled: false,
             pseudo_stereo_strength: "medium".to_string(),
+            cast_mute_local: true,
+            cast_last_device: None,
+            cast_lossless: false,
             restart_usb_on_load: false,
             macos_usb_mode: "bridge".to_string(),
             http_remote_enabled: false,
@@ -341,6 +351,17 @@ impl Config {
             } else if let Some(rest) = line.strip_prefix("\"force_stereo_2sid\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.force_stereo_2sid = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"cast_mute_local\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.cast_mute_local = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"cast_lossless\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                config.cast_lossless = val == "true";
+            } else if let Some(rest) = line.strip_prefix("\"cast_last_device\"") {
+                let val = rest.trim().trim_start_matches(':').trim();
+                if val != "null" {
+                    config.cast_last_device = strip_json_string(val);
+                }
             } else if let Some(rest) = line.strip_prefix("\"pseudo_stereo_enabled\"") {
                 let val = rest.trim().trim_start_matches(':').trim();
                 config.pseudo_stereo_enabled = val == "true";
@@ -471,6 +492,9 @@ impl Config {
                 "  \"force_stereo_2sid\": {},\n",
                 "  \"pseudo_stereo_enabled\": {},\n",
                 "  \"pseudo_stereo_strength\": \"{}\",\n",
+                "  \"cast_mute_local\": {},\n",
+                "  \"cast_last_device\": {},\n",
+                "  \"cast_lossless\": {},\n",
                 "  \"restart_usb_on_load\": {},\n",
                 "  \"macos_usb_mode\": \"{}\",\n",
                 "  \"http_remote_enabled\": {},\n",
@@ -510,6 +534,9 @@ impl Config {
             self.force_stereo_2sid,
             self.pseudo_stereo_enabled,
             self.pseudo_stereo_strength,
+            self.cast_mute_local,
+            fmt_opt_str(&self.cast_last_device),
+            self.cast_lossless,
             self.restart_usb_on_load,
             self.macos_usb_mode,
             self.http_remote_enabled,
@@ -687,6 +714,10 @@ mod tests {
         let json = cfg.to_json();
         let back = Config::parse_json(&json);
         assert!(back.pseudo_stereo_enabled);
+        assert!(
+            back.cast_mute_local,
+            "cast_mute_local defaults on and round-trips"
+        );
         assert_eq!(back.pseudo_stereo_strength, "wide");
     }
 

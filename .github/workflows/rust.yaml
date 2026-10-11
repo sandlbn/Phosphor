@@ -11,13 +11,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        # vendor/airplay2-sender-cpp (AirPlay sender) is a git submodule.
+        submodules: recursive
 
     # Fails in seconds without needing a build, so it goes first.
     - name: Check formatting
       run: cargo fmt --all -- --check
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev
+      # cmake + g++ build the AirPlay sender (C++20); preinstalled on the
+      # runner but listed so the requirement is explicit.
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev cmake g++
 
     # This project pulls iced/wgpu plus C builds for LAME, libsidplayfp and
     # SIDLite, so a cold build is slow. Keyed on the lockfile: dependency

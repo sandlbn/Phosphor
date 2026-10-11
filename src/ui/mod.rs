@@ -1,3 +1,4 @@
+pub mod cast_panel;
 pub mod device_panel;
 pub mod font;
 pub mod knob;
@@ -300,6 +301,8 @@ pub enum Message {
     ToggleDeviceConfig,
     /// Pedalboard (effects) tab actions.
     Pedal(pedalboard_panel::PedalMsg),
+    /// Cast-to-speaker panel actions.
+    Cast(cast_panel::CastMsg),
     DeviceConfigRefresh,
     DeviceConfigApplyPreset(usbsid_pico_config::Preset),
     DeviceConfigSetClock(usbsid_pico_config::ClockRate),
@@ -906,6 +909,7 @@ pub fn controls_bar<'a>(
     // user always knows the server is up and can click to open it in
     // their browser. `None` = server not running → no pill.
     http_remote_url: Option<String>,
+    casting: bool,
 ) -> Element<'a, Message> {
     // Derived, not guessed. The labelled bottom row needs ~854 px at the
     // default font — the old `< 760.0` left a band where it overflowed while
@@ -1245,10 +1249,6 @@ pub fn controls_bar<'a>(
                 small_button("🔧", Message::ToggleDeviceConfig),
                 "USB SID Pico device configuration"
             ),
-            with_tip(
-                small_button("🎛", Message::Pedal(pedalboard_panel::PedalMsg::Toggle)),
-                "Pedalboard — effects for the software engines"
-            ),
             with_tip(small_button("⚙", Message::ToggleSettings), "Settings"),
         ]
         .spacing(3)
@@ -1259,10 +1259,6 @@ pub fn controls_bar<'a>(
             with_tip(
                 small_button("🔧 Device", Message::ToggleDeviceConfig),
                 "USB SID Pico device configuration"
-            ),
-            with_tip(
-                small_button("🎛 FX", Message::Pedal(pedalboard_panel::PedalMsg::Toggle)),
-                "Pedalboard — effects for the software engines"
             ),
             with_tip(
                 small_button("⚙ Settings", Message::ToggleSettings),
@@ -1309,9 +1305,43 @@ pub fn controls_bar<'a>(
     //   Row 1: PLAYBACK (transport ┃ subtune ┃ mode)
     //   Row 2: LIBRARY  (file ops ┃ panel toggles)  + optional update badge
     let row_spacing = if compact { 6 } else { 8 };
-    let top_row = row![transport, sep(), subtune_controls, sep(), mode_controls]
-        .spacing(row_spacing)
-        .align_y(Alignment::Center);
+    // Audio output: effects and casting sit with playback, not the library.
+    let audio_out = row![
+        with_tip(
+            small_button(
+                if compact { "🎛" } else { "🎛 FX" },
+                Message::Pedal(pedalboard_panel::PedalMsg::Toggle)
+            ),
+            "Pedalboard — effects for the software engines"
+        ),
+        with_tip(
+            small_button(
+                match (compact, casting) {
+                    (true, _) => "📡",
+                    (false, true) => "📡 Casting",
+                    (false, false) => "📡 Cast",
+                },
+                Message::Cast(cast_panel::CastMsg::TogglePanel)
+            ),
+            if casting {
+                "Casting — click to manage"
+            } else {
+                "Cast to Chromecast, AirPlay, Sonos or DLNA"
+            }
+        ),
+    ]
+    .spacing(if compact { 3 } else { 4 });
+    let top_row = row![
+        transport,
+        sep(),
+        subtune_controls,
+        sep(),
+        mode_controls,
+        sep(),
+        audio_out
+    ]
+    .spacing(row_spacing)
+    .align_y(Alignment::Center);
 
     let mut bottom_row = row![
         file_ops,

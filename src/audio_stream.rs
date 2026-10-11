@@ -109,6 +109,9 @@ struct AudioTap {
     /// Cheap-to-check subscriber presence — avoids a Mutex lock on the
     /// producer hot path.
     has_subscribers: AtomicBool,
+    /// Raw PCM listeners (AirPlay sender): get the stereo pairs as pushed.
+    pcm_subs: Mutex<Vec<crossbeam_channel::Sender<Vec<(i16, i16)>>>>,
+    has_pcm_subs: AtomicBool,
 }
 
 fn tap() -> &'static Arc<AudioTap> {
@@ -122,6 +125,8 @@ fn tap() -> &'static Arc<AudioTap> {
             encoder_running: AtomicBool::new(false),
             last_push: Mutex::new(Instant::now()),
             has_subscribers: AtomicBool::new(false),
+            pcm_subs: Mutex::new(Vec::new()),
+            has_pcm_subs: AtomicBool::new(false),
         })
     })
 }
@@ -134,10 +139,30 @@ fn tap() -> &'static Arc<AudioTap> {
 /// cpal output rate; the encoder is rebuilt if it changes.
 pub fn push_pairs(pairs: &[(i16, i16)], sample_rate: u32) {
     let tap = tap();
-    if !tap.has_subscribers.load(Ordering::Relaxed) {
+    let mp3 = tap.has_subscribers.load(Ordering::Relaxed);
+    let raw = tap.has_pcm_subs.load(Ordering::Relaxed);
+    if !mp3 && !raw {
         return;
     }
     tap.sample_rate.store(sample_rate, Ordering::Relaxed);
+    if raw {
+        let mut subs = lock_or_recover(&tap.pcm_subs);
+        // A full queue just drops this chunk (the sender pads silence);
+        // a disconnected one is removed.
+        subs.retain(|tx| {
+            !matches!(
+                tx.try_send(pairs.to_vec()),
+                Err(crossbeam_channel::TrySendError::Disconnected(_))
+            )
+        });
+        if subs.is_empty() {
+            tap.has_pcm_subs.store(false, Ordering::Relaxed);
+        }
+    }
+    if !mp3 {
+        *lock_or_recover(&tap.last_push) = Instant::now();
+        return;
+    }
     {
         let mut pcm = lock_or_recover(&tap.pcm);
         // Drop from the head if a runaway producer overshoots the cap.
@@ -162,6 +187,23 @@ pub fn push_pairs(pairs: &[(i16, i16)], sample_rate: u32) {
 pub fn is_available() -> bool {
     let last = *lock_or_recover(&tap().last_push);
     last.elapsed() < AVAILABILITY_WINDOW
+}
+
+/// Subscribe to the raw stereo PCM the software engines produce, in the
+/// chunks they push (a few ms each). Drop the receiver to unsubscribe.
+/// ~64 chunks of slack; a stalled reader loses chunks, never blocks
+/// the engine.
+pub fn subscribe_pcm() -> crossbeam_channel::Receiver<Vec<(i16, i16)>> {
+    let (tx, rx) = crossbeam_channel::bounded(SUBSCRIBER_CAPACITY);
+    let tap = tap();
+    lock_or_recover(&tap.pcm_subs).push(tx);
+    tap.has_pcm_subs.store(true, Ordering::Relaxed);
+    rx
+}
+
+/// Current engine output rate (what `subscribe_pcm` chunks are in).
+pub fn sample_rate() -> u32 {
+    tap().sample_rate.load(Ordering::Relaxed)
 }
 
 /// Called by each audio engine's `open()` to lock in the cpal output
@@ -591,5 +633,18 @@ mod tests {
         if before == 0 {
             assert!(!tap().has_subscribers.load(Ordering::Relaxed));
         }
+    }
+
+    #[test]
+    fn pcm_subscribers_receive_pairs_and_unsubscribe_on_drop() {
+        let rx = subscribe_pcm();
+        push_pairs(&[(1, 2), (3, 4)], 44_100);
+        assert_eq!(rx.try_recv().unwrap(), vec![(1, 2), (3, 4)]);
+        assert_eq!(sample_rate(), 44_100);
+        drop(rx);
+        push_pairs(&[(5, 6)], 44_100);
+        assert!(lock_or_recover(&tap().pcm_subs)
+            .iter()
+            .all(|s| s.len() < SUBSCRIBER_CAPACITY));
     }
 }
