@@ -64,6 +64,9 @@ jobs:
       DO_SIGN: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # vendor/airplay2-sender-cpp (AirPlay sender) is a git submodule.
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

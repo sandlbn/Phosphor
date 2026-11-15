@@ -28,8 +28,10 @@ depends=('alsa-lib' 'libusb' 'systemd-libs' 'gcc-libs' 'glibc')
 # base-devel (gcc, make, autoconf, automake, libtool, pkgconf) is assumed
 # present by makepkg and is not repeated here. mp3lame-sys drives autotools
 # and sidplayfp-sys/sidlite-sys drive cc, all of which that covers. git is
-# needed because gosh-dl is pinned as a git dependency in Cargo.toml.
-makedepends=('rust' 'git')
+# needed because gosh-dl is pinned as a git dependency in Cargo.toml, and
+# by CMake to fetch Mbed TLS for the AirPlay sender (vendor/airplay2-
+# sender-cpp, a git submodule: run `git submodule update --init` first).
+makedepends=('rust' 'git' 'cmake')
 optdepends=('vulkan-driver: GPU rendering for the iced UI (falls back to software)'
             'vulkan-swrast: software Vulkan, for machines with no GPU driver')
 # Phosphor links native C (LAME, libsidplayfp, SIDLite) built by `cc` in

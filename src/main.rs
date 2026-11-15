@@ -5,11 +5,13 @@ mod audio_stream;
 #[allow(dead_code)]
 mod audio_volume;
 mod c64_emu;
+mod cast;
 mod config;
 mod debug_log;
 mod device_config;
 mod dsp;
 mod favorites;
+mod flac_stream;
 mod heard_db;
 mod petscii;
 mod player;
@@ -282,6 +284,22 @@ struct App {
     fx_window_id: Option<iced::window::Id>,
     /// Main window settings, cloned for the FX window (icon, Linux app id).
     window_template: iced::window::Settings,
+    /// Casting to network speakers.
+    cast: cast::CastManager,
+    cast_devices: Vec<cast::CastTarget>,
+    cast_state: cast::CastState,
+    show_cast_panel: bool,
+    /// (md5, subtune) last announced to the speaker, to detect track changes.
+    cast_track_key: Option<(String, u16)>,
+    /// The web server was started just for casting (stop it again after).
+    cast_started_server: bool,
+    /// Speaker volume while casting (the slider shows / drives this instead
+    /// of the local volume, which is left untouched and restored after).
+    cast_volume: Option<f32>,
+    /// Device being cast to (for per-device AirPlay volume memory).
+    cast_target: Option<cast::CastTarget>,
+    cast_volumes: cast::volumes::VolumeMemory,
+    cast_volumes_dirty: bool,
     /// Cached state for the Device Config panel. `None` means we haven't
     /// successfully read the device yet.
     device_cfg: Option<ui::DeviceConfigSnapshot>,
@@ -620,6 +638,7 @@ impl App {
         let auto_last_stil_file = config.last_stil_file.clone();
         let initial_show_welcome = !config.has_seen_welcome;
 
+        cast::set_lossless(config.cast_lossless);
         let pedalboard_store = dsp::presets::PedalboardStore::load();
         let pedalboard = dsp::LiveBoard::from_spec(pedalboard_store.active.clone());
         let _ = cmd_tx.try_send(player::PlayerCmd::SetPedalboard(pedalboard.clone()));
@@ -652,6 +671,16 @@ impl App {
             pedal_save_due: None,
             fx_window_id: None,
             window_template: main_settings.clone(),
+            cast: cast::CastManager::spawn(),
+            cast_devices: Vec::new(),
+            cast_state: cast::CastState::Idle,
+            show_cast_panel: false,
+            cast_track_key: None,
+            cast_started_server: false,
+            cast_volume: None,
+            cast_target: None,
+            cast_volumes: cast::volumes::VolumeMemory::load(),
+            cast_volumes_dirty: false,
             device_cfg: None,
             device_cfg_status: String::new(),
             device_config_needs_confirm: false,
@@ -1600,6 +1629,7 @@ impl App {
                     self.show_sid_panel = false;
                     self.show_device_config = false;
                     self.show_pedalboard = false;
+                    self.show_cast_panel = false;
                     self.show_hvsc_browser = false;
                     // Reset the tab to General each time the panel is opened
                     // — the tab strip is a quick swap, and re-opening is
@@ -1618,6 +1648,7 @@ impl App {
                 if self.show_device_config {
                     self.show_settings = false;
                     self.show_pedalboard = false;
+                    self.show_cast_panel = false;
                     self.show_recently_played = false;
                     self.show_sid_panel = false;
                     self.show_hvsc_browser = false;
@@ -1630,6 +1661,7 @@ impl App {
             }
 
             Message::Pedal(p) => return self.handle_pedal(p),
+            Message::Cast(c) => self.handle_cast(c),
 
             Message::DeviceConfigRefresh => {
                 self.device_cfg_status = "Reading device…".into();
@@ -1863,23 +1895,9 @@ impl App {
                 }
             }
 
-            Message::VolumeChanged(v) => {
-                let clamped = v.clamp(0.0, 1.0);
-                if (clamped - self.config.master_volume).abs() > 1e-4 {
-                    self.config.master_volume = clamped;
-                    crate::audio_volume::set(clamped);
-                    self.config.save();
-                }
-            }
+            Message::VolumeChanged(v) => self.set_volume_from_user(v),
 
-            Message::VolumeNudge(delta) => {
-                let target = (self.config.master_volume + delta).clamp(0.0, 1.0);
-                if (target - self.config.master_volume).abs() > 1e-4 {
-                    self.config.master_volume = target;
-                    crate::audio_volume::set(target);
-                    self.config.save();
-                }
-            }
+            Message::VolumeNudge(delta) => self.set_volume_from_user(self.shown_volume() + delta),
 
             Message::BaseFontSizeChanged(val) => {
                 // Echo the keystroke back into the input buffer so the
@@ -2213,6 +2231,7 @@ impl App {
 
             // ── Tick ──────────────────────────────────────────────────────
             Message::Tick => {
+                self.poll_cast();
                 if self
                     .pedal_save_due
                     .is_some_and(|t| t.elapsed() >= Duration::from_millis(800))
@@ -2364,6 +2383,13 @@ impl App {
                 } else if Some(wid) == self.window_id {
                     // A daemon doesn't quit on its own; the main window
                     // going away ends the app (and any detached window).
+                    // Release any speaker first (AirPlay needs TEARDOWN).
+                    if self.cast_active() {
+                        self.cast.shutdown(Duration::from_secs(3));
+                    }
+                    if self.cast_volumes_dirty {
+                        self.cast_volumes.save();
+                    }
                     self.pedalboard_store.save();
                     return iced::exit();
                 }
@@ -2563,6 +2589,7 @@ impl App {
                     self.show_sid_panel = false;
                     self.show_device_config = false;
                     self.show_pedalboard = false;
+                    self.show_cast_panel = false;
                     // Re-sync root in case it changed since last open.
                     self.hvsc_browser.set_root(
                         self.config
@@ -3782,7 +3809,7 @@ impl App {
             self.stil_entry.is_some() || !self.stil_display_text.is_empty(),
             self.window_width,
             &self.config.output_engine,
-            self.config.master_volume,
+            self.shown_volume(),
             engine_suffix.as_deref(),
         );
         // Alarm the Library button (rotating red ring) when HVSC is unconfigured
@@ -3815,12 +3842,32 @@ impl App {
             self.tick,
             hvsc_needs_attention,
             http_remote_url,
+            self.cast_active(),
         );
         let current_duration = self.playlist.current_entry().and_then(|e| e.duration_secs);
         let progress = ui::progress_bar(&self.status, current_duration);
 
         // Build the main content area
-        let main_content: Element<'_, Message> = if self.show_pedalboard {
+        let main_content: Element<'_, Message> = if self.show_cast_panel {
+            let panel = ui::cast_panel::cast_panel(ui::cast_panel::CastView {
+                devices: &self.cast_devices,
+                state: &self.cast_state,
+                mute_local: self.config.cast_mute_local,
+                lossless: self.config.cast_lossless,
+                last_device: self.config.cast_last_device.as_deref(),
+                server_port: self.config.http_remote_port,
+                engine_supported: self.software_engine(),
+            });
+            column![
+                info_bar,
+                progress,
+                rule::horizontal(1),
+                controls,
+                rule::horizontal(1),
+                panel
+            ]
+            .into()
+        } else if self.show_pedalboard {
             let panel = self.pedalboard_view(false);
             column![
                 info_bar,
@@ -4215,11 +4262,7 @@ impl App {
             selected: self.pedal_selected,
             picker: self.pedal_picker,
             preset_name: &self.pedal_preset_name,
-            engine_supported: match self.config.output_engine.as_str() {
-                "emulated" | "sidlite" => Some(true),
-                "auto" => None,
-                _ => Some(false),
-            },
+            engine_supported: self.software_engine(),
             active_sids: self
                 .status
                 .track_info
@@ -4278,6 +4321,7 @@ impl App {
                 self.show_pedalboard = !self.show_pedalboard;
                 if self.show_pedalboard {
                     self.context_menu = None;
+                    self.show_cast_panel = false;
                     self.show_settings = false;
                     self.show_device_config = false;
                     self.show_recently_played = false;
@@ -4361,6 +4405,249 @@ impl App {
             self.pedal_save_due = Some(std::time::Instant::now());
         }
         Task::none()
+    }
+
+    /// Some(true) = software engine (effects / casting apply), Some(false)
+    /// = hardware engine, None = "auto" (depends on what's connected).
+    fn software_engine(&self) -> Option<bool> {
+        match self.config.output_engine.as_str() {
+            "emulated" | "sidlite" => Some(true),
+            "auto" => None,
+            _ => Some(false),
+        }
+    }
+
+    fn cast_active(&self) -> bool {
+        matches!(
+            self.cast_state,
+            cast::CastState::Casting { .. } | cast::CastState::Connecting { .. }
+        )
+    }
+
+    /// Local speakers follow the volume slider, unless we're casting with
+    /// "mute this computer" on.
+    fn apply_local_volume(&self) {
+        let local = if self.cast_active() && self.config.cast_mute_local {
+            0.0
+        } else {
+            self.config.master_volume
+        };
+        crate::audio_volume::set(local);
+    }
+
+    /// What the volume slider shows: the speaker while casting (when we
+    /// know its level), otherwise this computer.
+    fn shown_volume(&self) -> f32 {
+        self.cast_volume.unwrap_or(self.config.master_volume)
+    }
+
+    /// Slider, keyboard and web-remote volume all land here. While casting
+    /// it moves the speaker and leaves the local volume alone; we never
+    /// push the local level to a speaker, so a slider sitting at 100%
+    /// can't blast it.
+    fn set_volume_from_user(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        if self.cast_active() {
+            self.cast_volume = Some(v);
+            self.cast.send(cast::CastCmd::Volume(v));
+            if let Some(t) = self
+                .cast_target
+                .as_ref()
+                .filter(|t| t.protocol == cast::Protocol::AirPlay)
+            {
+                self.cast_volumes.set(&t.id, v);
+                self.cast_volumes_dirty = true;
+            }
+            return;
+        }
+        if (v - self.config.master_volume).abs() > 1e-4 {
+            self.config.master_volume = v;
+            self.apply_local_volume();
+            self.config.save();
+        }
+    }
+
+    fn cast_meta(&self) -> cast::TrackMeta {
+        match self.status.track_info.as_ref() {
+            Some(i) => cast::TrackMeta {
+                title: if i.songs > 1 {
+                    format!("{} ({}/{})", i.name, i.current_song, i.songs)
+                } else {
+                    i.name.clone()
+                },
+                artist: i.author.clone(),
+            },
+            None => cast::TrackMeta::default(),
+        }
+    }
+
+    fn handle_cast(&mut self, msg: ui::cast_panel::CastMsg) {
+        use ui::cast_panel::CastMsg as C;
+        match msg {
+            C::TogglePanel => {
+                self.show_cast_panel = !self.show_cast_panel;
+                if self.show_cast_panel {
+                    self.cast.ensure_discovery();
+                    self.context_menu = None;
+                    self.show_settings = false;
+                    self.show_device_config = false;
+                    self.show_pedalboard = false;
+                    self.show_recently_played = false;
+                    self.show_sid_panel = false;
+                    self.show_hvsc_browser = false;
+                }
+            }
+            C::Start(id) => {
+                if let Some(target) = self.cast_devices.iter().find(|d| d.id == id).cloned() {
+                    self.start_cast(target);
+                }
+            }
+            C::Reconnect => {
+                let last = self.config.cast_last_device.clone();
+                if let Some(target) = self
+                    .cast_devices
+                    .iter()
+                    .find(|d| Some(&d.name) == last.as_ref())
+                    .cloned()
+                {
+                    self.start_cast(target);
+                }
+            }
+            C::Stop => {
+                self.cast.send(cast::CastCmd::Stop);
+                // Reflect it at once; the worker confirms with Idle.
+                if let Some(t) = &self.cast_target {
+                    crate::remote::kick_stream(std::net::IpAddr::V4(t.addr));
+                }
+                self.cast_state = cast::CastState::Idle;
+                self.cast_volume = None;
+                self.apply_local_volume();
+            }
+            C::ToggleLossless => {
+                self.config.cast_lossless = !self.config.cast_lossless;
+                self.config.save();
+                cast::set_lossless(self.config.cast_lossless);
+            }
+            C::ToggleMuteLocal => {
+                self.config.cast_mute_local = !self.config.cast_mute_local;
+                self.config.save();
+                self.apply_local_volume();
+            }
+        }
+    }
+
+    fn start_cast(&mut self, target: cast::CastTarget) {
+        // The speaker pulls /api/stream.mp3 from our web server.
+        if !self.http_remote_running {
+            self.http_server = remote::start_server(
+                self.config.http_remote_port,
+                Arc::clone(&self.remote_state),
+                self.remote_cmd_tx.clone(),
+            );
+            self.http_remote_running = self.http_server.is_some();
+            self.cast_started_server = self.http_remote_running;
+            if !self.http_remote_running {
+                self.cast_state = cast::CastState::Error(format!(
+                    "couldn't start the web server on port {} (in use?)",
+                    self.config.http_remote_port
+                ));
+                return;
+            }
+        }
+        // Open the stream gate now rather than on the next Tick — the
+        // speaker requests the URL within a few hundred ms of LOAD.
+        if let Ok(mut rs) = self.remote_state.lock() {
+            rs.stream_enabled = true;
+        }
+        self.cast_state = cast::CastState::Connecting {
+            id: target.id.clone(),
+            name: target.name.clone(),
+        };
+        self.cast_track_key = self
+            .status
+            .track_info
+            .as_ref()
+            .map(|i| (i.md5.clone(), i.current_song));
+        let airplay_volume = self.cast_volumes.get(&target.id);
+        // A new cast to a device lifts any earlier Stop's stream block.
+        crate::remote::unkick_stream(std::net::IpAddr::V4(target.addr));
+        self.cast_volume = None;
+        self.cast_target = Some(target.clone());
+        self.cast.send(cast::CastCmd::Start {
+            target,
+            stream_port: self.config.http_remote_port,
+            meta: self.cast_meta(),
+            airplay_volume,
+        });
+        self.apply_local_volume();
+    }
+
+    /// Drain cast events (device list, session state) and keep the speaker's
+    /// track title in sync. Called every Tick.
+    fn poll_cast(&mut self) {
+        while let Some(ev) = self.cast.try_event() {
+            match ev {
+                cast::CastEvent::DeviceUpdated(fresh) => {
+                    if let Some(d) = self.cast_devices.iter_mut().find(|d| d.id == fresh.id) {
+                        *d = fresh.clone();
+                    }
+                    if let Some(t) = self.cast_target.as_mut().filter(|t| t.id == fresh.id) {
+                        *t = fresh;
+                    }
+                }
+                cast::CastEvent::Devices(proto, list) => {
+                    // Each protocol reports its full list; merge, keeping
+                    // groups together (panel sections) and names sorted.
+                    self.cast_devices.retain(|d| d.protocol != proto);
+                    self.cast_devices.extend(list);
+                    self.cast_devices.sort_by(|a, b| {
+                        a.protocol
+                            .cmp(&b.protocol)
+                            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                    });
+                }
+                cast::CastEvent::State(st) => {
+                    if let cast::CastState::Casting { name, volume, .. } = &st {
+                        self.cast_volume = *volume;
+                        if self.config.cast_last_device.as_deref() != Some(name) {
+                            self.config.cast_last_device = Some(name.clone());
+                            self.config.save();
+                        }
+                    }
+                    let ended = matches!(st, cast::CastState::Idle | cast::CastState::Error(_));
+                    self.cast_state = st;
+                    if ended {
+                        self.cast_track_key = None;
+                        self.cast_volume = None;
+                        self.cast_target = None;
+                        if self.cast_volumes_dirty {
+                            self.cast_volumes.save();
+                            self.cast_volumes_dirty = false;
+                        }
+                        if self.cast_started_server && !self.config.http_remote_enabled {
+                            if let Some(server) = self.http_server.take() {
+                                server.unblock();
+                            }
+                            self.http_remote_running = false;
+                            self.cast_started_server = false;
+                        }
+                    }
+                    // Restore (or keep muting) the local speakers.
+                    self.apply_local_volume();
+                }
+            }
+        }
+        if matches!(self.cast_state, cast::CastState::Casting { .. }) {
+            let key = self
+                .status
+                .track_info
+                .as_ref()
+                .map(|i| (i.md5.clone(), i.current_song));
+            if key.is_some() && key != self.cast_track_key {
+                self.cast_track_key = key;
+                self.cast.send(cast::CastCmd::Track(self.cast_meta()));
+            }
+        }
     }
 
     fn send_cmd(&self, cmd: player::PlayerCmd) {
@@ -5187,7 +5474,7 @@ impl App {
                 is_pal: info.map(|i| i.is_pal).unwrap_or(true),
                 engine: self.config.output_engine.clone(),
                 is_favorite: is_favorite_current,
-                master_volume: self.config.master_volume,
+                master_volume: self.shown_volume(),
                 shuffle: self.playlist.shuffle,
                 repeat: match self.playlist.repeat {
                     playlist::RepeatMode::Off => "off",
@@ -5246,7 +5533,7 @@ impl App {
                     index: i,
                 })
                 .collect();
-            rs.stream_enabled = self.config.http_stream_enabled;
+            rs.stream_enabled = self.config.http_stream_enabled || self.cast_active();
 
             // Rebuild playlist snapshot when entries OR favourites
             // change. Same `playlist_version` we already computed above
@@ -5348,14 +5635,7 @@ impl App {
                     }
                 },
                 remote::RemoteCmd::SetVolume(v) => {
-                    let clamped = v.clamp(0.0, 1.0);
-                    self.config.master_volume = clamped;
-                    // Push the new gain into the audio thread — WITHOUT
-                    // this call the cpal callback keeps the old value,
-                    // so config/UI/API status all show the new volume
-                    // but you hear no change.
-                    crate::audio_volume::set(clamped);
-                    self.config.save();
+                    self.set_volume_from_user(v);
                 }
 
                 // ── Ops that reuse full Message handlers via Task::done

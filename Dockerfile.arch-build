@@ -38,6 +38,7 @@ RUN pacman -Syu --noconfirm --needed \
         libusb \
         systemd-libs \
         pkgconf \
+        cmake \
     && pacman -Scc --noconfirm
 
 # makepkg refuses to run as root. Create a builder user with a

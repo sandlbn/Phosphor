@@ -17,6 +17,9 @@ RUN apt-get update \
         libasound2-dev \
         pkg-config \
         ca-certificates \
+        cmake \
+        g++ \
+        git \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-deb --locked
 
