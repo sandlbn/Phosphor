@@ -150,9 +150,3 @@ opt-level = 3
 
 [build-dependencies]
 cmake = "0.1"
-
-# LOCAL TESTING ONLY (fw 0.9 investigation) — build against the patched
-# driver/config working trees. Remove before release.
-[patch.crates-io]
-usbsid-pico = { path = "../USBSID-Pico-Rust-driver" }
-usbsid-pico-config = { path = "../usbsid-pico-config" }
