@@ -39,6 +39,8 @@ pub struct BridgeDevice {
     /// USB yanked → daemon panic, etc.) and back to `true` after a
     /// successful reconnect. Logged on transitions.
     connected: bool,
+    /// Self-clocked timeline for the ring writes (see self_clock.rs).
+    clock: crate::self_clock::SelfClock,
 }
 
 impl BridgeDevice {
@@ -52,6 +54,7 @@ impl BridgeDevice {
                 return Ok(Self {
                     stream,
                     connected: true,
+                    clock: crate::self_clock::SelfClock::new(),
                 });
             }
             Err(first_err) => {
@@ -72,6 +75,7 @@ impl BridgeDevice {
                 return Ok(Self {
                     stream,
                     connected: true,
+                    clock: crate::self_clock::SelfClock::new(),
                 });
             }
         }
@@ -136,38 +140,11 @@ impl BridgeDevice {
     }
 }
 
-impl SidDevice for BridgeDevice {
-    fn init(&mut self) -> Result<(), String> {
-        self.send_cmd(&[CMD_INIT]);
-        self.read_response()
-    }
-
-    fn set_clock_rate(&mut self, is_pal: bool) {
-        self.send_cmd(&[CMD_CLOCK, if is_pal { 1 } else { 0 }]);
-        let _ = self.read_response();
-    }
-
-    fn reset(&mut self) {
-        self.send_cmd(&[CMD_RESET]);
-        let _ = self.read_response();
-    }
-
-    #[allow(deprecated)]
-    fn set_stereo(&mut self, _mode: i32) {
-        // Intentional no-op — see `SidDevice::set_stereo` doc. Stereo
-        // routing on USBSID-Pico is controlled by the flash-persistent
-        // `DeviceConfig::stereo_enabled`, not this transient opcode.
-    }
-
-    fn write(&mut self, reg: u8, val: u8) {
-        self.send_cmd(&[CMD_WRITE, reg, val]);
-    }
-
-    fn ring_cycled(&mut self, writes: &[(u16, u8, u8)]) {
+impl BridgeDevice {
+    fn send_ring(&mut self, writes: &[(u16, u8, u8)]) {
         if writes.is_empty() {
             return;
         }
-
         let mut buf = Vec::with_capacity(writes.len() * 5);
         for &(cycles, reg, val) in writes {
             buf.push(CMD_RING);
@@ -190,8 +167,49 @@ impl SidDevice for BridgeDevice {
             );
         }
     }
+}
+
+impl SidDevice for BridgeDevice {
+    fn init(&mut self) -> Result<(), String> {
+        self.send_cmd(&[CMD_INIT]);
+        self.read_response()
+    }
+
+    fn set_clock_rate(&mut self, is_pal: bool) {
+        self.send_cmd(&[CMD_CLOCK, if is_pal { 1 } else { 0 }]);
+        let _ = self.read_response();
+        self.clock.set_pal(is_pal);
+    }
+
+    fn set_cycles_per_frame(&mut self, cycles: u32) {
+        self.clock.set_cycles_per_frame(cycles);
+    }
+
+    fn reset(&mut self) {
+        self.send_cmd(&[CMD_RESET]);
+        let _ = self.read_response();
+        self.clock.restart();
+    }
+
+    #[allow(deprecated)]
+    fn set_stereo(&mut self, _mode: i32) {
+        // Intentional no-op — see `SidDevice::set_stereo` doc. Stereo
+        // routing on USBSID-Pico is controlled by the flash-persistent
+        // `DeviceConfig::stereo_enabled`, not this transient opcode.
+    }
+
+    fn write(&mut self, reg: u8, val: u8) {
+        self.send_cmd(&[CMD_WRITE, reg, val]);
+    }
+
+    fn ring_cycled(&mut self, writes: &[(u16, u8, u8)]) {
+        let timed = self.clock.frame_writes(writes);
+        self.send_ring(&timed);
+    }
 
     fn flush(&mut self) {
+        let fill = self.clock.end_frame();
+        self.send_ring(&fill);
         let t0 = std::time::Instant::now();
         let _ = self.stream.write_all(&[CMD_FLUSH]);
         let _ = self.stream.flush();
@@ -202,6 +220,14 @@ impl SidDevice for BridgeDevice {
                 dt.as_secs_f64() * 1000.0,
             );
         }
+    }
+
+    fn discard_pending(&mut self) {
+        // The daemon protocol has no discard: drain as before, but start a
+        // fresh timeline for the next tune.
+        SidDevice::flush(self);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        self.clock.restart();
     }
 
     fn reinit(&mut self) -> Result<(), String> {

@@ -32,6 +32,16 @@ pub fn run<T: Transport>(
     op: &DeviceConfigCmd,
 ) -> Result<Option<DeviceConfigSnapshot>, String> {
     let mut dev = Device::new(transport);
+    // Pick the wire layout BEFORE any read-modify-write. Previously only
+    // `refresh()` did this, so edits on fw >= 0.7.5 decoded and re-encoded
+    // with the 0.7.0 layout and inverted socket change detection (byte 3).
+    // `refresh()` repeats it; the extra version query is cheap.
+    if !matches!(op, DeviceConfigCmd::Refresh) {
+        let ver = dev
+            .read_firmware_version()
+            .map_err(|e| format!("read_firmware_version: {e}"))?;
+        dev.set_fw_flavor(usbsid_pico_config::fw_flavor_from_version(&ver));
+    }
     match op {
         DeviceConfigCmd::Refresh => refresh(&mut dev).map(Some),
 
@@ -267,20 +277,16 @@ fn refresh<T: Transport>(dev: &mut Device<T>) -> Result<DeviceConfigSnapshot, St
         .map_err(|e| format!("read_pcb_version: {e}"))?;
     let pcb_version_raw = usbsid_pico_config::parse_pcb_version(&pcb_version).unwrap_or(0);
     let capabilities = usbsid_pico_config::fw_capabilities(pcb_version_raw);
-    let mut config = dev
+    let config = dev
         .read_config_lenient()
         .map_err(|e| format!("read_config: {e}"))?;
-    // v1.5+ boards keep sockets unpowered until CONFIG_ACK (0xFA) is
-    // sent, and every fresh read reports `need_confirmation = true`
-    // until then. Fire ACK once, wait for the regulators to settle,
-    // re-read so the snapshot reflects live chip types.
-    if config.need_confirmation {
-        let _ = dev.confirm_config();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        if let Ok(refreshed) = dev.read_config_lenient() {
-            config = refreshed;
-        }
-    }
+    // v1.5+: `need_confirmation` is only raised after the firmware detects
+    // a socket/chip change (or a forced validation). CONFIG_ACK then saves
+    // the config AND switches the socket voltages on for the stored chip
+    // types — a wrong 6581/8580 setting can damage a SID. So never ACK
+    // automatically here: the Device panel surfaces the state and the user
+    // confirms with "✓ Confirm config" (DeviceConfigCmd::Confirm). Until
+    // then the firmware drops SID writes, so playback is silent.
     Ok(DeviceConfigSnapshot {
         firmware_version,
         pcb_version,
