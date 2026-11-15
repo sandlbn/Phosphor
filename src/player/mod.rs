@@ -710,10 +710,7 @@ fn player_loop(
 
 fn cleanup(bridge: &mut Option<Box<dyn SidDevice>>) {
     if let Some(ref mut br) = bridge {
-        br.flush();
-        // Let the writer drain any in-flight ring entries so they can't
-        // re-trigger voices after mute/reset.
-        thread::sleep(Duration::from_millis(20));
+        br.discard_pending();
         br.mute();
         br.reset();
         br.close();
@@ -1375,11 +1372,10 @@ fn stop_playback_inner(
             if stop_audio {
                 br.stop_audio();
             }
-            br.flush();
-            // Give the writer thread a beat to drain any queued ring entries
-            // before we silence the chip — otherwise late voice/oscillator
-            // writes can land *after* mute and re-trigger sustained voices.
-            thread::sleep(Duration::from_millis(20));
+            // Drop (or, on engines that can't, drain) queued writes before
+            // we silence the chip — otherwise late voice/oscillator/$D418
+            // writes land *after* mute and re-trigger or un-mute voices.
+            br.discard_pending();
             br.mute();
             // Frees SID2/3/4 on software engines; USB no-ops it.
             #[allow(deprecated)]
@@ -1572,7 +1568,9 @@ fn setup_playback(
     // Only applies to exactly 2-SID tunes.
     let force_mono_2sid = force_stereo && num_sids == 2;
     let mono_mode = !is_multi || force_mono_2sid;
-    let mirror_mono = mono_mode;
+    // PHOSPHOR_NO_MIRROR=1: debug switch, don't duplicate mono writes to SID2
+    // (used to measure the device-side cost of the mirror on fw 0.9).
+    let mirror_mono = mono_mode && std::env::var_os("PHOSPHOR_NO_MIRROR").is_none();
 
     // Pseudo-stereo widens a genuinely mono tune by transposing the mirrored
     // SID2 a few cents flat. Deliberately NOT applied when `force_stereo`

@@ -58,6 +58,8 @@ pub struct DirectDevice {
     /// (likely a yank or device reset), and back to `true` on the next
     /// successful call. Logged on transitions so stderr has a breadcrumb.
     connected: bool,
+    /// Turns per-frame deltas into a self-clocked timeline (see self_clock.rs).
+    clock: crate::self_clock::SelfClock,
 }
 
 impl DirectDevice {
@@ -69,7 +71,21 @@ impl DirectDevice {
         Ok(Self {
             dev,
             connected: true,
+            clock: crate::self_clock::SelfClock::new(),
         })
+    }
+
+    fn push_ring(&mut self, writes: &[(u16, u8, u8)]) {
+        for &(cycles, reg, val) in writes {
+            let r = self.dev.write_ring_cycled(reg, val, cycles);
+            self.note_call("ring_cycled", &r);
+            // If the device went away mid-batch, stop hammering it —
+            // subsequent writes will fail the same way and just spam
+            // the log. The next user-initiated action will retry.
+            if !self.connected {
+                break;
+            }
+        }
     }
 
     /// Update `connected` based on a fresh USB call result and log the
@@ -100,6 +116,11 @@ impl SidDevice for DirectDevice {
             ClockSpeed::Ntsc as i64
         };
         self.dev.set_clock_rate(speed, true);
+        self.clock.set_pal(is_pal);
+    }
+
+    fn set_cycles_per_frame(&mut self, cycles: u32) {
+        self.clock.set_cycles_per_frame(cycles);
     }
 
     fn reset(&mut self) {
@@ -107,6 +128,7 @@ impl SidDevice for DirectDevice {
         // ignore the RES pin), then toggle RES for real chips.
         self.dev.reset_all_registers();
         self.dev.reset();
+        self.clock.restart();
     }
 
     #[allow(deprecated)]
@@ -125,19 +147,13 @@ impl SidDevice for DirectDevice {
     }
 
     fn ring_cycled(&mut self, writes: &[(u16, u8, u8)]) {
-        for &(cycles, reg, val) in writes {
-            let r = self.dev.write_ring_cycled(reg, val, cycles);
-            self.note_call("ring_cycled", &r);
-            // If the device went away mid-batch, stop hammering it —
-            // subsequent writes will fail the same way and just spam
-            // the log. The next user-initiated action will retry.
-            if !self.connected {
-                break;
-            }
-        }
+        let timed = self.clock.frame_writes(writes);
+        self.push_ring(&timed);
     }
 
     fn flush(&mut self) {
+        let fill = self.clock.end_frame();
+        self.push_ring(&fill);
         self.dev.set_flush();
     }
 
@@ -145,12 +161,17 @@ impl SidDevice for DirectDevice {
         self.connected
     }
 
+    fn discard_pending(&mut self) {
+        self.dev.discard_pending();
+        self.clock.restart();
+    }
+
     fn mute(&mut self) {
         self.dev.mute();
     }
 
     fn close(&mut self) {
-        self.dev.set_flush();
+        self.dev.discard_pending();
         self.dev.mute();
         self.dev.reset_all_registers();
         self.dev.reset();

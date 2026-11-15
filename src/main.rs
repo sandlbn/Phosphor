@@ -6,6 +6,7 @@ mod audio_stream;
 mod audio_volume;
 mod c64_emu;
 mod cast;
+mod cli;
 mod config;
 mod debug_log;
 mod device_config;
@@ -17,6 +18,7 @@ mod petscii;
 mod player;
 mod playlist;
 mod recently_played;
+mod self_clock;
 mod sid_device;
 mod stil;
 mod ui;
@@ -6576,6 +6578,14 @@ fn main() -> iced::Result {
 
     env_logger::init();
     debug_log::init();
+
+    // Headless CLI: `phosphor cli <play|info> ...` (see src/cli.rs).
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("cli") {
+            std::process::exit(cli::run(&args[2..]));
+        }
+    }
 
     // Diagnostic subcommand: walk a directory of .sid files, call the
     // regular `PlaylistEntry::from_path` on each (the same function

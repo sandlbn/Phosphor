@@ -23,6 +23,16 @@ pub trait SidDevice: Send {
     fn ring_cycled(&mut self, writes: &[(u16, u8, u8)]);
 
     fn flush(&mut self);
+
+    /// Drop queued-but-unsent writes before a mute/reset (stop, tune
+    /// change). Default: drain them instead (old behaviour) — engines whose
+    /// driver can discard override this so stale writes never land after
+    /// the mute.
+    fn discard_pending(&mut self) {
+        self.flush();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
     fn mute(&mut self);
     fn close(&mut self);
     fn shutdown(&mut self);
